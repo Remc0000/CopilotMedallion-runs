@@ -1,5 +1,7 @@
 use this skill to create a medallion architecture: https://github.com/microsoft/skills-for-fabric/tree/main/skills/e2e-medallion-architecture
 
+split the notebooks per layer, so 1 for bronze, 1 for silver, 1 for gold
+
 In silver I want to add fields for ingestion_dt and source_dt
 In gold I want to have the following tables:
 Dim_Customer -> join customer, customer address, address and leave all relevant/meaningfull fields
