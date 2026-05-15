@@ -25,7 +25,7 @@ Build 3 Spark notebooks (one per layer) — bronze, silver, gold — in a single
 - **Bronze**: 1:1 ingestion of the selected source tables into the `bronze` schema, adding `ingestion_timestamp`, `source_path`, `batch_id`, `ingestion_date` metadata columns. Mode: overwrite + overwriteSchema=true. Partitioned by `ingestion_date`.
 - **Silver**: dedupe, snake_case rename, drop fully-null columns, trim strings, add `ingestion_dt` and `source_dt` audit columns, `_silver_ts` timestamp. Mode: overwrite. After write run OPTIMIZE.
 - **Gold** (AdventureWorksLT shape):
-  - **Dim_Customer** — join customer + customeraddress + address; keep all relevant fields.
+  - **Dim_Customer** — join `silver.customer` as `c` + `silver.customer_address` as `ca` + `silver.address` as `a` using `c.customer_id = ca.customer_id` and `ca.address_id = a.address_id`; keep all relevant customer/address fields. To avoid ambiguous-column failures, alias every input DataFrame and fully qualify all selected/joined columns with the alias prefix. In the final projection, use `ca.address_id` as the relationship/junction key and only include a single output column named `address_id`; any physical address attributes (for example address lines, city, state/province, country/region, postal code) must come from alias `a`. Do not use bare `address_id` anywhere in joins, selects, filters, or tests after the join.
   - **Dim_Product** — join product + productcategory (self-join: subcategory → parent category) + productdescription + productmodel + productmodelproductdescription; expose `category` and `subcategory`.
   - **Dim_Sales** — degenerate dimension on the cleaned salesperson from salesorderheader (strip leading `adventureworks/`, strip trailing digits).
   - **Fact_Sales** — join salesorderdetail + salesorderheader, keep all relevant fields, AND include the cleaned `sales_person` column (same cleaning as Dim_Sales) so reports can aggregate by it.
@@ -105,3 +105,7 @@ Create a **Data Agent (AISkill)** named `{target_lakehouse_name}_agent`, **groun
 - Do not invent column names that aren't in the semantic model — if a metric isn't exposed, propose adding it and stop.
 
 If the AISkill REST endpoint is not yet GA in the tenant, the reporting notebook will print these full instructions and starter questions so they can be pasted when creating the Data Agent manually in the Fabric portal.
+
+## Known constraints (from prior runs)
+- In gold joins where two inputs share the same column name (especially `address_id` in `customer_address` and `address`), always alias both sides and reference columns as `alias.column`; never use bare column names after the join.
+- Gold output tables must not carry duplicate logical columns with different aliases; project one canonical `address_id` column in `dim_customer`.
