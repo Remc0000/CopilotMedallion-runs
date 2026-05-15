@@ -65,6 +65,8 @@ Create a **Direct Lake** semantic model named `{target_lakehouse_name}_sm` on th
 - Mark `fact_sales[order_date]` as a date column so time intelligence works without a separate date dim.
 - Hide all FK columns from the report view.
 - The semantic-model notebook must not fail if `dim_sales` is missing. It must dynamically derive the set of available gold tables from the materialization manifest / existence checks and generate a valid reduced model from only those tables.
+- The semantic-model notebook must capture the create/update response object explicitly and validate it before any field access. Do not call `.get(...)` on a null/None response. If semantic model creation returns `None`, an empty payload, or a payload without an `id`, treat this as a controlled failure: append a FAIL/ERROR row to `test.test_results` with `layer = 'semantic_model'`, `table_name = '{target_lakehouse_name}_sm'`, and details containing the raw response status/body if available, then stop downstream report/model-binding steps that require a semantic model id.
+- Persist a small semantic-model status artifact for downstream notebooks containing at minimum: `run_id`, `semantic_model_name`, `status` (`CREATED`/`FAILED`/`SKIPPED`), `semantic_model_id` when available, and diagnostic details. The reporting notebook must read this status first rather than assuming the semantic model API returned a valid object.
 
 ## Report
 
@@ -77,6 +79,10 @@ Create a Power BI report named `{target_lakehouse_name}_rpt` bound to the semant
 3. **Data quality** — table visual showing the latest `test_results` (filter to MAX(run_id)), columns: layer, table_name, test_name, status, actual, expected; conditional formatting on `status` (green=PASS, red=FAIL, amber=ERROR).
 
 The reporting notebook must not enumerate or read schemas for a hard-coded gold table list without checking existence first. When building any `schema_map` or similar structure for gold tables, use only the subset of gold tables that were actually materialized and whose Delta paths exist; specifically, do not attempt to load `Tables/gold/dim_sales` when `dim_sales` was skipped.
+- Before creating the report, the reporting notebook must first load the semantic-model status artifact / manifest and verify there is a successful semantic model record for the current `run_id` with a non-null `semantic_model_id`. If that status is missing, FAILED, SKIPPED, or the `semantic_model_id` is null/empty, do not attempt report binding/creation.
+- In reporting code, never assume the semantic model create call returned an object. Any variable such as `sm_resp` must be null-checked before use; accessing `sm_resp.get('id')` is forbidden unless `sm_resp` is confirmed to be a dict-like object. Materialize `reporting_summary['semantic_model_id']` only from the validated manifest/status record or a validated non-null response object.
+- If the semantic model is unavailable, the reporting notebook must exit gracefully after writing a FAIL/ERROR row to `test.test_results` with `layer = 'reporting'`, `table_name = '{target_lakehouse_name}_rpt'`, and details such as `semantic model not available; report creation skipped`. This is a controlled skip/fail, not an uncaught exception.
+- The report notebook may still emit PBIR scaffolding or instructions, but must not call downstream APIs that require a semantic model id when that id is missing.
 
 ## Data Agent
 
@@ -122,3 +128,4 @@ If the AISkill REST endpoint is not yet GA in the tenant, the reporting notebook
 - The gold write path must never receive a DataFrame with duplicate column names. This was previously hit in `dim_customer` from carrying overlapping columns across `customer`, `customer_address`, and `address` (including `rowguid`, `modified_date`, silver audit columns, and bronze metadata columns). Explicitly project a unique final schema before writing Delta.
 - `silver.product` in this source does not provide `discontinued_date`. Any `dim_product` logic must validate source columns first and must not select `p.discontinued_date` unless that column is confirmed to exist.
 - Reporting/semantic-model code must never hard-code reads of every expected gold path. `dim_sales` may be intentionally skipped when `silver.sales_order_header.sales_person` is absent, so `Tables/gold/dim_sales` may not exist. Always check the gold materialization manifest or Delta path existence before loading a gold table.
+- Semantic-model/reporting orchestration must treat the semantic model API response as nullable. A prior run failed because reporting accessed `sm_resp.get('id')` when `sm_resp` was `None`. Always validate response presence and `semantic_model_id` before field access, and skip report creation gracefully when the semantic model was not successfully created.
