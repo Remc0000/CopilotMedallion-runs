@@ -25,8 +25,8 @@ Build 3 Spark notebooks (one per layer) — bronze, silver, gold — in a single
 - **Bronze**: 1:1 ingestion of the selected source tables into the `bronze` schema, adding `ingestion_timestamp`, `source_path`, `batch_id`, `ingestion_date` metadata columns. Mode: overwrite + overwriteSchema=true. Partitioned by `ingestion_date`.
 - **Silver**: dedupe, snake_case rename, drop fully-null columns, trim strings, add `ingestion_dt` and `source_dt` audit columns, `_silver_ts` timestamp. Mode: overwrite. After write run OPTIMIZE.
 - **Gold** (AdventureWorksLT shape):
-  - **Dim_Customer** — join customer + customeraddress + address; keep all relevant fields.
-  - **Dim_Product** — join product + productcategory (self-join: subcategory → parent category) + productdescription + productmodel + productmodelproductdescription; expose `category` and `subcategory`.
+  - **Dim_Customer** — join customer + customeraddress + address; keep all relevant fields. Use explicit DataFrame aliases for every joined table (`c`, `ca`, `a`) and qualify every selected/joined column with its alias. Join keys must be `c.customer_id = ca.customer_id` and `ca.address_id = a.address_id`. In the final projection, do not reference bare `address_id`; materialize it explicitly as `ca.address_id AS address_id` for the dimension key/bridge reference, and if the physical address table key is also needed expose it only as a separately named column such as `a.address_id AS source_address_id`. This join must not contain any unqualified `address_id` reference.
+  - **Dim_Product** — join product + productcategory (self-join: subcategory → parent category) + productdescription + productmodel + productmodelproductdescription; expose `category` and `subcategory`. Use aliases consistently on self-joins and shared key names to avoid ambiguous references.
   - **Dim_Sales** — degenerate dimension on the cleaned salesperson from salesorderheader (strip leading `adventureworks/`, strip trailing digits).
   - **Fact_Sales** — join salesorderdetail + salesorderheader, keep all relevant fields, AND include the cleaned `sales_person` column (same cleaning as Dim_Sales) so reports can aggregate by it.
 
@@ -103,3 +103,7 @@ Create a **Data Agent (AISkill)** named `{target_lakehouse_name}_agent`, **groun
 - Do not invent column names that aren't in the semantic model — if a metric isn't exposed, propose adding it and stop.
 
 If the AISkill REST endpoint is not yet GA in the tenant, the reporting notebook will print these full instructions and starter questions so they can be pasted when creating the Data Agent manually in the Fabric portal.
+
+## Known constraints (from prior runs)
+- In gold-layer joins, any column name present in more than one input table must always be referenced with an alias prefix; never use bare shared names like `address_id`.
+- For `dim_customer`, `customer_address.address_id` is the canonical joined address key to project as `address_id`. If an additional address-table identifier is retained, it must be renamed to avoid collisions.
