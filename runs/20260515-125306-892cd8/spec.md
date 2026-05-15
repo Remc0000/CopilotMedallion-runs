@@ -24,11 +24,21 @@ You are a data agent, and you use your skills: https://github.com/microsoft/skil
 
 In silver I want to add fields for `ingestion_dt` and `source_dt`.
 
+For **all silver tables**, preserve business/source columns from Bronze and add metadata columns without dropping source fields unless there is an explicit rename. In particular, for `SalesOrderHeader`, the original SalesLT salesperson field must be retained and standardized for downstream gold use:
+- if the Bronze/source column is `SalesPerson`, create a silver snake_case column named `salesperson`;
+- if the Bronze/source column already lands as `salesperson`, keep it;
+- do not drop `salesperson` during silver standardization even if many other columns are converted to snake_case;
+- `sales_person` is a gold canonical field, not a required silver field.
+
 In gold I want to have the following tables:
 
 - **Dim_Customer** — join customer, customer address, address and leave all relevant/meaningful fields.
 - **Dim_Product** — join product, productcategory, productdescription, productmodel, productmodelproductdescription. Please notice that in productcategory there is a self join: in the end I have the category (which is the parent category) and a subcategory.
-- **Dim_Sales** — build this from `SalesOrderHeader` in silver. The source column is the original salesperson column from SalesLT; in silver it may be present as `salesperson` (expected) and must be standardized to a snake_case column named `sales_person`. Do not assume `sales_person` already exists unless you explicitly create/rename it. Clean `sales_person` by removing the `adventureworks/` prefix and removing the trailing numeric suffix at the end of the name. The result is a degenerate dimension with one row per distinct cleaned salesperson. If the source salesperson column is absent in silver, fail fast with a clear validation message listing the available columns.
+- **Dim_Sales** — build this from `SalesOrderHeader` in silver. The source column is the original salesperson column from SalesLT; in silver it should normally be present as `salesperson` and in gold must be standardized to a snake_case column named `sales_person`. Do not assume `sales_person` already exists in silver. Materialize it in gold from silver using this precedence:
+  1. if `salesperson` exists, rename/copy it to `sales_person`;
+  2. else if `sales_person` already exists, use it;
+  3. else if neither exists but the available silver columns match the known SalesLT header shape and there is no salesperson field at all, fail fast with a clear validation message stating that silver `SalesOrderHeader` was built incorrectly because the original salesperson source column was dropped; include the available columns in the error.
+  Clean `sales_person` by removing the `adventureworks/` prefix and removing the trailing numeric suffix at the end of the name. The result is a degenerate dimension with one row per distinct cleaned salesperson. If the source salesperson column is absent in silver, do not silently continue or infer from another field; fail fast as above.
 - **Fact_Sales** — join `SalesOrderDetail` and `SalesOrderHeader` and keep all relevant fields. Join on `sales_order_id`. This table **must also include the cleaned `sales_person` column (same cleaning rule as Dim_Sales)** so that downstream reports can aggregate sales and discounts by salesperson.
 
   Build `Fact_Sales` in these explicit steps:
@@ -37,7 +47,7 @@ In gold I want to have the following tables:
   3. In header-prep, materialize exactly one canonical salesperson column named `sales_person` using this precedence:
      - if `salesperson` exists, rename/copy it to `sales_person`;
      - else if `sales_person` already exists, use it;
-     - else fail fast with a clear validation message listing available `SalesOrderHeader` columns.
+     - else fail fast with a clear validation message that silver `SalesOrderHeader` is missing the original SalesLT salesperson field because it was not preserved from source; include the available `SalesOrderHeader` columns.
   4. Clean the canonical `sales_person` in header-prep by removing the `adventureworks/` prefix and removing any trailing numeric suffix at the end of the value.
   5. Keep `sales_person` in header-prep all the way through the final fact projection; it is a required output column and must not be dropped during renaming or column selection.
 
@@ -69,5 +79,6 @@ Create a semantic model on top of the gold layer where you can count the distinc
 
 ## Known constraints (from prior runs)
 - `SalesOrderHeader` silver did not contain a `sales_person` column; available columns were snake_case fields plus ingestion metadata. Standardize the raw salesperson field to `sales_person` explicitly before gold logic depends on it.
-- Validate required columns before gold transformations, especially on `SalesOrderHeader`: `sales_order_id` and the salesperson source column (`salesperson` or explicitly created `sales_person`).
+- A prior silver/gold path showed `SalesOrderHeader` columns like `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`, `rowguid`, `modified_date`, and metadata columns, but no salesperson field. This means the source `SalesPerson` column was dropped in silver; the next build must preserve it as `salesperson`.
+- Validate required columns before gold transformations, especially on `SalesOrderHeader`: `sales_order_id` and the salesperson source column (`salesperson` preferred, or explicitly created `sales_person`).
 - A prior gold run produced `Fact_Sales` without `sales_person` even though the salesperson summary depends on it. The final fact projection must explicitly include `h.sales_person AS sales_person`; do not rely on inherited columns or `select *`.
