@@ -23,12 +23,12 @@ You are a data agent following the FabricDataEngineer agent (https://github.com/
 Build 3 Spark notebooks (one per layer) — bronze, silver, gold — in a single lakehouse with schemas as the layer separator.
 
 - **Bronze**: 1:1 ingestion of the selected source tables into the `bronze` schema, adding `ingestion_timestamp`, `source_path`, `batch_id`, `ingestion_date` metadata columns. Mode: overwrite + overwriteSchema=true. Partitioned by `ingestion_date`.
-- **Silver**: dedupe, snake_case rename, drop fully-null columns, trim strings, add `ingestion_dt` and `source_dt` audit columns, `_silver_ts` timestamp. Mode: overwrite. After write run OPTIMIZE.
+- **Silver**: dedupe, snake_case rename, drop fully-null columns, trim strings, add `ingestion_dt` and `source_dt` audit columns, `_silver_ts` timestamp. Mode: overwrite. After write run OPTIMIZE. For all downstream gold logic, use the snake_case silver column names exactly as produced from source-system names. In particular, `SalesOrderHeader.SalesPerson` becomes `sales_person`; if the source table does not contain a `SalesPerson` field, do not invent it.
 - **Gold** (AdventureWorksLT shape):
   - **Dim_Customer** — join customer + customeraddress + address; keep all relevant fields. Use explicit DataFrame aliases for every joined table (`c`, `ca`, `a`) and qualify every selected/joined column with its alias. Join keys must be `c.customer_id = ca.customer_id` and `ca.address_id = a.address_id`. In the final projection, do not reference bare `address_id`; materialize it explicitly as `ca.address_id AS address_id` for the dimension key/bridge reference, and if the physical address table key is also needed expose it only as a separately named column such as `a.address_id AS source_address_id`. This join must not contain any unqualified `address_id` reference.
   - **Dim_Product** — join product + productcategory (self-join: subcategory → parent category) + productdescription + productmodel + productmodelproductdescription; expose `category` and `subcategory`. Use aliases consistently on self-joins and shared key names to avoid ambiguous references.
-  - **Dim_Sales** — degenerate dimension on the cleaned salesperson from salesorderheader (strip leading `adventureworks/`, strip trailing digits).
-  - **Fact_Sales** — join salesorderdetail + salesorderheader, keep all relevant fields, AND include the cleaned `sales_person` column (same cleaning as Dim_Sales) so reports can aggregate by it.
+  - **Dim_Sales** — build from `silver.sales_order_header` only after first verifying the cleaned silver column `sales_person` exists in that DataFrame. Apply salesperson cleaning only to `soh.sales_person` (not to any guessed variant such as `salesperson` or `sales_person_name`): strip leading `adventureworks/`, `adventure-works/`, or `adventure works/` case-insensitively, then strip trailing digits, then trim. If `sales_person` is absent in `silver.sales_order_header`, skip creation of `dim_sales` and record a FAIL/ERROR row in `test.test_results` explaining that the source schema does not provide a salesperson column; do not call `select` or any transform against a non-existent `sales_person` column.
+  - **Fact_Sales** — join salesorderdetail + salesorderheader, keep all relevant fields, and include the cleaned `sales_person` column only if `silver.sales_order_header.sales_person` exists. Use explicit aliases (`sod`, `soh`) and qualify all shared columns. The salesperson cleaning logic here must reuse the same expression as **Dim_Sales** and must be applied specifically to `soh.sales_person`. If `sales_person` is absent, still build `fact_sales` without that column and log the missing-column condition to `test.test_results` instead of failing the notebook.
 
 ### Data quality tests (in the gold notebook)
 
@@ -38,7 +38,7 @@ Add a `test` schema with table `test_results` (run_id, test_name, layer, table_n
 2. No-null primary keys in gold dims.
 3. Unique primary keys in gold dims.
 4. Referential integrity (every fact_sales FK exists in its dim).
-5. Salesperson cleaning sanity (no `adventureworks/`, no trailing digit).
+5. Salesperson cleaning sanity (run this only when a gold `sales_person` column exists; otherwise write a FAIL/ERROR result with details `sales_person column missing in silver.sales_order_header`, rather than raising an exception).
 
 ## Semantic model
 
@@ -107,3 +107,4 @@ If the AISkill REST endpoint is not yet GA in the tenant, the reporting notebook
 ## Known constraints (from prior runs)
 - In gold-layer joins, any column name present in more than one input table must always be referenced with an alias prefix; never use bare shared names like `address_id`.
 - For `dim_customer`, `customer_address.address_id` is the canonical joined address key to project as `address_id`. If an additional address-table identifier is retained, it must be renamed to avoid collisions.
+- Before applying any gold-layer transform to salesperson data, validate that `silver.sales_order_header` actually contains the snake_case column `sales_person`; if not, branch gracefully and log the issue to `test.test_results` instead of raising `UNRESOLVED_COLUMN`.
