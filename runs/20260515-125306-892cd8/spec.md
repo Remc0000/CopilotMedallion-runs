@@ -25,10 +25,13 @@ You are a data agent, and you use your skills: https://github.com/microsoft/skil
 In silver I want to add fields for `ingestion_dt` and `source_dt`.
 
 For **all silver tables**, preserve business/source columns from Bronze and add metadata columns without dropping source fields unless there is an explicit rename. In particular, for `SalesOrderHeader`, the original SalesLT salesperson field must be retained and standardized for downstream gold use:
-- if the Bronze/source column is `SalesPerson`, create a silver snake_case column named `salesperson`;
-- if the Bronze/source column already lands as `salesperson`, keep it;
-- do not drop `salesperson` during silver standardization even if many other columns are converted to snake_case;
-- `sales_person` is a gold canonical field, not a required silver field.
+- treat the Bronze/source SalesLT column name as **exactly `SalesPerson`** for `SalesOrderHeader`;
+- in the silver `SalesOrderHeader` build, explicitly map `SalesPerson` -> `salesperson`;
+- `salesperson` is a **required** silver output column for `SalesOrderHeader`, even if many other columns are converted to snake_case;
+- do not rename `salesperson` to `sales_person` in silver;
+- do not drop `salesperson` during silver standardization, metadata enrichment, final select, deduplication, or column reordering;
+- after silver `SalesOrderHeader` transformation and before write, validate that both `sales_order_id` and `salesperson` are present in the dataframe columns; if either is missing, fail fast and include the final silver column list in the error;
+- the current known-good silver `SalesOrderHeader` shape must include all standard header fields plus metadata **and** `salesperson`; a silver shape that contains `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`, `rowguid`, `modified_date`, metadata columns, but no `salesperson`, is invalid and must not be written.
 
 In gold I want to have the following tables:
 
@@ -78,7 +81,7 @@ Use only one OneLake for bronze, silver and gold; use schemas to separate them. 
 Create a semantic model on top of the gold layer where you can count the distinct salespersons. Also I want to know which salespersons sell the most, but also give the most discounts. Create some reports on top of this!
 
 ## Known constraints (from prior runs)
-- `SalesOrderHeader` silver did not contain a `sales_person` column; available columns were snake_case fields plus ingestion metadata. Standardize the raw salesperson field to `sales_person` explicitly before gold logic depends on it.
-- A prior silver/gold path showed `SalesOrderHeader` columns like `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`, `rowguid`, `modified_date`, and metadata columns, but no salesperson field. This means the source `SalesPerson` column was dropped in silver; the next build must preserve it as `salesperson`.
+- `SalesOrderHeader` silver did not contain a `sales_person` column; available columns were snake_case fields plus ingestion metadata. The root issue was that the original source column `SalesPerson` was dropped before silver write. In the next build, preserve it in silver as **`salesperson`**.
+- A prior silver `SalesOrderHeader` column list was `['sales_order_id', 'revision_number', 'order_date', 'due_date', 'ship_date', 'status', 'online_order_flag', 'sales_order_number', 'purchase_order_number', 'account_number', 'customer_id', 'ship_to_address_id', 'bill_to_address_id', 'ship_method', 'sub_total', 'tax_amt', 'freight', 'total_due', 'rowguid', 'modified_date', 'ingestion_timestamp', 'source_path', 'batch_id', 'ingestion_date', 'ingestion_dt', 'source_dt', '_silver_ts']` with no salesperson field. This exact outcome is invalid; silver must include `salesperson` before any gold notebook runs.
 - Validate required columns before gold transformations, especially on `SalesOrderHeader`: `sales_order_id` and the salesperson source column (`salesperson` preferred, or explicitly created `sales_person`).
 - A prior gold run produced `Fact_Sales` without `sales_person` even though the salesperson summary depends on it. The final fact projection must explicitly include `h.sales_person AS sales_person`; do not rely on inherited columns or `select *`.
