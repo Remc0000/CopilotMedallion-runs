@@ -2,15 +2,14 @@
 
 ## Updated specs
 
-### Iteration 7 — 2026-05-16 13:27:21Z — failed layer: bronze (run: 20260516-122334-99df4d)
-- **Root cause (1-line summary)**: Spark session cancelled due to inefficient or missing partition pruning and ambiguous column references in Bronze ingestion.
+### Iteration 8 — 2026-05-16 13:30:08Z — failed layer: bronze (run: 20260516-122334-99df4d)
+- **Root cause (1-line summary)**: Spark session cancelled due to ambiguous column references and missing explicit aliasing in Bronze ingestion queries.
 - **What was changed**:
-  - In the Bronze section, explicitly require aliasing all source tables before any transformations or joins.
-  - For `SalesOrderHeader`, enforce alias `soh` and validate that `soh.OrderDate` exists, is non-null, and is a date type before partitioning.
-  - For `SalesOrderDetail`, enforce alias `sod` and require a left join to `SalesOrderHeader` aliased as `soh` on `SalesOrderID` to retrieve `soh.OrderDate`; define partition column as `partition_date = coalesce(soh.OrderDate, sod.ModifiedDate)` with explicit null and type checks.
-  - For `CustomerAddress`, enforce alias `ca` and validate `ca.ModifiedDate` exists, is non-null, and is date type before partitioning.
-  - Mandate prefixing all columns with table aliases in joins and partitionBy clauses to avoid ambiguous references and improve query optimization.
-  - Add explicit assertions on partition columns to prevent nulls and ensure correct data types before write operations to reduce timeout risk.
+  - Strengthened the Bronze section to mandate explicit aliasing of all source tables before any transformations or joins.
+  - Enforced prefixing all column references with their table aliases in all joins, filters, and partitionBy clauses to eliminate ambiguity.
+  - Added explicit validation steps to confirm existence, non-nullability, and correct date type of partition columns (`soh.OrderDate`, `partition_date`, `ca.ModifiedDate`) before write operations.
+  - Clarified join keys and alias usage for `SalesOrderDetail` left join to `SalesOrderHeader` on `SalesOrderID` to derive `partition_date`.
+  - Added explicit instructions to coalesce `partition_date` from `soh.OrderDate` and `sod.ModifiedDate` with null and type checks.
 
 ## Inputs
 - Workspace: `f81d9542-fe59-4e24-8ed8-0f73db2693ce`
@@ -61,16 +60,19 @@ Standard cross-cutting code rules:
     - Alias source as `soh`.
     - Assert `soh.OrderDate` column exists, is non-null, and is of date type before write.
     - Partition by `soh.OrderDate` (date part).
+    - All column references in transformations and partitionBy must be prefixed with `soh.`.
   - For `SalesOrderDetail`:
     - Alias source as `sod`.
     - Left join `sod` with `SalesOrderHeader` aliased as `soh` on `sod.SalesOrderID = soh.SalesOrderID` to retrieve `soh.OrderDate`.
     - Define a partition column `partition_date` as `coalesce(soh.OrderDate, sod.ModifiedDate)`.
     - Assert `partition_date` exists, is non-null, and is of date type before write.
     - Partition by `partition_date`.
+    - All column references in transformations, joins, and partitionBy must be prefixed with their respective aliases (`sod.` or `soh.`).
   - For `CustomerAddress`:
     - Alias source as `ca`.
     - Assert `ca.ModifiedDate` column exists, is non-null, and is of date type before write.
     - Partition by `ca.ModifiedDate` (date part).
+    - All column references must be prefixed with `ca.`.
   - Other tables ingested without partitioning due to smaller size or lack of natural partition key.
 - Preserve original column names and types exactly.
 - Include full audit columns from source (`ModifiedDate`, `rowguid`).
