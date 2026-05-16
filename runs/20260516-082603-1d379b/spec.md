@@ -1,5 +1,14 @@
 # Run Spec 20260516-081758-967a7c
 
+## Updated specs
+
+### Iteration 1 — 2026-05-16 08:33:34Z — failed layer: reporting (run: 20260516-082603-1d379b)
+- **Root cause (1-line summary)**: Reporting step failed while creating the semantic model because the spec allowed multiple conflicting semantic-model shapes and role-playing options, leaving the model definition underspecified.
+- **What was changed**:
+  - Tightened **Gold** to use exactly one order-level table in addition to the line fact: `gold.dim_sales_order` instead of a second fact table.
+  - Tightened **Semantic model** to a single required table list, explicit relationship endpoints, and required role-played address tables so model creation is deterministic.
+  - Tightened **Report** and **Data Agent** to reference the finalized semantic model objects and measures only.
+
 ## Inputs
 - Workspace: `24bf4b77-62a2-4cd3-ba8f-da166af94f79`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -41,6 +50,7 @@ Standard cross-cutting code rules:
 - Add ingestion metadata columns consistently across Bronze/Silver/Gold where appropriate.
 - Prefer deterministic dedup logic using business keys plus `modified_date` or ingestion timestamp.
 - Optimize Delta tables after major writes; where useful, partition only when there is a clear selective date column and enough volume.
+- For semantic model creation, do not leave optional/alternative table names or relationship shapes unresolved at build time. The model definition must reference only tables and columns that are explicitly required by this spec and actually produced in Gold.
 
 ## Bronze
 Land each selected source object into the `bronze` schema as raw-conformed Delta tables with minimal transformation.
@@ -168,7 +178,7 @@ Create cleaned, typed, deduplicated, snake_case-conformed tables in the `silver`
   - Upper/lower standardization for `address_type`.
 - Modeling note:
   - Junction table connecting customers to addresses; can support billing/shipping role analysis.
-  - Alternative: rely only on `sales_order_header.ship_to_address_id` and `bill_to_address_id` for order analytics and keep this table for customer master views.
+  - Alternative: rely only on `sales_order_header.ship_to_address_id` and `sales_order_header.bill_to_address_id` for order analytics and keep this table for customer master views.
 
 ### silver.product
 - Source: `bronze.product`
@@ -240,13 +250,12 @@ Create cleaned, typed, deduplicated, snake_case-conformed tables in the `silver`
 ### silver.v_product_and_description
 - Source: `bronze.v_product_and_description`
 - Dedup key:
-  - Plausible keys:
-    - `product_id`, `culture` if multilingual rows exist
-    - alternative: `product_id` only if one row per product in practice
+  - `product_id`, `culture`
 - Use:
   - Enrich product dimension with `product_model`, `description`, `culture`.
-- User-editable decision:
-  - If multiple cultures are present, either keep a separate localized dimension or filter to a preferred culture in Gold.
+- Required decision:
+  - Gold must filter this table to English only: `culture = 'en'` when present.
+  - After filtering to English, Gold `dim_product` must retain at most one row per `product_id`.
 
 ### silver.v_product_model_catalog_description
 - Source: `bronze.v_product_model_catalog_description`
@@ -263,13 +272,13 @@ Model a sales-oriented star schema because the actual tables show clear transact
 ### Modeling route selected
 - Primary route:
   - Line-level sales fact centered on `sales_order_detail`, enriched by `sales_order_header`.
-  - Dimensions from customer, product, product category, address, and date.
-- Plausible alternative route:
-  - Also create an order-header summary fact from `sales_order_header` for order-level KPIs. --> I don't want an extra fact, I want an extra dimension for order number etc
-- Plausible alternative route for product descriptions:
-  - Option A: enrich `dim_product` with one preferred-culture description from `v_product_and_description`.
-  - Option B: create `dim_product_localized` keyed by `product_id` + `culture`.
-- User may edit the spec to choose A or B if multilingual reporting is required. --> I don't need multi language, so english only is fine
+  - Dimensions from customer, product, address, date, and sales order.
+- Required modeling choice:
+  - Do not create `gold.fact_sales_order`.
+  - Create `gold.dim_sales_order` instead, as the extra dimension for order number and order-level descriptive attributes.
+- Product description choice:
+  - Use English only in Gold. Filter `silver.v_product_and_description` to `culture = 'en'` where the column exists.
+  - Do not create a multilingual dimension.
 
 ### Fact tables
 
@@ -277,13 +286,13 @@ Model a sales-oriented star schema because the actual tables show clear transact
 - Grain:
   - One row per `sales_order_id` + `sales_order_detail_id`
 - Built from:
-  - `silver.sales_order_detail` d
-  - inner/left join `silver.sales_order_header` h on `sales_order_id`
+  - `silver.sales_order_detail` as `d`
+  - left join `silver.sales_order_header` as `h` on `d.sales_order_id = h.sales_order_id`
 - Natural transaction keys retained:
   - `sales_order_id`
   - `sales_order_detail_id`
-  - `sales_order_number`
 - Foreign keys:
+  - `sales_order_id`
   - `customer_id`
   - `product_id`
   - `bill_to_address_id`
@@ -291,45 +300,75 @@ Model a sales-oriented star schema because the actual tables show clear transact
   - `order_date_key`
   - `due_date_key`
   - `ship_date_key`
-- Measures columns:
-  - `order_qty`
-  - `unit_price`
-  - `unit_price_discount`
-  - `line_total`
-  - `sub_total` from header only if needed for reconciliation, otherwise avoid repeating at line grain
-  - `tax_amt`
-  - `freight`
-  - `total_due`
+- Required output columns:
+  - From detail:
+    - `sales_order_id`
+    - `sales_order_detail_id`
+    - `product_id`
+    - `order_qty`
+    - `unit_price`
+    - `unit_price_discount`
+    - `line_total`
+  - From header:
+    - `customer_id`
+    - `bill_to_address_id`
+    - `ship_to_address_id`
+    - `online_order_flag`
+    - `order_date`
+    - `due_date`
+    - `ship_date`
+    - `sub_total`
+    - `tax_amt`
+    - `freight`
+    - `total_due`
 - Derived columns:
+  - `order_date_key = cast(date_format(order_date, 'yyyyMMdd') as int)`
+  - `due_date_key = cast(date_format(due_date, 'yyyyMMdd') as int)` when `due_date` is not null
+  - `ship_date_key = cast(date_format(ship_date, 'yyyyMMdd') as int)` when `ship_date` is not null
   - `gross_line_amount = order_qty * unit_price`
-  - `discount_amount = order_qty * unit_price * unit_price_discount` if discount is rate; alternative: if source semantics prove amount, keep raw field only
+  - `discount_amount = order_qty * unit_price * unit_price_discount`
   - `net_line_amount = line_total`
   - `is_online_order = online_order_flag`
 - Modeling caution:
-  - Header totals repeat across lines if joined to line grain; use explicit measures to avoid double counting header-level amounts.
+  - Header totals (`sub_total`, `tax_amt`, `freight`, `total_due`) repeat across lines and must be hidden in the semantic model to avoid accidental aggregation from line grain.
+  - Use alias-prefixed projection after the join; do not rely on `select("*")`.
 
-#### gold.fact_sales_order
-- Grain:
-  - One row per `sales_order_id`
-- Built from:
-  - `silver.sales_order_header`
-- Foreign keys:
+### Dimension tables
+
+#### gold.dim_sales_order
+- Source:
+  - `silver.sales_order_header` as `h`
+- Key:
+  - `sales_order_id`
+- Required attributes:
+  - `sales_order_number`
+  - `purchase_order_number`
+  - `account_number`
+  - `revision_number`
+  - `status`
+  - `ship_method`
   - `customer_id`
   - `bill_to_address_id`
   - `ship_to_address_id`
-  - `order_date_key`
-  - `due_date_key`
-  - `ship_date_key`
-- Measures columns:
+  - `online_order_flag`
+  - `order_date`
+  - `due_date`
+  - `ship_date`
   - `sub_total`
   - `tax_amt`
   - `freight`
   - `total_due`
-  - `order_count` as implicit row count
-- Use:
-  - Clean order-level KPI reporting without line-level duplication.
-
-### Dimension tables
+  - `order_date_key`
+  - `due_date_key`
+  - `ship_date_key`
+- Derived columns:
+  - `order_date_key = cast(date_format(order_date, 'yyyyMMdd') as int)`
+  - `due_date_key = cast(date_format(due_date, 'yyyyMMdd') as int)` when `due_date` is not null
+  - `ship_date_key = cast(date_format(ship_date, 'yyyyMMdd') as int)` when `ship_date` is not null
+  - `is_online_order = online_order_flag`
+- Notes:
+  - This is a conformed order dimension-like helper table for order number and order-level attributes, not a fact table.
+  - Keep exactly one row per `sales_order_id`.
 
 #### gold.dim_customer
 - Source:
@@ -358,18 +397,41 @@ Model a sales-oriented star schema because the actual tables show clear transact
 - Attributes:
   - `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`
 - Use:
-  - Role-played as billing and shipping address.
+  - Base address dimension used to derive the two role-played address dimensions below.
+
+#### gold.dim_ship_to_address
+- Source:
+  - `gold.dim_address`
+- Key:
+  - `address_id`
+- Attributes:
+  - `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`
+- Notes:
+  - Physical duplicate/role-played table required for simpler semantic-model relationships.
+
+#### gold.dim_bill_to_address
+- Source:
+  - `gold.dim_address`
+- Key:
+  - `address_id`
+- Attributes:
+  - `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`
+- Notes:
+  - Physical duplicate/role-played table required for simpler semantic-model relationships.
 
 #### gold.dim_product
 - Source:
-  - `silver.product` p
-  - left join `silver.product_category` pc on `p.product_category_id = pc.product_category_id`
-  - left join `silver.v_get_all_categories` c on category id
-  - left join `silver.product_model` pm on `p.product_model_id = pm.product_model_id`
-  - optional left join `silver.v_product_and_description` vpd on `p.product_id = vpd.product_id`
-  - optional left join `silver.v_product_model_catalog_description` vmcd on `p.product_model_id = vmcd.product_model_id`
+  - `silver.product` as `p`
+  - left join `silver.product_category` as `pc` on `p.product_category_id = pc.product_category_id`
+  - left join `silver.v_get_all_categories` as `c` on `p.product_category_id = c.product_category_id`
+  - left join `silver.product_model` as `pm` on `p.product_model_id = pm.product_model_id`
+  - left join filtered English-only `silver.v_product_and_description` as `vpd_en` on `p.product_id = vpd_en.product_id`
+  - left join `silver.v_product_model_catalog_description` as `vmcd` on `p.product_model_id = vmcd.product_model_id`
 - Key:
   - `product_id`
+- Required row-shape rule:
+  - Final `gold.dim_product` must have exactly one row per `product_id`.
+  - If `vpd_en` still contains duplicates for a `product_id`, resolve deterministically to one row using the latest available `modified_date`, otherwise latest ingestion metadata.
 - Core attributes:
   - `product_name`
   - `product_number`
@@ -387,14 +449,12 @@ Model a sales-oriented star schema because the actual tables show clear transact
   - `product_category_name`
   - `parent_product_category_name`
   - `product_model_name`
-  - `description` or preferred-culture description
+  - `description`
   - `manufacturer`
   - `material`
   - `style`
   - `product_line`
   - `rider_experience`
-- User-editable decision:
-  - If description/model attributes create duplicate product rows, split into `dim_product` and `dim_product_model`.
 
 #### gold.dim_date
 - Role-playing date dimension for:
@@ -420,7 +480,7 @@ Model a sales-oriented star schema because the actual tables show clear transact
 ### Data quality tests
 1. Row count reconciliation
 - Bronze to Silver row counts should match after excluding exact duplicates by dedup key.
-- Gold `fact_sales_order` row count should equal distinct `sales_order_id` from `silver.sales_order_header`.
+- Gold `dim_sales_order` row count should equal distinct `sales_order_id` from `silver.sales_order_header`.
 - Gold `fact_sales_order_line` row count should equal distinct (`sales_order_id`, `sales_order_detail_id`) from `silver.sales_order_detail`.
 
 2. No-null primary keys
@@ -441,7 +501,7 @@ Model a sales-oriented star schema because the actual tables show clear transact
   - `product_category_id`
   - `product_description_id`
   - `product_model_id`
-  - `sales_order_id`
+  - `sales_order_id` in `dim_sales_order`
   - composite `sales_order_id`, `sales_order_detail_id`
   - composite `customer_id`, `address_id`, `address_type`
 
@@ -470,51 +530,54 @@ Model a sales-oriented star schema because the actual tables show clear transact
 Build a Direct Lake semantic model over Gold with a star schema optimized for sales analytics.
 
 ### Tables
-- Facts:
+- Fact:
   - `fact_sales_order_line`
-  - `fact_sales_order`
 - Dimensions:
+  - `dim_sales_order`
   - `dim_customer`
   - `dim_product`
-  - `dim_address`
+  - `dim_ship_to_address`
+  - `dim_bill_to_address`
   - `dim_date`
-  - optional `bridge_customer_address`
+- Exclude from semantic model by default:
+  - `dim_address`
+  - `bridge_customer_address`
 
 ### Relationships
-- `fact_sales_order_line[customer_id]` -> `dim_customer[customer_id]` many-to-one
-- `fact_sales_order_line[product_id]` -> `dim_product[product_id]` many-to-one
-- `fact_sales_order_line[ship_to_address_id]` -> `dim_address[address_id]` many-to-one inactive or via role-playing copy
-- `fact_sales_order_line[bill_to_address_id]` -> `dim_address[address_id]` many-to-one inactive or via role-playing copy
-- `fact_sales_order_line[order_date_key]` -> `dim_date[date_key]` active
-- `fact_sales_order_line[due_date_key]` -> `dim_date[date_key]` inactive
-- `fact_sales_order_line[ship_date_key]` -> `dim_date[date_key]` inactive
-- `fact_sales_order[same FK pattern]` to the same dimensions
-- Recommended semantic simplification:
-  - Duplicate `dim_address` into `dim_ship_to_address` and `dim_bill_to_address`
-  - Duplicate `dim_date` views/roles for order, due, ship if authoring experience needs simpler active relationships
+- `fact_sales_order_line[sales_order_id]` -> `dim_sales_order[sales_order_id]` many-to-one active
+- `fact_sales_order_line[customer_id]` -> `dim_customer[customer_id]` many-to-one active
+- `fact_sales_order_line[product_id]` -> `dim_product[product_id]` many-to-one active
+- `fact_sales_order_line[ship_to_address_id]` -> `dim_ship_to_address[address_id]` many-to-one active
+- `fact_sales_order_line[bill_to_address_id]` -> `dim_bill_to_address[address_id]` many-to-one active
+- `fact_sales_order_line[order_date_key]` -> `dim_date[date_key]` many-to-one active
+- `fact_sales_order_line[due_date_key]` -> `dim_date[date_key]` many-to-one inactive
+- `fact_sales_order_line[ship_date_key]` -> `dim_date[date_key]` many-to-one inactive
+- Do not create any relationships referencing `fact_sales_order` because that table must not exist in this build.
 
 ### Measures
 - `Total Sales = SUM(fact_sales_order_line[net_line_amount])`
 - `Total Quantity = SUM(fact_sales_order_line[order_qty])`
-- `Order Count = DISTINCTCOUNT(fact_sales_order[sales_order_id])`
-- `Average Order Value = DIVIDE(SUM(fact_sales_order[total_due]), DISTINCTCOUNT(fact_sales_order[sales_order_id]))`
+- `Order Count = DISTINCTCOUNT(fact_sales_order_line[sales_order_id])`
+- `Average Order Value = DIVIDE([Total Sales], [Order Count])`
 - `Average Selling Price = DIVIDE(SUM(fact_sales_order_line[net_line_amount]), SUM(fact_sales_order_line[order_qty]))`
 - `Discount Amount = SUM(fact_sales_order_line[discount_amount])`
-- `Tax Amount = SUM(fact_sales_order[tax_amt])`
-- `Freight Amount = SUM(fact_sales_order[freight])`
-- `Online Order Count = CALCULATE(DISTINCTCOUNT(fact_sales_order[sales_order_id]), fact_sales_order[is_online_order] = TRUE())`
+- `Tax Amount = SUMX(VALUES(dim_sales_order[sales_order_id]), CALCULATE(MAX(dim_sales_order[tax_amt])))`
+- `Freight Amount = SUMX(VALUES(dim_sales_order[sales_order_id]), CALCULATE(MAX(dim_sales_order[freight])))`
+- `Online Order Count = CALCULATE(DISTINCTCOUNT(dim_sales_order[sales_order_id]), dim_sales_order[is_online_order] = TRUE())`
 - `Gross Margin = SUM(fact_sales_order_line[net_line_amount]) - SUMX(fact_sales_order_line, fact_sales_order_line[order_qty] * RELATED(dim_product[standard_cost]))`
 - `Gross Margin % = DIVIDE([Gross Margin], [Total Sales])`
 
 ### Semantic modeling notes
+- Required implementation rule:
+  - Create the semantic model with exactly the tables, relationships, and measures listed above.
+  - Do not infer optional copies, alternative facts, or extra bridge tables during model creation.
 - Hide technical columns:
   - rowguids, raw modified dates where not analytic, record hashes, run ids.
+  - In `fact_sales_order_line`, hide repeated header amount columns: `sub_total`, `tax_amt`, `freight`, `total_due`.
 - Format measures:
   - currency for sales/tax/freight/margin
   - whole number for counts/quantities
   - percentage for margin and discount rates if exposed
-- Alternative model:
-  - If user wants only a single fact, keep `fact_sales_order_line` and define header-safe measures using distinct order summarization patterns.
 
 ## Report
 Create a Power BI report tailored to the modeled sales/order/product/customer data.
@@ -529,9 +592,9 @@ Create a Power BI report tailored to the modeled sales/order/product/customer da
 - Line chart:
   - Total Sales by `dim_date[month]` using order date
 - Clustered column chart:
-  - Total Sales by `dim_product[parent_product_category_name]` or `product_category_name`
+  - Total Sales by `dim_product[parent_product_category_name]` or `dim_product[product_category_name]`
 - Donut chart:
-  - Online vs offline order count using `online_order_flag`
+  - Online vs offline order count using `dim_sales_order[is_online_order]`
 - Matrix:
   - Product category -> product name with Total Sales, Quantity, Gross Margin
 
@@ -539,11 +602,11 @@ Create a Power BI report tailored to the modeled sales/order/product/customer da
 - Map or filled map:
   - Total Sales by `dim_ship_to_address[country_region]`, `state_province`, `city`
 - Bar chart:
-  - Top customers by Total Sales using `customer_display_name`
+  - Top customers by Total Sales using `dim_customer[customer_display_name]`
 - Table:
   - Customer, company, email, phone, order count, total sales
 - Stacked bar:
-  - Sales by billing vs shipping country if both role dimensions are surfaced
+  - Sales by billing vs shipping country using `dim_bill_to_address[country_region]` and `dim_ship_to_address[country_region]`
 - Slicer set:
   - Order date, country_region, sales_person, product category
 
@@ -555,7 +618,7 @@ Create a Power BI report tailored to the modeled sales/order/product/customer da
 - Matrix:
   - Product model, product, color, size, standard cost, list price, total sales, gross margin
 - Decomposition tree:
-  - Analyze Total Sales by category -> model -> product -> customer geography
+  - Analyze Total Sales by category -> model -> product -> shipping geography
 - Optional visual:
   - Description or manufacturer drill-through if enriched product attributes are included
 
@@ -593,10 +656,10 @@ Create an AISkill grounded on the semantic model.
 - Preferred business terms:
   - sales, orders, quantity, average order value, gross margin, online orders, category, product model, shipping geography
 - Important caveats:
-  - Order-level totals live in `fact_sales_order`
+  - Order-level descriptive attributes and header totals live in `dim_sales_order`
   - Line-level sales and quantity live in `fact_sales_order_line`
-  - Header amounts should not be summed from line grain without safe measures
-  - Product descriptions may be culture-specific if multiple cultures exist
+  - Header amounts repeated onto line grain must not be summed directly from `fact_sales_order_line`
+  - Product descriptions are English-only in this build
 
 ### Starter questions
 - What are total sales, order count, and average order value by month?
@@ -613,9 +676,9 @@ Create an AISkill grounded on the semantic model.
 ### Guardrails
 - Answer only from the grounded semantic model; do not invent entities or columns.
 - Prefer certified measures over ad hoc aggregations.
-- Use `fact_sales_order` for order-level financial totals and order counts.
+- Use `dim_sales_order` for order-level attributes, tax, freight, and online-order analysis.
 - Use `fact_sales_order_line` for product, quantity, and line-sales analysis.
-- If a request depends on multilingual product descriptions or undefined culture handling, state the ambiguity.
+- Do not reference `fact_sales_order`; it must not exist in this build.
 - Do not expose hidden technical metadata or dropped sensitive fields such as password values.
-- Flag when results may be affected by inactive relationships, especially due date/ship date and billing/ship address roles.
+- Flag when results may be affected by inactive relationships, especially due date/ship date.
 - If data quality test failures exist, mention they may affect confidence in the answer.
