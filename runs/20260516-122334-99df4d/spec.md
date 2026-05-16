@@ -2,11 +2,11 @@
 
 ## Updated specs
 
-### Iteration 6 — 2026-05-16 13:24:34Z — failed layer: bronze (run: 20260516-122334-99df4d)
-- **Root cause (1-line summary)**: Timeout caused by inefficient or missing partition pruning due to lack of explicit partition column aliasing and validation in Bronze ingestion.
+### Iteration 7 — 2026-05-16 13:27:21Z — failed layer: bronze (run: 20260516-122334-99df4d)
+- **Root cause (1-line summary)**: Spark session cancelled due to inefficient or missing partition pruning and ambiguous column references in Bronze ingestion.
 - **What was changed**:
-  - Enhanced Bronze section to require explicit aliasing of all source tables before any transformations or joins.
-  - For `SalesOrderHeader`, enforce alias `soh` and explicit validation that `soh.OrderDate` exists, is non-null, and is a date type before partitioning.
+  - In the Bronze section, explicitly require aliasing all source tables before any transformations or joins.
+  - For `SalesOrderHeader`, enforce alias `soh` and validate that `soh.OrderDate` exists, is non-null, and is a date type before partitioning.
   - For `SalesOrderDetail`, enforce alias `sod` and require a left join to `SalesOrderHeader` aliased as `soh` on `SalesOrderID` to retrieve `soh.OrderDate`; define partition column as `partition_date = coalesce(soh.OrderDate, sod.ModifiedDate)` with explicit null and type checks.
   - For `CustomerAddress`, enforce alias `ca` and validate `ca.ModifiedDate` exists, is non-null, and is date type before partitioning.
   - Mandate prefixing all columns with table aliases in joins and partitionBy clauses to avoid ambiguous references and improve query optimization.
