@@ -2,13 +2,13 @@
 
 ## Updated specs
 
-### Iteration 4 — 2026-05-16 12:34:34Z — failed layer: bronze (run: 20260516-122334-99df4d)
+### Iteration 5 — 2026-05-16 12:37:19Z — failed layer: bronze (run: 20260516-122334-99df4d)
 - **Root cause (1-line summary)**: Ambiguous or missing partition column references and lack of explicit aliasing caused Spark session failure during Bronze ingestion.
 - **What was changed**:
   - Strengthened Bronze section to mandate explicit aliasing of all source tables before any transformations.
   - For `SalesOrderHeader`, explicitly require alias `soh` and assert `soh.OrderDate` exists, is non-null, and is date type before partitioning.
   - For `SalesOrderDetail`, require alias `sod` and left join with `SalesOrderHeader` aliased as `soh` on `SalesOrderID` to retrieve `soh.OrderDate`; define partition column as `coalesce(soh.OrderDate, sod.ModifiedDate)` with explicit assertions.
-  - For `CustomerAddress`, require alias `ca` and assert `ca.ModifiedDate` exists, non-null, and is date type before partitioning.
+  - For `CustomerAddress`, require alias `ca` and assert `ca.ModifiedDate` exists, is non-null, and is date type before partitioning.
   - Enforce prefixing all columns with table aliases in joins and partitionBy clauses to avoid ambiguous references.
   - Add explicit null and type checks on partition columns before write operations.
 
