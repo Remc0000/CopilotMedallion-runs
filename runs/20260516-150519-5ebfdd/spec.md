@@ -16,6 +16,13 @@
   - Tightened **Silver** customer and salesperson/sales preparation with explicit minimum required columns, optional-column handling, and a fallback rule that avoids building a salesperson dimension when `SalesPerson` is not present in `bronze_salesorderheader`.
   - Tightened **Gold**, **Semantic model**, **Report**, and **Data Agent** so the salespeople dimension/relationship/visuals are only created if `SalesPersonNameClean` exists from silver.
 
+### Iteration 3 — 2026-05-16 19:16:17Z — failed layer: bronze (run: 20260516-150519-5ebfdd)
+- **Root cause (1-line summary)**: Bronze build likely failed because the spec required ingesting AdventureWorks tables that may not physically exist in the available source/schema, causing statement failures before downstream processing.
+- **What was changed**:
+  - Tightened **Generic guidance** to require a bronze schema/source inventory first and to ingest only physically available listed source tables.
+  - Tightened **Bronze** with explicit required vs optional source tables and a fail-fast rule that only the minimum join-critical tables are mandatory.
+  - Tightened **Silver Product preparation** so product-enrichment joins are conditional on the optional bronze tables actually existing, while preserving a valid minimum one-row-per-`ProductID` output from `bronze_product`.
+
 ## Inputs
 Dim_Customer -> join customer, customer address, address and leave all relevant/meaningfull fields
 Dim_Product -> join product, productcategory, producdescription, productmodel, productmodelproductdescription. Please notice that in productcategory there is a self join. So in the end I have the category (which is the parent category) and a subcategory.
@@ -27,10 +34,13 @@ Use Medallion architecture
 Use Microsoft Fabric
 Use dimensional modelling
 Keep bronze close to source, silver for preparation, and gold for model-ready dimensional tables.
+At the start of the build, perform a source inventory against the available AdventureWorks objects and only ingest tables that physically exist and are accessible in the source environment.
+Treat source-table existence as a separate validation from column existence: do not attempt to read or create a bronze table for a source object that is absent from the source.
 For every join outside bronze, use explicit table aliases and fully qualified column references to avoid ambiguous or unresolved column selection.
 Do not use `select *` in silver or gold. Project the final required columns explicitly and rename them to stable business-friendly names.
 Before building each silver table, inspect the bronze schema and only reference columns that physically exist in the ingested source table. If a requested attribute is not present, omit it from the output instead of failing the build.
 Treat these as optional unless confirmed present in bronze: `CustomerAddress.AddressType`, `Address.StateProvince`, `SalesOrderHeader.SalesPerson`, `SalesOrderHeader.PurchaseOrderNumber`, `SalesOrderHeader.AccountNumber`, `SalesOrderHeader.Status`, `SalesOrderHeader.OnlineOrderFlag`, `SalesOrderHeader.SubTotal`, `SalesOrderHeader.TaxAmt`, `SalesOrderHeader.Freight`, `SalesOrderHeader.TotalDue`, `SalesOrderDetail.CarrierTrackingNumber`.
+Treat these source tables as optional unless confirmed present in the source inventory and successfully landed to bronze: `ProductCategory`, `ProductDescription`, `ProductModel`, `ProductModelProductDescription`.
 Silver outputs must always satisfy their minimum required schema with stable column names; optional columns may be omitted entirely when absent in bronze.
 Gold tables must be model-safe:
 - each dimension must have a deterministic primary business key column
@@ -47,37 +57,48 @@ Store the source data in its original form in Fabric so it can be consumed by do
 
 ### source
 AdventureWorks tables required to satisfy the requested dimensional model:
+
+Required source tables:
 - Customer
 - CustomerAddress
 - Address
 - Product
+- SalesOrderHeader
+- SalesOrderDetail
+
+Optional source tables for product enrichment only:
 - ProductCategory
 - ProductDescription
 - ProductModel
 - ProductModelProductDescription
-- SalesOrderHeader
-- SalesOrderDetail
 
 ### destination
-Fabric Lakehouse bronze layer tables, one table per source object.
+Fabric Lakehouse bronze layer tables, one table per ingested source object.
 
 ### logic
-- Ingest each source table as-is from AdventureWorks into the bronze lakehouse.
+- First validate which listed AdventureWorks source tables physically exist and are readable.
+- Ingest each available source table as-is from AdventureWorks into the bronze lakehouse.
 - Preserve source column names.
 - Do not apply business transformations in bronze.
 - Add standard ingestion metadata where available, such as load timestamp.
+- Fail fast only if any required source table is missing or unreadable: `Customer`, `CustomerAddress`, `Address`, `Product`, `SalesOrderHeader`, `SalesOrderDetail`.
+- Do not fail the bronze build for missing optional product-enrichment tables: `ProductCategory`, `ProductDescription`, `ProductModel`, `ProductModelProductDescription`.
+- Only create bronze tables for source objects that were successfully ingested.
 
 ### output tables
+Required:
 - bronze_customer
 - bronze_customeraddress
 - bronze_address
 - bronze_product
+- bronze_salesorderheader
+- bronze_salesorderdetail
+
+Optional when corresponding source tables exist:
 - bronze_productcategory
 - bronze_productdescription
 - bronze_productmodel
 - bronze_productmodelproductdescription
-- bronze_salesorderheader
-- bronze_salesorderdetail
 
 ## Silver
 ### goal
@@ -133,41 +154,47 @@ Additional requirement for downstream gold:
 #### Product preparation
 Create a prepared product dataset from:
 - bronze_product
-- bronze_productcategory
-- bronze_productdescription
-- bronze_productmodel
-- bronze_productmodelproductdescription
+- bronze_productcategory only if it exists
+- bronze_productdescription only if it exists
+- bronze_productmodel only if it exists
+- bronze_productmodelproductdescription only if it exists
 
 Transformations:
-- Join product to productmodel on `p.ProductModelID = pm.ProductModelID`.
-- Join productmodel to productmodelproductdescription on `pm.ProductModelID = pmpd.ProductModelID`.
-- Join productmodelproductdescription to productdescription on `pmpd.ProductDescriptionID = pd.ProductDescriptionID`.
+- `bronze_product` is the required base table and must drive the output grain.
+- Always build `silver_product_prepared` from `bronze_product` even if one or more optional product-enrichment bronze tables are absent.
 - Use explicit aliases: `p` for product, `pm` for productmodel, `pmpd` for productmodelproductdescription, `pd` for productdescription, `pc_child` for child category, `pc_parent` for parent category.
-- Resolve product category hierarchy using a self-join on productcategory:
+- Join product to productmodel on `p.ProductModelID = pm.ProductModelID` only when both `bronze_productmodel` exists and both join columns physically exist.
+- Join productmodel to productmodelproductdescription on `pm.ProductModelID = pmpd.ProductModelID` only when `bronze_productmodelproductdescription` exists and both join columns physically exist.
+- Join productmodelproductdescription to productdescription on `pmpd.ProductDescriptionID = pd.ProductDescriptionID` only when `bronze_productdescription` exists and both join columns physically exist.
+- Resolve product category hierarchy only when `bronze_productcategory` exists and the needed columns physically exist:
   - child category represents `Subcategory`
   - parent category represents `Category`
-- Join product to the child productcategory using `p.ProductSubcategoryID = pc_child.ProductCategoryID`.
-- Join child category to parent category using `pc_child.ParentProductCategoryID = pc_parent.ProductCategoryID`.
-- Rename product name to `ProductName`.
-- Rename model name to `ProductModelName`.
-- Rename description text to `ProductDescription`.
-- Retain one row per `ProductID`. If multiple descriptions exist for the same product model, select one deterministic row per `ProductID` in silver or gold.
-- Only reference category/model/description columns that physically exist in their respective bronze tables.
+  - join product to child category using `p.ProductSubcategoryID = pc_child.ProductCategoryID`
+  - join child category to parent category using `pc_child.ParentProductCategoryID = pc_parent.ProductCategoryID`
+- Rename product name to `ProductName` only if a product name column physically exists in `bronze_product`.
+- Rename model name to `ProductModelName` only if a model name column physically exists in `bronze_productmodel`.
+- Rename description text to `ProductDescription` only if a description column physically exists in `bronze_productdescription`.
+- Retain one row per `ProductID`. If optional joins introduce multiple rows for the same product, select one deterministic row per `ProductID` in silver or gold.
+- Do not reference `pc_child`, `pc_parent`, `pm`, `pmpd`, or `pd` columns unless the corresponding bronze table exists and the referenced columns physically exist.
+- If any optional product-enrichment table is absent, omit the dependent output columns rather than failing the build.
+
+The minimum required columns for `silver_product_prepared` are:
+- `ProductID` from `p.ProductID`
 
 Expected prepared fields include:
 - ProductID
-- ProductName
-- ProductNumber
-- Color
-- StandardCost
-- ListPrice
-- Size
-- Weight
-- ProductModelID
-- ProductModelName
-- ProductDescription
-- Subcategory
-- Category
+- ProductName if available
+- ProductNumber if available
+- Color if available
+- StandardCost if available
+- ListPrice if available
+- Size if available
+- Weight if available
+- ProductModelID if available
+- ProductModelName if available
+- ProductDescription if available
+- Subcategory if available
+- Category if available
 
 Suggested output:
 - silver_product_prepared
@@ -318,6 +345,7 @@ Rules:
   - `ProductDescription`
   - `Subcategory`
   - `Category`
+- If optional product-enrichment columns were omitted in silver because the upstream bronze tables were absent, omit those same columns from gold rather than failing the build.
 
 Primary key:
 - `ProductID`
@@ -564,6 +592,7 @@ Condition:
 ### report design guidance
 - Use SalesPersonNameClean instead of SalesPersonRaw in all end-user visuals when available.
 - Use the product hierarchy Category > Subcategory > ProductName for drill-down.
+- If optional product-enrichment fields such as `Category`, `Subcategory`, `ProductModelName`, or `ProductDescription` were omitted upstream, remove only the dependent visuals/slicers/fields rather than failing the report build.
 - Use consistent currency formatting for sales measures.
 - Apply interactive filtering across overview, product, customer/location, and salesperson pages.
 - Hide raw or technical fields from the field list where not needed.
@@ -613,6 +642,7 @@ Provide business-friendly synonyms:
 ### behavior guidance
 - Prefer cleaned salesperson names from Dim_Sales[SalesPersonNameClean] in all responses when Dim_Sales exists.
 - Interpret product hierarchy questions using Category and Subcategory before ProductName where relevant.
+- If optional product hierarchy attributes were not built upstream, answer with the next available product grain instead of failing.
 - Interpret customer geography questions using City, StateProvince, and PostalCode from Dim_Customer.
 - Use Sales Amount as the default metric when a user asks general sales questions without specifying a measure.
 - When users ask for “top products,” rank by Sales Amount unless another metric is specified.
