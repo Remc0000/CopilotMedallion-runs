@@ -9,6 +9,13 @@
   - Tightened **Silver** customer and sales prep so the exact customer/address and salesperson columns needed by gold are always present with stable names.
   - Added explicit **Gold** build rules, table schemas, and join keys for `gold_dim_customer`, `gold_dim_product`, `gold_dim_sales`, and `gold_fact_sales`, including a required single-row-per-`CustomerID` customer dimension.
 
+### Iteration 2 — 2026-05-16 19:12:52Z — failed layer: silver (run: 20260516-150519-5ebfdd)
+- **Root cause (1-line summary)**: Silver layer likely failed due to referencing source columns that may not exist in the ingested AdventureWorks tables, especially `CustomerAddress.AddressType`, `Address.StateProvince`, and `SalesOrderHeader.SalesPerson`.
+- **What was changed**:
+  - Tightened **Generic guidance** to require schema-first silver builds that only reference physically present bronze columns and to skip optional attributes cleanly when absent.
+  - Tightened **Silver** customer and salesperson/sales preparation with explicit minimum required columns, optional-column handling, and a fallback rule that avoids building a salesperson dimension when `SalesPerson` is not present in `bronze_salesorderheader`.
+  - Tightened **Gold**, **Semantic model**, **Report**, and **Data Agent** so the salespeople dimension/relationship/visuals are only created if `SalesPersonNameClean` exists from silver.
+
 ## Inputs
 Dim_Customer -> join customer, customer address, address and leave all relevant/meaningfull fields
 Dim_Product -> join product, productcategory, producdescription, productmodel, productmodelproductdescription. Please notice that in productcategory there is a self join. So in the end I have the category (which is the parent category) and a subcategory.
@@ -22,11 +29,14 @@ Use dimensional modelling
 Keep bronze close to source, silver for preparation, and gold for model-ready dimensional tables.
 For every join outside bronze, use explicit table aliases and fully qualified column references to avoid ambiguous or unresolved column selection.
 Do not use `select *` in silver or gold. Project the final required columns explicitly and rename them to stable business-friendly names.
+Before building each silver table, inspect the bronze schema and only reference columns that physically exist in the ingested source table. If a requested attribute is not present, omit it from the output instead of failing the build.
+Treat these as optional unless confirmed present in bronze: `CustomerAddress.AddressType`, `Address.StateProvince`, `SalesOrderHeader.SalesPerson`, `SalesOrderHeader.PurchaseOrderNumber`, `SalesOrderHeader.AccountNumber`, `SalesOrderHeader.Status`, `SalesOrderHeader.OnlineOrderFlag`, `SalesOrderHeader.SubTotal`, `SalesOrderHeader.TaxAmt`, `SalesOrderHeader.Freight`, `SalesOrderHeader.TotalDue`, `SalesOrderDetail.CarrierTrackingNumber`.
+Silver outputs must always satisfy their minimum required schema with stable column names; optional columns may be omitted entirely when absent in bronze.
 Gold tables must be model-safe:
 - each dimension must have a deterministic primary business key column
 - `gold_dim_customer` must contain exactly one row per `CustomerID`
 - `gold_dim_product` must contain exactly one row per `ProductID`
-- `gold_dim_sales` must contain exactly one row per `SalesPersonNameClean`
+- create `gold_dim_sales` only if `SalesPersonNameClean` exists in silver and contains nonblank values
 - `gold_fact_sales` must remain at sales order line grain: one row per `SalesOrderDetailID`
 If multiple source rows exist for a dimension business key, resolve them in silver/gold with an explicit rule rather than allowing duplicates to flow into the semantic model.
 When a requested source attribute does not physically exist in the listed AdventureWorks source tables, do not invent additional joins; only include that attribute if present in the ingested tables.
@@ -83,26 +93,35 @@ Create a prepared customer dataset from:
 
 Transformations:
 - Standardize key column names for downstream joins.
-- Join customer to customeraddress on `CustomerID`.
-- Join customeraddress to address on `AddressID`.
+- Join customer to customeraddress on `c.CustomerID = ca.CustomerID`.
+- Join customeraddress to address on `ca.AddressID = a.AddressID`.
 - Use explicit aliases: `c` for customer, `ca` for customeraddress, `a` for address.
 - Retain meaningful customer and address attributes needed for a customer dimension.
 - Deduplicate only exact technical duplicates.
 - Keep one row per valid customer-address relationship in this prepared table.
-- Ensure the prepared output contains the exact downstream columns `CustomerID` and `AddressID`.
-- If `AddressType` exists in `bronze_customeraddress`, keep it as `AddressType`. If it does not exist, omit it rather than deriving it.
-- If address-related columns such as `StateProvince` do not exist in the ingested `Address` table, do not fabricate them.
+- The minimum required columns for `silver_customer_prepared` are:
+  - `CustomerID` from `c.CustomerID`
+  - `AddressID` from `ca.AddressID`
+  - `AddressLine1` from `a.AddressLine1` if present
+  - `AddressLine2` from `a.AddressLine2` if present
+  - `City` from `a.City` if present
+  - `PostalCode` from `a.PostalCode` if present
+- Include `AddressType` only if `ca.AddressType` physically exists in `bronze_customeraddress`; otherwise omit it.
+- Include `StateProvince` only if a column with exactly that name physically exists in `bronze_address`; otherwise omit it. Do not assume or derive `StateProvince` from any other table.
+- Do not reference any customer descriptive columns unless they physically exist in `bronze_customer`.
+- Ensure the prepared output always contains the exact downstream columns `CustomerID` and `AddressID`.
+- If either `CustomerID` or `AddressID` is missing from the source schema, fail fast because the requested customer join cannot be built.
 
 Expected prepared fields include:
 - CustomerID
 - AddressID
 - AddressType if available
 - Customer-level descriptive attributes available in source
-- AddressLine1
-- AddressLine2
-- City
-- StateProvince if available through address-related source columns present in the ingested tables
-- PostalCode
+- AddressLine1 if available
+- AddressLine2 if available
+- City if available
+- StateProvince if available through a physical column named `StateProvince` in the ingested `Address` table
+- PostalCode if available
 
 Suggested output:
 - silver_customer_prepared
@@ -120,9 +139,9 @@ Create a prepared product dataset from:
 - bronze_productmodelproductdescription
 
 Transformations:
-- Join product to productmodel on `ProductModelID`.
-- Join productmodel to productmodelproductdescription on `ProductModelID`.
-- Join productmodelproductdescription to productdescription on `ProductDescriptionID`.
+- Join product to productmodel on `p.ProductModelID = pm.ProductModelID`.
+- Join productmodel to productmodelproductdescription on `pm.ProductModelID = pmpd.ProductModelID`.
+- Join productmodelproductdescription to productdescription on `pmpd.ProductDescriptionID = pd.ProductDescriptionID`.
 - Use explicit aliases: `p` for product, `pm` for productmodel, `pmpd` for productmodelproductdescription, `pd` for productdescription, `pc_child` for child category, `pc_parent` for parent category.
 - Resolve product category hierarchy using a self-join on productcategory:
   - child category represents `Subcategory`
@@ -133,6 +152,7 @@ Transformations:
 - Rename model name to `ProductModelName`.
 - Rename description text to `ProductDescription`.
 - Retain one row per `ProductID`. If multiple descriptions exist for the same product model, select one deterministic row per `ProductID` in silver or gold.
+- Only reference category/model/description columns that physically exist in their respective bronze tables.
 
 Expected prepared fields include:
 - ProductID
@@ -157,21 +177,27 @@ Create a prepared salesperson dataset from:
 - bronze_salesorderheader
 
 Transformations:
-- Extract distinct salesperson values from `SalesOrderHeader.SalesPerson`.
-- Clean the salesperson string by:
-  - removing the `adventureworks/` prefix
-  - removing trailing numeric suffix at the end of the name
-- Trim whitespace after cleansing.
-- Exclude null or empty salesperson values from the dimension output if they do not represent valid salespeople.
-- Keep the raw source column as `SalesPersonRaw`.
-- Output the cleaned value as `SalesPersonNameClean`.
+- First inspect `bronze_salesorderheader` schema.
+- Only perform salesperson cleansing if a column named exactly `SalesPerson` physically exists in `bronze_salesorderheader`.
+- If `SalesPerson` exists:
+  - Extract distinct salesperson values from `SalesOrderHeader.SalesPerson`.
+  - Clean the salesperson string by:
+    - removing the `adventureworks/` prefix
+    - removing trailing numeric suffix at the end of the name
+  - Trim whitespace after cleansing.
+  - Exclude null or empty salesperson values from the dimension output if they do not represent valid salespeople.
+  - Keep the raw source column as `SalesPersonRaw`.
+  - Output the cleaned value as `SalesPersonNameClean`.
+- If `SalesPerson` does not exist:
+  - do not fabricate `SalesPersonRaw` or `SalesPersonNameClean`
+  - skip creation of `silver_salesperson_prepared`
 
 Expected prepared fields include:
 - SalesPersonRaw
 - SalesPersonNameClean
 
 Suggested output:
-- silver_salesperson_prepared
+- silver_salesperson_prepared only when `bronze_salesorderheader.SalesPerson` exists
 
 #### Sales fact preparation
 Create a prepared sales dataset from:
@@ -179,30 +205,46 @@ Create a prepared sales dataset from:
 - bronze_salesorderheader
 
 Transformations:
-- Join salesorderdetail to salesorderheader on `SalesOrderID`.
+- Join salesorderdetail to salesorderheader on `d.SalesOrderID = h.SalesOrderID`.
 - Use explicit aliases: `d` for salesorderdetail and `h` for salesorderheader.
 - Preserve line-level grain from `salesorderdetail`, with one row per `SalesOrderDetailID`.
 - Standardize key names and date fields for downstream fact modelling.
-- Carry the raw salesperson value from header as `SalesPersonRaw`.
-- Also create `SalesPersonNameClean` in this table using the same cleansing rule used in `silver_salesperson_prepared`, so gold fact can join consistently to `gold_dim_sales` on the cleaned name.
 - Explicitly project only the required detail and header fields.
+- The minimum required columns for `silver_sales_prepared` are:
+  - `SalesOrderID` from `d.SalesOrderID`
+  - `SalesOrderDetailID` from `d.SalesOrderDetailID`
+  - `ProductID` from `d.ProductID`
+  - `OrderQty` from `d.OrderQty`
+  - `UnitPrice` from `d.UnitPrice`
+  - `UnitPriceDiscount` from `d.UnitPriceDiscount`
+  - `LineTotal` from `d.LineTotal`
+  - `CustomerID` from `h.CustomerID`
+  - `OrderDate` from `h.OrderDate` if present
+  - `DueDate` from `h.DueDate` if present
+  - `ShipDate` from `h.ShipDate` if present
+  - `SalesOrderNumber` from `h.SalesOrderNumber` if present
+- Include `CarrierTrackingNumber` only if `d.CarrierTrackingNumber` exists.
+- Include `PurchaseOrderNumber`, `AccountNumber`, `Status`, `OnlineOrderFlag`, `SubTotal`, `TaxAmt`, `Freight`, and `TotalDue` only if they physically exist in `bronze_salesorderheader`.
+- Only create `SalesPersonRaw` and `SalesPersonNameClean` in this table if `h.SalesPerson` physically exists; otherwise omit both columns from `silver_sales_prepared`.
+- If `h.SalesPerson` exists, the cleansing rule must exactly match the rule used in `silver_salesperson_prepared` so gold fact can join consistently to `gold_dim_sales`.
+- If `SalesOrderID` is missing from either side, or `SalesOrderDetailID` is missing from detail, fail fast because fact grain cannot be built.
 
 Expected prepared fields include:
 - SalesOrderID
 - SalesOrderDetailID
-- OrderDate
-- DueDate
-- ShipDate
+- OrderDate if available
+- DueDate if available
+- ShipDate if available
 - CustomerID
-- SalesPersonRaw
-- SalesPersonNameClean
+- SalesPersonRaw if available
+- SalesPersonNameClean if available
 - ProductID
 - OrderQty
 - UnitPrice
 - UnitPriceDiscount
 - LineTotal
 - CarrierTrackingNumber if available
-- SalesOrderNumber
+- SalesOrderNumber if available
 - PurchaseOrderNumber if available
 - AccountNumber if available
 - Status if available
@@ -227,7 +269,7 @@ Create model-ready star schema tables in Fabric with unique dimension keys and a
 ### output tables
 - gold_dim_customer
 - gold_dim_product
-- gold_dim_sales
+- gold_dim_sales only when `silver_salesperson_prepared` exists
 - gold_fact_sales
 
 ### logic
@@ -284,6 +326,7 @@ Primary key:
 Build from `silver_salesperson_prepared`.
 
 Rules:
+- Create this table only if `silver_salesperson_prepared` exists and contains `SalesPersonNameClean`.
 - This table must contain exactly one row per `SalesPersonNameClean`.
 - Exclude null or blank `SalesPersonNameClean`.
 - If multiple raw values map to the same cleaned name, keep one deterministic representative raw value and one row per cleaned name.
@@ -302,12 +345,13 @@ Rules:
 - Grain must remain one row per `SalesOrderDetailID`.
 - Do not join gold fact to the multi-row customer prepared table.
 - Fact should be built directly from `silver_sales_prepared`, which already contains the required header and detail fields.
-- Keep `CustomerID`, `ProductID`, and `SalesPersonNameClean` in the fact exactly with those column names so the semantic model can create deterministic relationships.
-- `SalesPersonRaw` may also be retained for lineage/troubleshooting.
-- Before publishing, validate that every fact row has at most one matching row in each gold dimension on:
+- Keep `CustomerID` and `ProductID` in the fact exactly with those column names so the semantic model can create deterministic relationships.
+- Keep `SalesPersonNameClean` only if that column exists in `silver_sales_prepared`.
+- `SalesPersonRaw` may also be retained for lineage/troubleshooting only when present in silver.
+- Before publishing, validate that every fact row has at most one matching row in each created gold dimension on:
   - `CustomerID`
   - `ProductID`
-  - `SalesPersonNameClean`
+  - `SalesPersonNameClean` only when `gold_dim_sales` exists
 
 Include these columns:
 - `SalesOrderID`
@@ -318,8 +362,8 @@ Include these columns:
 - `ShipDate`
 - `CustomerID`
 - `ProductID`
-- `SalesPersonRaw`
-- `SalesPersonNameClean`
+- `SalesPersonRaw` when available
+- `SalesPersonNameClean` when available
 - `OrderQty`
 - `UnitPrice`
 - `UnitPriceDiscount`
@@ -344,17 +388,18 @@ Create a Fabric semantic model on top of the gold model for sales analysis by cu
 ### model tables
 - Dim_Customer from gold_dim_customer
 - Dim_Product from gold_dim_product
-- Dim_Sales from gold_dim_sales
+- Dim_Sales from gold_dim_sales only when `gold_dim_sales` exists
 - Fact_Sales from gold_fact_sales
 
 ### relationships
 Define single-direction, many-to-one relationships from Fact_Sales to dimensions using the business keys present in gold:
 - Fact_Sales[CustomerID] -> Dim_Customer[CustomerID]
 - Fact_Sales[ProductID] -> Dim_Product[ProductID]
-- Fact_Sales[SalesPersonNameClean] -> Dim_Sales[SalesPersonNameClean]
+- Fact_Sales[SalesPersonNameClean] -> Dim_Sales[SalesPersonNameClean] only when both tables contain `SalesPersonNameClean`
 
 `gold_dim_customer` must already be unique by `CustomerID` before creating the semantic relationship. Do not create the semantic relationship if multiple rows per `CustomerID` remain.
 The semantic model must only use active relationships that preserve deterministic filtering.
+Do not create placeholder columns or empty relationships for salespeople if the source `SalesPerson` field was absent upstream.
 
 ### dimensions and attributes
 
@@ -402,6 +447,7 @@ Expose:
 Default usage:
 - Use SalesPersonNameClean in slicers and visuals.
 - Hide SalesPersonRaw from report consumers if it is only required for lineage or troubleshooting.
+- Omit this dimension entirely if `gold_dim_sales` was not created.
 
 #### Fact_Sales
 Expose all relevant joined header and detail fields present in gold_fact_sales, including:
@@ -413,8 +459,8 @@ Expose all relevant joined header and detail fields present in gold_fact_sales, 
 - ShipDate
 - CustomerID
 - ProductID
-- SalesPersonRaw
-- SalesPersonNameClean
+- SalesPersonRaw when available
+- SalesPersonNameClean when available
 - OrderQty
 - UnitPrice
 - UnitPriceDiscount
@@ -462,7 +508,7 @@ Visuals:
 - KPI card: Order Quantity
 - Line chart: Sales Amount by OrderDate
 - Clustered column chart: Sales Amount by Category
-- Bar chart: Sales Amount by SalesPersonNameClean
+- Bar chart: Sales Amount by SalesPersonNameClean only when `Dim_Sales` exists
 - Donut or column chart: Sales Amount by OnlineOrderFlag
 - Matrix: Category, Subcategory, ProductName with Sales Amount and Order Quantity
 
@@ -470,7 +516,7 @@ Slicers:
 - OrderDate
 - Category
 - Subcategory
-- SalesPersonNameClean
+- SalesPersonNameClean only when `Dim_Sales` exists
 
 #### 2. Product Performance
 Visuals:
@@ -500,6 +546,7 @@ Slicers:
 
 Note:
 - Use the single-row-per-customer `Dim_Customer` gold table for customer/location visuals.
+- If `StateProvince` was not present in source and therefore omitted upstream, remove the related visuals and slicers rather than failing the report build.
 
 #### 4. Salesperson Performance
 Visuals:
@@ -511,8 +558,11 @@ Slicers:
 - SalesPersonNameClean
 - OrderDate
 
+Condition:
+- Create this page only when `Dim_Sales` exists and `Fact_Sales` contains `SalesPersonNameClean`.
+
 ### report design guidance
-- Use SalesPersonNameClean instead of SalesPersonRaw in all end-user visuals.
+- Use SalesPersonNameClean instead of SalesPersonRaw in all end-user visuals when available.
 - Use the product hierarchy Category > Subcategory > ProductName for drill-down.
 - Use consistent currency formatting for sales measures.
 - Apply interactive filtering across overview, product, customer/location, and salesperson pages.
@@ -530,7 +580,7 @@ The agent should answer questions about:
 - Distinct customers
 - Customer and location sales
 - Product category and subcategory performance
-- Salesperson performance using cleaned salesperson names
+- Salesperson performance using cleaned salesperson names when the salesperson dimension exists
 
 ### semantic hints
 Provide business-friendly synonyms:
@@ -561,13 +611,14 @@ Provide business-friendly synonyms:
 - SalesPersonNameClean: salesperson, sales rep, representative, seller
 
 ### behavior guidance
-- Prefer cleaned salesperson names from Dim_Sales[SalesPersonNameClean] in all responses.
+- Prefer cleaned salesperson names from Dim_Sales[SalesPersonNameClean] in all responses when Dim_Sales exists.
 - Interpret product hierarchy questions using Category and Subcategory before ProductName where relevant.
 - Interpret customer geography questions using City, StateProvince, and PostalCode from Dim_Customer.
 - Use Sales Amount as the default metric when a user asks general sales questions without specifying a measure.
 - When users ask for “top products,” rank by Sales Amount unless another metric is specified.
-- When users ask for “top salespeople,” rank by Sales Amount using SalesPersonNameClean.
+- When users ask for “top salespeople,” rank by Sales Amount using SalesPersonNameClean only when the salesperson dimension exists.
 - Use the unique gold customer dimension grain for customer geography questions.
+- If the salesperson source field was absent and no salesperson dimension was built, the agent should not reference salesperson analysis capabilities.
 
 ### example questions
 - What are total sales by category?
