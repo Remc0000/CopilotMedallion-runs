@@ -9,6 +9,13 @@
   - Tightened **Bronze** to prioritize/base-table ingestion first, defer source views until after base tables succeed, and explicitly minimize hashing/processing on binary columns such as `thumb_nail_photo`.
   - Added explicit runtime guardrails for bronze reads/writes, including fail-loud per-table timeout behavior and no full-build dependency on bronze views.
 
+### Iteration 2 — 2026-05-16 16:01:29Z — failed layer: gold (run: 20260516-150519-5ebfdd)
+- **Root cause (1-line summary)**: Gold build caused Spark statement failures due to underspecified joins/grain in dimension construction, especially `dim_customer` and `dim_product`, which can create row explosion or unstable joins.
+- **What was changed**:
+  - Tightened **Generic guidance** to require explicit join cardinality, join keys, and post-join row-count assertions for every gold build.
+  - Tightened **Gold** to define exact source tables, join keys, preferred culture rule, category self-join logic, and one-row-per-key grain rules for `dim_customer`, `dim_product`, and `dim_sales`.
+  - Tightened **Semantic model** to align with the enforced gold grains, especially requiring `dim_customer` to remain one row per `customer_id` and keeping multi-address analysis in `bridge_customer_address`/`dim_address`.
+
 ## Inputs
 - Workspace: `4e8e1b48-3d46-48b6-b370-80eb5b06d2fb`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -50,10 +57,18 @@ Standard cross-cutting code rules:
 - Include audit metadata on writes where appropriate: ingestion timestamp, run id, source table name, record hash where useful, and processing timestamp.
 - Prefer explicit schema handling over inference for stable pipelines.
 - Exclude binary payloads from gold unless there is a clear analytics use case.
-- For bronze orchestration, process one source object at a time and persist success state after each object so a rerun resumes from remaining objects instead of redoing already-landed objects in the same run.
+- For bronze orchestration, process one source object at a time and persist success state after each successful bronze write.
 - Do not make bronze completion of source views a prerequisite for base-table bronze success; base tables are the required first-class ingestion targets.
 - Any expensive per-row computation in bronze, especially hashing across many columns, must be scoped to a single object write and must exclude binary columns and large text blobs unless explicitly required.
 - Keep bronze notebooks operationally bounded: each source object should have its own read-transform-write unit with logging of row count, start/end time, and object name.
+- For every gold-table join, explicitly document and implement:
+  - left/right aliases,
+  - join type,
+  - exact join keys,
+  - expected cardinality (`1:1`, `1:many`, `many:1`),
+  - and the target grain after the join.
+- In gold, do not use convenience joins that multiply rows at the target dimension grain. If a supporting table is `1:many`, first reduce it to one row per target business key using an explicit ranking or aggregation rule before joining.
+- After building each gold dimension/fact, assert the final row count and key uniqueness for the intended grain before writing the Delta table. Fail loudly if grain is violated.
 
 Notebook authoring requirement for every generated notebook:
 - EACH code cell must start with a short markdown comment block using Python comments.
@@ -278,10 +293,46 @@ Entity classification based on actual columns:
   - `v_product_and_description`
   - `v_product_model_catalog_description`
 
+Gold build order and hard constraints:
+- Build gold tables in this order:
+  1. `gold.dim_date`
+  2. `gold.dim_address`
+  3. `gold.bridge_customer_address`
+  4. `gold.dim_customer`
+  5. `gold.dim_product`
+  6. `gold.dim_sales`
+  7. `gold.fact_sales_order_header`
+  8. `gold.fact_sales_order_line`
+- For every gold table, select only the required columns listed in this spec before writing.
+- Do not use `select("*")` after joins in gold.
+- All joins in gold must use DataFrame aliases and explicit equality predicates.
+- If an enrichment source can introduce more than one row per target key, reduce it first with a deterministic rule before joining.
+
 ### Proposed gold dimensions
 - `gold.dim_customer`
-  - Grain: one row per `customer_id`
-  - Columns:
+  - Grain: exactly one row per `customer_id`
+  - Base source: `silver.customer` alias `c`
+  - Required supporting sources:
+    - `silver.customer_address` alias `ca`
+    - `silver.address` alias `a`
+  - Join intent:
+    - `c.customer_id = ca.customer_id` is `1:many`
+    - `ca.address_id = a.address_id` is `many:1`
+  - To preserve one row per `customer_id`, DO NOT directly join all customer-address rows into the final dimension.
+  - Required reduction rule before final join:
+    - Build an intermediate customer-address choice table with at most one row per `customer_id`.
+    - Preferred ranking:
+      1. `address_type = 'Main Office'`
+      2. else `address_type = 'Primary'`
+      3. else `address_type = 'Shipping'`
+      4. else `address_type = 'Billing'`
+      5. else alphabetical by `address_type`
+      6. then lowest `address_id` as final tie-breaker
+    - Join `c` to that reduced one-row-per-customer table only.
+  - Final join keys:
+    - `c.customer_id = chosen_ca.customer_id`
+    - `chosen_ca.address_id = a.address_id`
+  - Final columns:
     - `customer_id`
     - `full_name`
     - `name_style`
@@ -294,11 +345,25 @@ Entity classification based on actual columns:
     - `sales_person`
     - `email_address`
     - `phone`
+    - `address_type`
+    - `address_id`
+    - `address_line1`
+    - `address_line2`
+    - `city`
+    - `state_province`
+    - `country_region`
+    - `postal_code`
     - `modified_date`
-  - Optional enrichments:
-    - default billing/shipping indicators via `customer_address` if a rule is later defined
+  - Write-time assertions:
+    - `customer_id` must be non-null
+    - `customer_id` must be unique in `gold.dim_customer`
+  - Multi-address requirement:
+    - Publish all customer-to-address combinations separately in `gold.bridge_customer_address`
+    - Do not duplicate customers inside `gold.dim_customer` to represent multiple addresses
+
 - `gold.dim_address`
   - Grain: one row per `address_id`
+  - Source: `silver.address`
   - Columns:
     - `address_id`
     - `address_line1`
@@ -308,16 +373,37 @@ Entity classification based on actual columns:
     - `country_region`
     - `postal_code`
     - `modified_date`
+
 - `gold.dim_product`
-  - Grain: one row per `product_id`
-  - Base from `silver.product`
-  - Enrich with:
-    - category names from `silver.product_category` or `silver.v_get_all_categories`
-    - model attributes from `silver.product_model` and `silver.v_product_model_catalog_description`
-    - description from `silver.v_product_and_description` where `culture` is available
-  - Columns:
+  - Grain: exactly one row per `product_id`
+  - Base source: `silver.product` alias `p`
+  - Required supporting sources:
+    - `silver.product_category` alias `pc_child`
+    - `silver.product_category` alias `pc_parent`
+    - `silver.product_model` alias `pm`
+    - `silver.product_model_product_description` alias `pmpd`
+    - `silver.product_description` alias `pd`
+  - Join keys:
+    - `p.product_category_id = pc_child.product_category_id` (`many:1`)
+    - `pc_child.parent_product_category_id = pc_parent.product_category_id` (`many:1`, self-join)
+    - `p.product_model_id = pm.product_model_id` (`many:1`)
+    - `p.product_model_id = pmpd.product_model_id` (`1:many` before reduction)
+    - `pmpd.product_description_id = pd.product_description_id` (`many:1`)
+  - Category naming rule:
+    - `category_name` = `pc_parent.name`
+    - `subcategory_name` = `pc_child.name`
+    - `parent_category_name` = `pc_parent.name`
+  - Because `pmpd` can create multiple rows per `product_model_id`, reduce description rows before joining to product.
+  - Required description reduction rule:
+    - First join `pmpd` to `pd` on `product_description_id`
+    - Then create one preferred description row per `product_model_id` using:
+      1. `culture = 'en'` preferred if present
+      2. else first non-null `culture` in ascending order
+      3. then lowest `product_description_id` as tie-breaker
+    - Join `p` to this reduced one-row-per-`product_model_id` description set only.
+  - Final columns:
     - `product_id`
-    - `product_name` from source `name`
+    - `product_name` from `p.name`
     - `product_number`
     - `color`
     - `standard_cost`
@@ -330,23 +416,46 @@ Entity classification based on actual columns:
     - `sell_end_date`
     - `discontinued_date`
     - `category_name`
+    - `subcategory_name`
     - `parent_category_name`
-    - `product_model_name`
+    - `product_model_name` from `pm.name`
     - `culture`
-    - `product_description`
-    - optional model attributes: `manufacturer`, `material`, `product_line`, `style`, `rider_experience`
-  - Preferred rule: choose one culture for primary description if multiple exist; default to `'en'` if present, else first non-null
-  - Alternative: keep descriptions in a separate multilingual dimension if multilingual reporting is required
+    - `product_description` from `pd.description`
+  - Optional model attributes:
+    - only include `manufacturer`, `material`, `product_line`, `style`, `rider_experience` if those columns were successfully parsed into silver and explicitly exist
+  - Write-time assertions:
+    - `product_id` must be non-null
+    - `product_id` must be unique in `gold.dim_product`
+
 - `gold.dim_date`
   - Grain: one row per date
   - Built from min/max of `order_date`, `due_date`, `ship_date`, `sell_start_date`, `sell_end_date`, `discontinued_date`
   - Standard attributes: date_key, full_date, year, quarter, month, month_name, week, day, weekday, is_month_end
 
+- `gold.dim_sales`
+  - Grain: one row per cleaned salesperson value
+  - Source: distinct values from `silver.sales_order_header.sales_person`
+  - Build only from non-null, non-empty `sales_person`
+  - Cleaning rule:
+    - remove case-insensitive prefix `adventureworks/`
+    - then remove trailing digits at the end of the remaining string
+    - then trim whitespace
+  - Required output columns:
+    - `sales_person_clean`
+    - `sales_person_original`
+  - Write-time assertions:
+    - `sales_person_clean` must be non-null
+    - `sales_person_clean` must be unique
+
 ### Proposed gold facts
 - `gold.fact_sales_order_line`
   - Grain: one row per `sales_order_detail_id`
-  - Source: `silver.sales_order_detail` joined to `silver.sales_order_header`
-  - Keys:
+  - Source: `silver.sales_order_detail` alias `d` joined to `silver.sales_order_header` alias `h`
+  - Join key:
+    - `d.sales_order_id = h.sales_order_id`
+  - Cardinality:
+    - `d -> h` is `many:1`
+  - Required selected columns:
     - `sales_order_detail_id`
     - `sales_order_id`
     - `order_date_key`
@@ -356,7 +465,7 @@ Entity classification based on actual columns:
     - `product_id`
     - `ship_to_address_id`
     - `bill_to_address_id`
-  - Degenerate dimensions:
+    - `sales_person`
     - `sales_order_number`
     - `purchase_order_number`
     - `account_number`
@@ -364,21 +473,23 @@ Entity classification based on actual columns:
     - `credit_card_approval_code`
     - `status`
     - `online_order_flag`
-  - Measures/analytics columns:
     - `order_qty`
     - `unit_price`
     - `unit_price_discount`
     - `line_total`
-    - allocated or repeated order-level amounts:
-      - `header_sub_total`
-      - `header_tax_amt`
-      - `header_freight`
-      - `header_total_due`
-  - Preferred note: keep header totals repeated at line grain only for convenience, but measures must avoid summing repeated header totals without distinct-order logic
+    - `header_sub_total` from `h.sub_total`
+    - `header_tax_amt` from `h.tax_amt`
+    - `header_freight` from `h.freight`
+    - `header_total_due` from `h.total_due`
+  - Add cleaned salesperson column using the same rule as `gold.dim_sales`:
+    - `sales_person_clean`
+  - Write-time assertions:
+    - `sales_order_detail_id` must be unique
+
 - `gold.fact_sales_order_header`
   - Grain: one row per `sales_order_id`
   - Source: `silver.sales_order_header`
-  - Keys:
+  - Required columns:
     - `sales_order_id`
     - `order_date_key`
     - `due_date_key`
@@ -386,16 +497,40 @@ Entity classification based on actual columns:
     - `customer_id`
     - `ship_to_address_id`
     - `bill_to_address_id`
-  - Measures:
+    - `sales_person`
+    - `sales_person_clean`
     - `sub_total`
     - `tax_amt`
     - `freight`
     - `total_due`
-  - Use case:
-    - clean order-level reporting without double counting
+    - `sales_order_number`
+    - `purchase_order_number`
+    - `account_number`
+    - `ship_method`
+    - `credit_card_approval_code`
+    - `status`
+    - `online_order_flag`
+  - Add cleaned salesperson column using the same rule as `gold.dim_sales`
+  - Write-time assertions:
+    - `sales_order_id` must be unique
+
 - `gold.bridge_customer_address`
   - Grain: one row per `customer_id`, `address_id`, `address_type`
-  - Use for customer-address analysis outside transactional facts
+  - Source: `silver.customer_address` joined to `silver.address`
+  - Join key:
+    - `customer_address.address_id = address.address_id`
+  - Required columns:
+    - `customer_id`
+    - `address_id`
+    - `address_type`
+    - `address_line1`
+    - `address_line2`
+    - `city`
+    - `state_province`
+    - `country_region`
+    - `postal_code`
+  - Write-time assertions:
+    - composite key `customer_id`, `address_id`, `address_type` must be unique
 
 Gold modeling alternatives:
 - Preferred star:
@@ -412,6 +547,10 @@ Gold modeling alternatives:
 1. Row count reconciliation
 - Assert bronze vs silver counts are equal after dedup for tables expected unique by PK (`address`, `customer`, `product`, `product_category`, `product_description`, `product_model`, `sales_order_header`)
 - For junction/view tables, allow silver count <= bronze count and log removed duplicates
+- Assert `gold.dim_customer` row count equals distinct `silver.customer.customer_id`
+- Assert `gold.dim_product` row count equals distinct `silver.product.product_id`
+- Assert `gold.fact_sales_order_header` row count equals distinct `silver.sales_order_header.sales_order_id`
+- Assert `gold.fact_sales_order_line` row count equals distinct `silver.sales_order_detail.sales_order_detail_id`
 
 2. No-null primary keys
 - `address.address_id`
@@ -436,6 +575,12 @@ Gold modeling alternatives:
 - Assert composite uniqueness of:
   - `customer_id`, `address_id`, `address_type` in `customer_address`
   - `product_model_id`, `product_description_id`, `culture` in `product_model_product_description`
+- Assert uniqueness of:
+  - `gold.dim_customer.customer_id`
+  - `gold.dim_product.product_id`
+  - `gold.dim_sales.sales_person_clean`
+  - `gold.fact_sales_order_header.sales_order_id`
+  - `gold.fact_sales_order_line.sales_order_detail_id`
 
 4. Referential integrity
 - `sales_order_header.customer_id` -> `customer.customer_id`
@@ -481,6 +626,7 @@ Table expectations aligned to gold:
 - `dim_customer`
   - One row per `customer_id`
   - Must reflect the gold requirement to join `customer`, `customer_address`, and `address`
+  - Must use the reduced single-address-per-customer result from gold, not the full customer-address bridge
   - Expose customer attributes plus meaningful address attributes that are safe for analysis
   - Recommended visible columns:
     - `customer_id`
@@ -501,6 +647,7 @@ Table expectations aligned to gold:
 - `dim_product`
   - One row per `product_id`
   - Must reflect the gold requirement to join product, category hierarchy, model, description, and model-description bridge
+  - Must use the reduced single-description-per-product-model rule from gold so the table stays one row per `product_id`
   - Recommended visible columns:
     - `product_id`
     - `product_name`
@@ -513,6 +660,7 @@ Table expectations aligned to gold:
     - `product_model_name`
     - `parent_category_name`
     - `category_name`
+    - `subcategory_name`
     - `product_description`
     - `culture`
 - `dim_sales`
@@ -577,12 +725,11 @@ Relationships:
 
 Modeling notes:
 - Keep `dim_sales` as the authoritative salesperson dimension for reporting by salesperson after the cleanup rule.
-- If `dim_customer` contains repeated rows because of multiple customer addresses, do not use it as the only customer lookup on facts unless gold enforces one row per `customer_id`.
+- `dim_customer` must remain one row per `customer_id`; do not model full customer-address multiplicity there.
 - Preferred semantic-model handling for customer-address enrichment:
   - Keep `dim_customer` at one row per `customer_id`
   - Use `dim_address` plus fact ship/bill relationships for geography
   - Expose `bridge_customer_address` as hidden helper only if needed for advanced customer-address analysis
-- If the gold implementation keeps multiple address rows in `dim_customer`, then create a separate report-facing customer table or constrain the visible fields to avoid ambiguous filtering.
 - Hide technical audit columns and source lineage columns.
 - Hide repeated header amount columns on `fact_sales_order_line` if present.
 - Prefer `fact_sales_order_header` for financial totals and order KPIs.
@@ -716,7 +863,7 @@ Visuals:
 Report notes:
 - Prioritize the cleaned salesperson from `dim_sales[sales_person_clean]` everywhere instead of the raw source salesperson text.
 - Prioritize the product hierarchy `parent_category_name` -> `category_name` -> `product_name`.
-- If `dim_customer` includes multiple rows per customer because of joined addresses, avoid visuals that assume a unique customer grain unless the gold table enforces one row per `customer_id`.
+- Because `dim_customer` is constrained to one row per `customer_id`, it is safe for standard customer visuals; use `bridge_customer_address` only for advanced multi-address analysis.
 - For geography visuals, prefer shipping geography through `dim_address` if customer-address joins introduce ambiguity.
 - If multilingual product descriptions are retained, add a culture slicer only when needed.
 - If only one address relationship is exposed initially, prioritize shipping address.
@@ -732,12 +879,13 @@ Role:
 
 Domain hints:
 - Customers are identified by `customer_id`.
-- `dim_customer` is enriched from customer, customer-address, and address data, so customer views may include address-related attributes such as `address_type`, `city`, `state_province`, `country_region`, and `postal_code`.
+- `dim_customer` is enriched from customer, customer-address, and address data, but is constrained to one visible row per customer; use address attributes there as the selected representative address only.
 - Orders come from `fact_sales_order_header`; order lines come from `fact_sales_order_line`.
 - Products are analyzed through `dim_product`, which combines product, product category hierarchy, product model, and description data.
 - Product hierarchy should use:
   - `parent_category_name` as the higher level
-  - `category_name` as the lower category/subcategory level
+  - `category_name` as the higher-level category label used for reporting
+  - `subcategory_name` as the lower category/subcategory level
   - `product_name` at the product level
 - Salespeople are analyzed through `dim_sales`, where values were cleaned from `sales_order_header.sales_person` by removing the `adventureworks/` prefix and the trailing number.
 - Address analysis should distinguish shipping vs billing when the model exposes both through `dim_address`.
@@ -760,7 +908,7 @@ Guardrails:
 - Do not expose or infer hidden sensitive fields such as password hash or salt.
 - Use `fact_sales_order_header` measures for order financial totals to avoid double counting.
 - Use the cleaned salesperson from `dim_sales`; do not present raw values with the `adventureworks/` prefix or trailing numbers.
-- When users ask for category performance, use the hierarchy `parent_category_name` and `category_name` correctly.
+- When users ask for category performance, use the hierarchy `parent_category_name`, `category_name`, and `subcategory_name` correctly.
 - If a question is ambiguous about date or geography role, ask whether to use order date vs ship date, or shipping vs billing address.
 - If customer geography can come from either enriched customer-address fields or shipping/billing address relationships, clarify which one the user wants when needed.
 - If multilingual product descriptions exist, clarify which culture to analyze when relevant.
