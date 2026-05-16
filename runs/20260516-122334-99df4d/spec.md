@@ -9,6 +9,17 @@
   - Added explicit aliasing and column existence assertions before partitioning and writing.
   - Clarified that `SalesOrderDetail` partitioning falls back to `ModifiedDate` only if `OrderDate` is not available via join to `SalesOrderHeader`.
 
+### Iteration 2 — 2026-05-16 12:29:06Z — failed layer: bronze (run: 20260516-122334-99df4d)
+- **Root cause (1-line summary)**: Spark session cancelled due to missing or ambiguous partition column references and lack of explicit aliasing in Bronze ingestion.
+- **What was changed**:
+  - In the Bronze section, explicitly require all source tables to be aliased before any join or partitioning operation.
+  - For `SalesOrderHeader`, assert that `OrderDate` column exists, is non-null, and is of date type before partitioning by `OrderDate`.
+  - For `SalesOrderDetail`, require a left join with `SalesOrderHeader` on `SalesOrderID` to retrieve `OrderDate`; if `OrderDate` is null, fallback to `ModifiedDate` from `SalesOrderDetail`.
+  - Assert that the chosen partition column for `SalesOrderDetail` exists, is non-null, and is of date type before write.
+  - For `CustomerAddress`, assert `ModifiedDate` column exists, is non-null, and is of date type before partitioning.
+  - Add explicit column existence and null checks before any partitionBy call to prevent ambiguous or missing column errors.
+  - Enforce prefixing of all columns with table aliases in joins to avoid ambiguous references.
+
 ## Inputs
 - Workspace: `f81d9542-fe59-4e24-8ed8-0f73db2693ce`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -47,22 +58,27 @@ Standard cross-cutting code rules:
 - Avoid `saveAsTable`; use lakehouse paths or managed tables with overwrite.
 - Error-loud try/except blocks call `_save_error(layer, e)` and re-raise exceptions.
 - Each notebook code cell starts with a short markdown comment block describing purpose.
-- **New:** Before writing partitioned tables, explicitly assert that partition columns exist and contain no nulls; if partition column is derived via join (e.g., `OrderDate` for `SalesOrderDetail`), perform left join with `SalesOrderHeader` and fallback to `ModifiedDate` if `OrderDate` is null.
+- **New:** Before writing partitioned tables, explicitly assert that partition columns exist, contain no nulls, and are of appropriate date type; if partition column is derived via join (e.g., `OrderDate` for `SalesOrderDetail`), perform left join with `SalesOrderHeader` and fallback to `ModifiedDate` if `OrderDate` is null.
+- Always prefix columns with table aliases in joins and partitionBy to prevent ambiguous references.
 
 ## Bronze
 - Ingest all source tables as-is into the `bronze` schema under the target lakehouse.
 - Include metadata columns: `_ingest_timestamp` (current timestamp), `_source_file` (if applicable).
 - Use `overwrite` mode with partitioning where beneficial:
   - For `SalesOrderHeader`:
+    - Alias source as `soh`.
+    - Assert `soh.OrderDate` column exists, is non-null, and is of date type before write.
     - Partition by `OrderDate` (date part).
-    - Assert `OrderDate` column exists and contains no nulls before write.
   - For `SalesOrderDetail`:
-    - Join with `SalesOrderHeader` on `SalesOrderID` to retrieve `OrderDate`.
-    - Use `OrderDate` as partition column if available; otherwise, fallback to `ModifiedDate`.
-    - Assert partition column exists and contains no nulls before write.
+    - Alias source as `sod`.
+    - Left join `sod` with `SalesOrderHeader` aliased as `soh` on `sod.SalesOrderID = soh.SalesOrderID` to retrieve `soh.OrderDate`.
+    - Create a partition column `partition_date` defined as `coalesce(soh.OrderDate, sod.ModifiedDate)`.
+    - Assert `partition_date` exists, is non-null, and is of date type before write.
+    - Partition by `partition_date`.
   - For `CustomerAddress`:
+    - Alias source as `ca`.
+    - Assert `ca.ModifiedDate` column exists, is non-null, and is of date type before write.
     - Partition by `ModifiedDate` (date part).
-    - Assert `ModifiedDate` column exists and contains no nulls before write.
   - Other tables ingested without partitioning due to smaller size or lack of natural partition key.
 - Preserve original column names and types exactly.
 - Include full audit columns from source (`ModifiedDate`, `rowguid`).
