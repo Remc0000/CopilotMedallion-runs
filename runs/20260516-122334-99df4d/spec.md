@@ -2,15 +2,15 @@
 
 ## Updated specs
 
-### Iteration 5 — 2026-05-16 12:37:19Z — failed layer: bronze (run: 20260516-122334-99df4d)
-- **Root cause (1-line summary)**: Ambiguous or missing partition column references and lack of explicit aliasing caused Spark session failure during Bronze ingestion.
+### Iteration 6 — 2026-05-16 13:24:34Z — failed layer: bronze (run: 20260516-122334-99df4d)
+- **Root cause (1-line summary)**: Timeout caused by inefficient or missing partition pruning due to lack of explicit partition column aliasing and validation in Bronze ingestion.
 - **What was changed**:
-  - Strengthened Bronze section to mandate explicit aliasing of all source tables before any transformations.
-  - For `SalesOrderHeader`, explicitly require alias `soh` and assert `soh.OrderDate` exists, is non-null, and is date type before partitioning.
-  - For `SalesOrderDetail`, require alias `sod` and left join with `SalesOrderHeader` aliased as `soh` on `SalesOrderID` to retrieve `soh.OrderDate`; define partition column as `coalesce(soh.OrderDate, sod.ModifiedDate)` with explicit assertions.
-  - For `CustomerAddress`, require alias `ca` and assert `ca.ModifiedDate` exists, is non-null, and is date type before partitioning.
-  - Enforce prefixing all columns with table aliases in joins and partitionBy clauses to avoid ambiguous references.
-  - Add explicit null and type checks on partition columns before write operations.
+  - Enhanced Bronze section to require explicit aliasing of all source tables before any transformations or joins.
+  - For `SalesOrderHeader`, enforce alias `soh` and explicit validation that `soh.OrderDate` exists, is non-null, and is a date type before partitioning.
+  - For `SalesOrderDetail`, enforce alias `sod` and require a left join to `SalesOrderHeader` aliased as `soh` on `SalesOrderID` to retrieve `soh.OrderDate`; define partition column as `partition_date = coalesce(soh.OrderDate, sod.ModifiedDate)` with explicit null and type checks.
+  - For `CustomerAddress`, enforce alias `ca` and validate `ca.ModifiedDate` exists, is non-null, and is date type before partitioning.
+  - Mandate prefixing all columns with table aliases in joins and partitionBy clauses to avoid ambiguous references and improve query optimization.
+  - Add explicit assertions on partition columns to prevent nulls and ensure correct data types before write operations to reduce timeout risk.
 
 ## Inputs
 - Workspace: `f81d9542-fe59-4e24-8ed8-0f73db2693ce`
