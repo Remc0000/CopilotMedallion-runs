@@ -2,23 +2,15 @@
 
 ## Updated specs
 
-### Iteration 1 — 2026-05-16 12:26:10Z — failed layer: bronze (run: 20260516-122334-99df4d)
-- **Root cause (1-line summary)**: Spark session cancelled due to ambiguous or missing partition column references during Bronze ingestion.
+### Iteration 3 — 2026-05-16 12:31:33Z — failed layer: bronze (run: 20260516-122334-99df4d)
+- **Root cause (1-line summary)**: Missing explicit aliasing and partition column references caused ambiguous or unresolved column errors during Bronze ingestion.
 - **What was changed**:
-  - Tightened Bronze layer ingestion instructions to explicitly require presence and use of partition columns (`OrderDate` for `SalesOrderHeader`, `ModifiedDate` for `SalesOrderDetail` and `CustomerAddress`) with explicit null handling.
-  - Added explicit aliasing and column existence assertions before partitioning and writing.
-  - Clarified that `SalesOrderDetail` partitioning falls back to `ModifiedDate` only if `OrderDate` is not available via join to `SalesOrderHeader`.
-
-### Iteration 2 — 2026-05-16 12:29:06Z — failed layer: bronze (run: 20260516-122334-99df4d)
-- **Root cause (1-line summary)**: Spark session cancelled due to missing or ambiguous partition column references and lack of explicit aliasing in Bronze ingestion.
-- **What was changed**:
-  - In the Bronze section, explicitly require all source tables to be aliased before any join or partitioning operation.
-  - For `SalesOrderHeader`, assert that `OrderDate` column exists, is non-null, and is of date type before partitioning by `OrderDate`.
-  - For `SalesOrderDetail`, require a left join with `SalesOrderHeader` on `SalesOrderID` to retrieve `OrderDate`; if `OrderDate` is null, fallback to `ModifiedDate` from `SalesOrderDetail`.
-  - Assert that the chosen partition column for `SalesOrderDetail` exists, is non-null, and is of date type before write.
-  - For `CustomerAddress`, assert `ModifiedDate` column exists, is non-null, and is of date type before partitioning.
-  - Add explicit column existence and null checks before any partitionBy call to prevent ambiguous or missing column errors.
-  - Enforce prefixing of all columns with table aliases in joins to avoid ambiguous references.
+  - In the Bronze section, explicitly require all source tables to be aliased before any operation.
+  - For `SalesOrderHeader`, require explicit alias `soh` and assert existence, non-null, and date type of `soh.OrderDate` before partitioning.
+  - For `SalesOrderDetail`, require alias `sod` and left join with `soh` on `SalesOrderID` to retrieve `soh.OrderDate`; define `partition_date` as `coalesce(soh.OrderDate, sod.ModifiedDate)` with explicit assertions before partitioning.
+  - For `CustomerAddress`, require alias `ca` and assert `ca.ModifiedDate` exists, non-null, and is date type before partitioning.
+  - Enforce prefixing of all columns with table aliases in joins and partitionBy to prevent ambiguous references.
+  - Add explicit null and type checks on partition columns before write operations.
 
 ## Inputs
 - Workspace: `f81d9542-fe59-4e24-8ed8-0f73db2693ce`
@@ -68,17 +60,17 @@ Standard cross-cutting code rules:
   - For `SalesOrderHeader`:
     - Alias source as `soh`.
     - Assert `soh.OrderDate` column exists, is non-null, and is of date type before write.
-    - Partition by `OrderDate` (date part).
+    - Partition by `soh.OrderDate` (date part).
   - For `SalesOrderDetail`:
     - Alias source as `sod`.
     - Left join `sod` with `SalesOrderHeader` aliased as `soh` on `sod.SalesOrderID = soh.SalesOrderID` to retrieve `soh.OrderDate`.
-    - Create a partition column `partition_date` defined as `coalesce(soh.OrderDate, sod.ModifiedDate)`.
+    - Define a partition column `partition_date` as `coalesce(soh.OrderDate, sod.ModifiedDate)`.
     - Assert `partition_date` exists, is non-null, and is of date type before write.
     - Partition by `partition_date`.
   - For `CustomerAddress`:
     - Alias source as `ca`.
     - Assert `ca.ModifiedDate` column exists, is non-null, and is of date type before write.
-    - Partition by `ModifiedDate` (date part).
+    - Partition by `ca.ModifiedDate` (date part).
   - Other tables ingested without partitioning due to smaller size or lack of natural partition key.
 - Preserve original column names and types exactly.
 - Include full audit columns from source (`ModifiedDate`, `rowguid`).
