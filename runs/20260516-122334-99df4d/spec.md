@@ -1,5 +1,14 @@
 # Run Spec 20260516-122223-3d24f4
 
+## Updated specs
+
+### Iteration 1 — 2026-05-16 12:26:10Z — failed layer: bronze (run: 20260516-122334-99df4d)
+- **Root cause (1-line summary)**: Spark session cancelled due to ambiguous or missing partition column references during Bronze ingestion.
+- **What was changed**:
+  - Tightened Bronze layer ingestion instructions to explicitly require presence and use of partition columns (`OrderDate` for `SalesOrderHeader`, `ModifiedDate` for `SalesOrderDetail` and `CustomerAddress`) with explicit null handling.
+  - Added explicit aliasing and column existence assertions before partitioning and writing.
+  - Clarified that `SalesOrderDetail` partitioning falls back to `ModifiedDate` only if `OrderDate` is not available via join to `SalesOrderHeader`.
+
 ## Inputs
 - Workspace: `f81d9542-fe59-4e24-8ed8-0f73db2693ce`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -38,18 +47,28 @@ Standard cross-cutting code rules:
 - Avoid `saveAsTable`; use lakehouse paths or managed tables with overwrite.
 - Error-loud try/except blocks call `_save_error(layer, e)` and re-raise exceptions.
 - Each notebook code cell starts with a short markdown comment block describing purpose.
+- **New:** Before writing partitioned tables, explicitly assert that partition columns exist and contain no nulls; if partition column is derived via join (e.g., `OrderDate` for `SalesOrderDetail`), perform left join with `SalesOrderHeader` and fallback to `ModifiedDate` if `OrderDate` is null.
 
 ## Bronze
 - Ingest all source tables as-is into the `bronze` schema under the target lakehouse.
 - Include metadata columns: `_ingest_timestamp` (current timestamp), `_source_file` (if applicable).
 - Use `overwrite` mode with partitioning where beneficial:
-  - Partition `SalesOrderHeader` and `SalesOrderDetail` by `OrderDate` (from `SalesOrderHeader`) or `ModifiedDate` if no order date available in detail.
-  - Partition `CustomerAddress` by `ModifiedDate` (date).
+  - For `SalesOrderHeader`:
+    - Partition by `OrderDate` (date part).
+    - Assert `OrderDate` column exists and contains no nulls before write.
+  - For `SalesOrderDetail`:
+    - Join with `SalesOrderHeader` on `SalesOrderID` to retrieve `OrderDate`.
+    - Use `OrderDate` as partition column if available; otherwise, fallback to `ModifiedDate`.
+    - Assert partition column exists and contains no nulls before write.
+  - For `CustomerAddress`:
+    - Partition by `ModifiedDate` (date part).
+    - Assert `ModifiedDate` column exists and contains no nulls before write.
   - Other tables ingested without partitioning due to smaller size or lack of natural partition key.
 - Preserve original column names and types exactly.
 - Include full audit columns from source (`ModifiedDate`, `rowguid`).
 - Use idempotent writes to allow reruns without duplicates.
-- Example: `spark.read.format("delta").load(source_path).write.mode("overwrite").partitionBy("ModifiedDate").save(bronze_path)`
+- Always alias source tables and prefix columns in joins to avoid ambiguity.
+- Example: `spark.read.format("delta").load(source_path).alias("src").write.mode("overwrite").partitionBy("ModifiedDate").save(bronze_path)`
 
 ## Silver
 - Clean and conform data from bronze with these steps:
