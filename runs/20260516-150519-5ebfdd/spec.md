@@ -1,5 +1,14 @@
 # Run Spec 20260516-145843-ade58d
 
+## Updated specs
+
+### Iteration 1 — 2026-05-16 15:53:24Z — failed layer: bronze (run: 20260516-150519-5ebfdd)
+- **Root cause (1-line summary)**: Bronze ingestion timed out after 45 minutes due to trying to land all listed source objects, including source views and binary-heavy columns, in a single long-running path without per-object limits/checkpoints.
+- **What was changed**:
+  - Tightened **Generic guidance** to require one source object per bounded ingestion unit with progress persisted after each successful bronze write.
+  - Tightened **Bronze** to prioritize/base-table ingestion first, defer source views until after base tables succeed, and explicitly minimize hashing/processing on binary columns such as `thumb_nail_photo`.
+  - Added explicit runtime guardrails for bronze reads/writes, including fail-loud per-table timeout behavior and no full-build dependency on bronze views.
+
 ## Inputs
 - Workspace: `4e8e1b48-3d46-48b6-b370-80eb5b06d2fb`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -41,6 +50,10 @@ Standard cross-cutting code rules:
 - Include audit metadata on writes where appropriate: ingestion timestamp, run id, source table name, record hash where useful, and processing timestamp.
 - Prefer explicit schema handling over inference for stable pipelines.
 - Exclude binary payloads from gold unless there is a clear analytics use case.
+- For bronze orchestration, process one source object at a time and persist success state after each object so a rerun resumes from remaining objects instead of redoing already-landed objects in the same run.
+- Do not make bronze completion of source views a prerequisite for base-table bronze success; base tables are the required first-class ingestion targets.
+- Any expensive per-row computation in bronze, especially hashing across many columns, must be scoped to a single object write and must exclude binary columns and large text blobs unless explicitly required.
+- Keep bronze notebooks operationally bounded: each source object should have its own read-transform-write unit with logging of row count, start/end time, and object name.
 
 Notebook authoring requirement for every generated notebook:
 - EACH code cell must start with a short markdown comment block using Python comments.
@@ -58,6 +71,28 @@ Landing pattern for all source objects:
 - Target naming: `bronze.<object_name_snake_case>`
 - Write mode: full refresh overwrite per run, because no reliable source CDC column beyond `ModifiedDate` is guaranteed to represent deletes.
 - File format: Delta
+- Orchestration requirement:
+  - Ingest each listed source object as an independent bounded step.
+  - Commit/write each bronze table immediately after that object's read completes; do not hold multiple source objects in memory before writing.
+  - Log per-object start time, end time, row count, and write target.
+  - If a later object fails or times out, previously written bronze tables remain valid and should not be reprocessed unnecessarily on rerun.
+- Ingestion order requirement:
+  - Ingest base tables first in this order:
+    1. `SalesLT/Address`
+    2. `SalesLT/Customer`
+    3. `SalesLT/CustomerAddress`
+    4. `SalesLT/Product`
+    5. `SalesLT/ProductCategory`
+    6. `SalesLT/ProductDescription`
+    7. `SalesLT/ProductModel`
+    8. `SalesLT/ProductModelProductDescription`
+    9. `SalesLT/SalesOrderHeader`
+    10. `SalesLT/SalesOrderDetail`
+  - Ingest source views only after all base tables above have been successfully written:
+    11. `SalesLT/vGetAllCategories`
+    12. `SalesLT/vProductAndDescription`
+    13. `SalesLT/vProductModelCatalogDescription`
+  - If runtime budget becomes constrained, base tables take priority and source views may be skipped/deferred without failing the bronze delivery of the core medallion path.
 - Partitioning:
   - Do not partition small/master tables.
   - Partition `bronze.sales_order_header` by `year(order_date)` if volume justifies it.
@@ -69,9 +104,14 @@ Landing pattern for all source objects:
   - `source_object_name`
   - `source_modified_date` when source has `ModifiedDate`
   - `bronze_record_hash` over all non-binary business columns
+- Record-hash performance rule:
+  - Compute `bronze_record_hash` only from non-binary source columns.
+  - Explicitly exclude `ThumbNailPhoto` and any other binary payload columns from hashing.
+  - For very wide source views, `bronze_record_hash` is optional and may be omitted if the view lands successfully without it; if omitted, keep the other ingestion metadata columns.
 - Binary handling:
   - `SalesLT/Product.ThumbNailPhoto` should be retained in bronze only.
   - Do not propagate `ThumbNailPhoto` to silver/gold unless the user later requests image analytics.
+  - When landing `SalesLT/Product`, do not perform any transformations on `ThumbNailPhoto` other than pass-through retention in bronze.
 
 Table-specific bronze landing:
 - `SalesLT/Address` -> `bronze.address`
@@ -87,6 +127,7 @@ Table-specific bronze landing:
 - `SalesLT/Product` -> `bronze.product`
   - Preserve all columns including binary thumbnail.
   - Candidate PK observed: `ProductID`
+  - Performance note: retain `ThumbNailPhoto` exactly as-is and exclude it from record-hash logic.
 - `SalesLT/ProductCategory` -> `bronze.product_category`
   - Preserve all columns.
   - Candidate PK observed: `ProductCategoryID`
@@ -108,10 +149,13 @@ Table-specific bronze landing:
 - `SalesLT/vGetAllCategories` -> `bronze.v_get_all_categories`
   - Treat as source view snapshot.
   - No `ModifiedDate`; add only ingestion metadata
+  - Optional/deferred bronze object; do not block core bronze success if this view is skipped for runtime reasons.
 - `SalesLT/vProductAndDescription` -> `bronze.v_product_and_description`
   - Treat as source view snapshot.
+  - Optional/deferred bronze object; do not block core bronze success if this view is skipped for runtime reasons.
 - `SalesLT/vProductModelCatalogDescription` -> `bronze.v_product_model_catalog_description`
   - Treat as source view snapshot.
+  - Optional/deferred bronze object; do not block core bronze success if this view is skipped for runtime reasons.
 
 ## Silver
 Purpose: standardize names and types, remove duplicates, separate analytics-ready entities from raw source replicas, and prepare conformed keys for gold.
@@ -129,6 +173,7 @@ Shared silver rules:
   - Exclude `password_hash`
   - Exclude `password_salt`
 - OPTIMIZE all silver Delta tables after load; consider ZORDER on main keys for larger transactional tables.
+- Silver builds must not require bronze source views; if `bronze.v_get_all_categories`, `bronze.v_product_and_description`, or `bronze.v_product_model_catalog_description` are absent because they were deferred in bronze, build silver from the corresponding base tables and treat the view-based silver tables as optional helpers.
 
 Silver tables and dedup logic:
 - `silver.address`
@@ -186,14 +231,17 @@ Silver tables and dedup logic:
   - Source: `bronze.v_get_all_categories`
   - Dedup key: `product_category_id`
   - Useful as flattened category helper
+  - Optional helper table only
 - `silver.v_product_and_description`
   - Source: `bronze.v_product_and_description`
   - Dedup key: `product_id`, `culture`
   - Useful for multilingual/descriptive enrichments
+  - Optional helper table only
 - `silver.v_product_model_catalog_description`
   - Source: `bronze.v_product_model_catalog_description`
   - Dedup key: `product_model_id`
   - Useful for product attributes not present in base tables
+  - Optional helper table only
 
 Silver modeling notes and alternatives:
 - Preferred approach: treat source views as enrichment helpers, not authoritative dimensions, because they appear derived from base tables.
@@ -410,7 +458,7 @@ Gold modeling alternatives:
 - `sub_total >= 0`, `tax_amt >= 0`, `freight >= 0`, `total_due >= 0`
 - `ship_date >= order_date` where ship date is not null
 - `due_date >= order_date` where due date is not null
-- Optional consistency check: compare `sales_order_header.sub_total` to sum of related `sales_order_detail.line_total` within toleranceals 
+- Optional consistency check: compare `sales_order_header.sub_total` to sum of related `sales_order_detail.line_total` within toleranceals
 
 ## Semantic model
 Mode: Direct Lake on the gold layer.
