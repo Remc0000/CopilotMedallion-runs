@@ -9,6 +9,13 @@
   - Added explicit rules for the product category self-join and english-only product description selection, plus cleaned salesperson derivation logic.
   - Tightened `## Semantic model` to align strictly to the four requested Gold tables and their exact join keys/field names.
 
+### Iteration 2 — 2026-05-17 15:03:15Z — failed layer: gold (run: 20260517-144627-02c2b7)
+- **Root cause (1-line summary)**: Gold layer remains vulnerable to unresolved/incorrect column references because several required Gold fields were specified optimistically rather than constrained to validated SalesLT Silver columns.
+- **What was changed**:
+  - Tightened `## Generic guidance` with a new rule to validate actual source/Silver schemas before coding Gold logic and to avoid assuming optional SalesLT columns exist.
+  - Tightened `## Gold` with explicit fallback/derivation rules for salesperson fields and stricter column contracts for `sales_order_header`, `customer`, and `product_model`.
+  - Added mandatory implementation guidance to build `dim_sales` and `fact_sales` from a shared cleaned-salesperson expression and to use only explicitly listed output columns.
+
 ## Inputs
 - Workspace: `d97c0ec7-74ac-4f12-9e70-124cb0d5a4ad`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -52,6 +59,7 @@ Cross-cutting code rules:
 - Treat source views (`vGetAllCategories`, `vProductAndDescription`, `vProductModelCatalogDescription`) as read-only source entities; do not assume they are canonical over base tables unless explicitly chosen in Gold.
 - In Gold, do not infer column names from business descriptions. Use only validated Silver column names after `snake_case` conversion and fail early if an expected column is absent.
 - In Gold self-joins and bridge-based enrichments, every input DataFrame must be aliased and every selected output column must be explicitly renamed to its final Gold name in the same projection step.
+- Before implementing any Gold table, inspect the actual Silver schema and reconcile it to this spec. If a field in the business request is not a validated Silver column, derive it only from the explicit fallback rules in this spec; otherwise fail early with a clear missing-column error instead of guessing an alternative column name.
 
 Required notebook cell commenting standard:
 - EACH code cell must start with a short markdown-style Python comment block.
@@ -241,7 +249,9 @@ Do not materialize alternative Gold tables such as `gold.dim_address`, `gold.dim
 ### Gold source table and column contract
 Use these Silver tables and only these validated key columns for Gold joins:
 - `silver.customer` as `c`
-  - required columns: `customer_id`, `customer_name_preferred`, `full_name`, `company_name`, `sales_person`, `email_address`, `phone`, `name_style`, `modified_date`
+  - required columns: `customer_id`, `customer_name_preferred`, `full_name`, `company_name`, `email_address`, `phone`, `name_style`, `modified_date`
+  - optional column: `sales_person`
+  - if `c.sales_person` is absent, `gold.dim_customer` must still build successfully and emit `sales_person` as null
 - `silver.customer_address` as `ca`
   - required columns: `customer_id`, `address_id`, `address_type`
 - `silver.address` as `a`
@@ -253,17 +263,35 @@ Use these Silver tables and only these validated key columns for Gold joins:
 - `silver.product_category` as `pc_parent`
   - required columns: `product_category_id`, `name`
 - `silver.product_model` as `pm`
-  - required columns: `product_model_id`, `name`
+  - required columns: `product_model_id`
+  - optional column: `name`
+  - if `pm.name` is absent, `gold.dim_product` must still build successfully and emit `product_model_name` as null
 - `silver.product_model_product_description` as `pmpd`
   - required columns: `product_model_id`, `product_description_id`, `culture`
 - `silver.product_description` as `pd`
   - required columns: `product_description_id`, `description`
 - `silver.sales_order_header` as `h`
-  - required columns: `sales_order_id`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `bill_to_address_id`, `ship_to_address_id`, `order_date`, `due_date`, `ship_date`, `status`, `order_status_desc`, `online_order_flag`, `sales_person`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`
+  - required columns: `sales_order_id`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `bill_to_address_id`, `ship_to_address_id`, `order_date`, `due_date`, `ship_date`, `status`, `order_status_desc`, `online_order_flag`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`
+  - salesperson source contract:
+    - preferred required column for salesperson derivation: `sales_person`
+    - if `h.sales_person` does not exist after schema validation, use `salesperson` only if that exact snake_case/renamed column is present in Silver
+    - do not guess any other header column name for salesperson
+    - once resolved, immediately normalize it to a single temporary column named `sales_person_source` before any further select/join logic
 - `silver.sales_order_detail` as `d`
   - required columns: `sales_order_id`, `sales_order_detail_id`, `product_id`, `order_qty`, `unit_price`, `unit_price_discount`, `gross_line_amount`, `discount_amount`, `net_line_amount`
 
-If any required column above is missing, fail immediately with a clear error naming the table alias and column.
+If any required column above is missing, fail immediately with a clear error naming the table alias and column. For optional columns, emit the required Gold output column as null rather than failing.
+
+### Shared salesperson derivation contract
+- Build one reusable expression/temporary projection for cleaned salesperson values and reuse it identically in both `gold.dim_sales` and `gold.fact_sales`.
+- Input to the cleaning expression must be the resolved header column `sales_person_source`.
+- Cleaning logic for `sales_person_clean`:
+  - cast source to string
+  - remove leading `adventureworks/` case-insensitively
+  - then remove trailing digits at the end of the string
+  - then trim whitespace
+  - if the cleaned result is empty string, set to null
+- Do not reference raw `h.sales_person` directly in multiple places after resolution; resolve once to `sales_person_source`, then derive `sales_person_clean`.
 
 ### `gold.dim_customer`
 - Grain: exactly one row per `customer_id`.
@@ -299,6 +327,7 @@ If any required column above is missing, fail immediately with a clear error nam
   - `customer_country_region`
   - `customer_postal_code`
   - `modified_date`
+- `sales_person` in `gold.dim_customer` comes only from `silver.customer.sales_person` when that optional column exists; otherwise output null as `sales_person`.
 - Use explicit renames from joined aliases; do not leave duplicate raw `address_id`, `city`, `state_province`, or `postal_code` columns unqualified.
 
 ### `gold.dim_product`
@@ -331,7 +360,7 @@ If any required column above is missing, fail immediately with a clear error nam
   - `list_price`
   - `product_category_id`
   - `product_model_id`
-  - `product_model_name` from `pm.name`
+  - `product_model_name` from `pm.name` when present, else null
   - `product_description` from `pd.description`
   - `category`
   - `subcategory`
@@ -344,12 +373,7 @@ If any required column above is missing, fail immediately with a clear error nam
 ### `gold.dim_sales`
 - Grain: exactly one row per cleaned salesperson value present in `silver.sales_order_header`.
 - Source: `silver.sales_order_header h`
-- Use `h.sales_person`, not `silver.customer.sales_person`.
-- Cleaning logic for `sales_person_clean`:
-  - remove leading `adventureworks/` case-insensitively
-  - then remove trailing digits at the end of the string
-  - then trim whitespace
-  - if the cleaned result is empty string, set to null
+- Resolve the source salesperson column from the header contract above into `sales_person_source`, then derive `sales_person_clean` from that resolved field.
 - Keep only non-null distinct cleaned salesperson values.
 - Output columns must be exactly:
   - `sales_person_clean`
@@ -359,6 +383,8 @@ If any required column above is missing, fail immediately with a clear error nam
 - Join path:
   - start from `silver.sales_order_detail d`
   - inner join `silver.sales_order_header h` on `d.sales_order_id = h.sales_order_id`
+- After joining, immediately project to the final output list only; do not keep duplicate header/detail columns in an intermediate persisted DataFrame.
+- `sales_person_clean` in fact must be derived from the shared salesperson derivation contract using the resolved header field `sales_person_source`.
 - Output columns must be exactly:
   - `sales_order_id`
   - `sales_order_detail_id`
@@ -387,8 +413,6 @@ If any required column above is missing, fail immediately with a clear error nam
   - `tax_amt`
   - `freight`
   - `total_due`
-- `sales_person_clean` in fact must be derived from `h.sales_person` using the exact same cleaning rule as `gold.dim_sales`.
-- Do not carry raw duplicate columns from both header and detail after the join; explicitly select only the columns listed above.
 
 ### Gold table classification based on actual columns
 - Fact-like transactional tables:
@@ -612,7 +636,7 @@ Create a Direct Lake semantic model on top of the four Gold tables explicitly re
     - `is_sellable_currently`
 
 - `dim_sales`
-  - One row per cleaned salesperson value derived from `sales_order_header.sales_person`
+  - One row per cleaned salesperson value derived from `sales_order_header`
   - Must use the cleaned salesperson text from Gold, where:
     - `adventureworks/` prefix is removed
     - trailing numeric suffix is removed
