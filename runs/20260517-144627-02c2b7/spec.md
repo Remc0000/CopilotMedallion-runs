@@ -124,7 +124,6 @@ Rule E — Validate schema between non-trivial transformation steps.
 Rule F — Self-check pattern for every withColumn / Window.
 - For every withColumn(name, expr) and every Window definition, confirm: "Every column referenced inside expr / inside the window's partitionBy / orderBy exists on the DataFrame at this exact point." If not, fix per Rule C before generating the code.
 
-
 ## Bronze
 Land each selected source object into the `bronze` schema as 1:1 raw Delta tables with minimal transformation and consistent metadata.
 
