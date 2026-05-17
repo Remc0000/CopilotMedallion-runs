@@ -51,6 +51,13 @@
   - Tightened `## Silver` to mandate named intermediate DataFrames, exact checkpoint actions, and per-table preflight/post-write validation sequencing.
   - Added an explicit no-batching rule: do not build multiple Silver tables or defer multiple writes/actions within the same unresolved execution chain.
 
+### Iteration 3 — 2026-05-17 15:49:13Z — failed layer: silver (run: 20260517-144627-02c2b7)
+- **Root cause (1-line summary)**: Silver failed again at session level because view-based Silver tables were under-specified; the notebook must not infer renamed view columns or defer schema discovery for `v_*` sources.
+- **What was changed**:
+  - Tightened `## Generic guidance` to require immediate schema introspection and persisted-column freezing for any source view before dedup/final projection logic is generated.
+  - Tightened `## Silver` with an explicit build pattern for `silver.v_get_all_categories`, `silver.v_product_and_description`, and `silver.v_product_model_catalog_description` using actual renamed columns only, no assumed business-key columns before validation.
+  - Added a hard rule that view-based Silver tables must derive dedup keys from validated renamed columns only; if the expected key column is absent after rename, fail immediately with the actual column list.
+
 ## Inputs
 - Workspace: `d97c0ec7-74ac-4f12-9e70-124cb0d5a4ad`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -107,6 +114,8 @@ Cross-cutting code rules:
 - In Silver, after every non-trivial intermediate DataFrame is created, immediately force a lightweight Spark action before moving on. Use one of these checkpoint actions only: `limit(1).collect()`, `take(1)`, or `count()` when row-count validation is explicitly required. This applies to post-rename DataFrames, post-derived-column DataFrames, ranked/deduped DataFrames, final projection DataFrames, and post-write readback DataFrames.
 - Do not batch unresolved Silver work: never create multiple Silver table DataFrames and then trigger actions later. Finish all validations, checkpoint actions, and the write/readback for the current Silver table before reading or transforming the next Silver source table.
 - Silver notebook control flow must be strictly linear and blocking: read one Bronze table, build one Silver table, validate it, checkpoint it with a lightweight action, write it, read it back once to verify schema/readability, then and only then proceed to the next Silver table.
+- For Bronze or Silver source views, always inspect the actual source schema first, then perform `snake_case` rename, then persist exactly the validated renamed column list. Do not assume key column names for a view until after that inspection and rename have completed.
+- For any `v_*` table in Silver, freeze the renamed column list into a named Python variable immediately after the rename checkpoint and use only that validated list in subsequent dedup/final projection logic. Never hand-type additional inferred column names later in the transform.
 
 Required notebook cell commenting standard:
 - EACH code cell must start with a short markdown-style Python comment block.
@@ -261,6 +270,9 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
 - Do not assume optional columns exist in Silver source data. If a transform depends on a non-required column, first validate it exists; otherwise either emit the output as null only where the spec explicitly allows, or fail clearly.
 - Do not combine multiple Silver tables in a shared transform/write loop that delays Spark actions. Each Silver table must complete all schema assertions, checkpoint actions, write, and readback before the next table starts.
 - For Silver tables with no derived columns, still create the named intermediate DataFrames `*_renamed_df`, `*_dedup_df`, and `*_final_df` and run the required schema assertions and lightweight checkpoint actions at each stage.
+- For each `v_*` Silver table, the notebook must first inspect the actual Bronze/view schema, then rename to `snake_case`, then capture `actual_view_columns = sorted(df.columns)` from the renamed DataFrame, and only then define dedup logic and final projection from that validated list.
+- For each `v_*` Silver table, the final persisted business columns must be exactly the validated renamed source columns in their existing order, plus audit columns; do not invent, drop, or reorder business columns unless this spec explicitly says so.
+- For each `v_*` Silver table, if the expected dedup key column(s) are absent after rename, fail immediately with an error that includes the table name and the full renamed column list. Do not substitute a guessed alternative key.
 
 ### Silver table specifications
 - `silver.address`
@@ -525,32 +537,53 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
 
 - `silver.v_get_all_categories`
   - Source: `bronze.v_get_all_categories`
-  - Dedup key: `product_category_id`
   - Intermediate DataFrame contract:
     - `v_get_all_categories_renamed_df` must be created from the full renamed view schema
-    - `v_get_all_categories_dedup_df` must preserve the validated renamed columns
-    - `v_get_all_categories_final_df` must persist the renamed columns plus audit columns only
-  - After `snake_case` rename, validate the actual column set from source and persist the renamed view columns plus audit columns only
+    - immediately after rename, capture the exact list of renamed business columns in a variable and assert it is non-empty
+    - `v_get_all_categories_dedup_df` must preserve exactly that validated renamed column list
+    - `v_get_all_categories_final_df` must persist exactly that validated renamed column list plus audit columns only
+  - Required process:
+    1. inspect actual Bronze/view columns
+    2. rename all columns to `snake_case`
+    3. validate/read checkpoint the renamed DataFrame
+    4. only then check whether `product_category_id` exists as a renamed column
+    5. if `product_category_id` exists, dedup by `product_category_id`
+    6. otherwise fail immediately and print the full renamed column list; do not guess another key
+  - Persist the validated renamed view columns plus audit columns only
   - Use as optional hierarchy helper in Gold
 
 - `silver.v_product_and_description`
   - Source: `bronze.v_product_and_description`
-  - Dedup key: `product_id`, `culture`
   - Intermediate DataFrame contract:
     - `v_product_and_description_renamed_df` must be created from the full renamed view schema
-    - `v_product_and_description_dedup_df` must preserve the validated renamed columns
-    - `v_product_and_description_final_df` must persist the renamed columns plus audit columns only
-  - After `snake_case` rename, validate the actual column set from source and persist the renamed view columns plus audit columns only
+    - immediately after rename, capture the exact list of renamed business columns in a variable and assert it is non-empty
+    - `v_product_and_description_dedup_df` must preserve exactly that validated renamed column list
+    - `v_product_and_description_final_df` must persist exactly that validated renamed column list plus audit columns only
+  - Required process:
+    1. inspect actual Bronze/view columns
+    2. rename all columns to `snake_case`
+    3. validate/read checkpoint the renamed DataFrame
+    4. only then check whether BOTH `product_id` and `culture` exist as renamed columns
+    5. if both exist, dedup by `product_id`, `culture`
+    6. otherwise fail immediately and print the full renamed column list; do not guess substitute key columns
+  - Persist the validated renamed view columns plus audit columns only
   - Optional multilingual product description helper
 
 - `silver.v_product_model_catalog_description`
   - Source: `bronze.v_product_model_catalog_description`
-  - Dedup key: `product_model_id`
   - Intermediate DataFrame contract:
     - `v_product_model_catalog_description_renamed_df` must be created from the full renamed view schema
-    - `v_product_model_catalog_description_dedup_df` must preserve the validated renamed columns
-    - `v_product_model_catalog_description_final_df` must persist the renamed columns plus audit columns only
-  - After `snake_case` rename, validate the actual column set from source and persist the renamed view columns plus audit columns only
+    - immediately after rename, capture the exact list of renamed business columns in a variable and assert it is non-empty
+    - `v_product_model_catalog_description_dedup_df` must preserve exactly that validated renamed column list
+    - `v_product_model_catalog_description_final_df` must persist exactly that validated renamed column list plus audit columns only
+  - Required process:
+    1. inspect actual Bronze/view columns
+    2. rename all columns to `snake_case`
+    3. validate/read checkpoint the renamed DataFrame
+    4. only then check whether `product_model_id` exists as a renamed column
+    5. if it exists, dedup by `product_model_id`
+    6. otherwise fail immediately and print the full renamed column list; do not guess another key
+  - Persist the validated renamed view columns plus audit columns only
   - Optional wide model attribute helper
 
 ### Silver modeling note
@@ -667,44 +700,4 @@ These rules exist to prevent recurring `UNRESOLVED_COLUMN` analyzer errors.
     - `rank_customer_id`   = `c.customer_id`
     - `rank_address_type`  = `ca.address_type`
     - `rank_address_id`    = `ca.address_id`
-    Also keep every source attribute needed for the final projection (customer fields from `c`, address fields from `a`, and `ca.address_type` / `ca.address_id` for the final renamed output columns).
-  - Step 2: assert `dim_customer_joined_df` contains the columns `rank_customer_id`, `rank_address_type`, `rank_address_id` AND every final-output source column. Fail with a clear message if any are missing.
-  - Step 3: build `dim_customer_ranked_df` by adding `_rn = row_number().over(w)` where `w` is defined ONLY against the flat helper columns from Step 1 (see window contract below).
-  - Step 4: assert `_rn`, `rank_customer_id`, `rank_address_type`, `rank_address_id` all exist on `dim_customer_ranked_df`.
-  - Step 5: build `dim_customer_filtered_df = dim_customer_ranked_df.filter(F.col('_rn') == 1)`.
-  - Step 6: build `dim_customer_final_df` by selecting/renaming to the final Gold column list. This is the FIRST point at which `rank_*` and `_rn` helper columns may be dropped.
-- Deterministic flattening rule for customers with multiple addresses:
-  - rank addresses per customer with this precedence:
-    1. `address_type = 'Main Office'`
-    2. `address_type = 'Primary'`
-    3. `address_type = 'Billing'`
-    4. `address_type = 'Home'`
-    5. `address_type = 'Shipping'`
-    6. any other non-null `address_type` alphabetically
-    7. lowest `address_id`
-  - keep only rank 1 per `customer_id`
-- Window specification contract for `dim_customer`:
-  - The window MUST be defined as:
-    ```python
-    w = (
-        Window
-        .partitionBy(F.col("rank_customer_id"))
-        .orderBy(
-            F.when(F.col("rank_address_type") == "Main Office", 1)
-             .when(F.col("rank_address_type") == "Primary",     2)
-             .when(F.col("rank_address_type") == "Billing",     3)
-             .when(F.col("rank_address_type") == "Home",        4)
-             .when(F.col("rank_address_type") == "Shipping",    5)
-             .when(F.col("rank_address_type").isNotNull(),      6)
-             .otherwise(7),
-            F.col("rank_address_type").asc_nulls_last(),
-            F.col("rank_address_id").asc_nulls_last(),
-        )
-    )
-    ```
-  - Hard prohibitions (any of these is an immediate fail, do not generate code that contains them):
-    - Do NOT pass dotted strings like `"c.customer_id"`, `"ca.address_type"`, or `"ca.address_id"` to `Window.partitionBy`, `Window.orderBy`, `F.col`, or `withColumn`. Spark interprets `"c.customer_id"` as a single column literally named `c.customer_id` and it will not resolve after a projection.
-    - Do NOT reference `c.*`, `ca.*`, or `a.*` alias-qualified columns AFTER the Step 1 select that produced `dim_customer_joined_df`. The alias scope ends at that select.
-    - Do NOT define the window AFTER renaming columns to their final Gold names (e.g. against `customer_address_type` / `customer_address_id`). The window must be defined against the `rank_*` helper columns from Step 1.
-    - Do NOT use `.alias("c")` / `.alias("ca")` and then expect `F.col("c.customer_id")` to work outside a `selectExpr` / SQL string context.
-- Self-check
+    Also keep every source attribute needed for the final projection (
