@@ -58,6 +58,13 @@
   - Tightened `## Silver` with an explicit build pattern for `silver.v_get_all_categories`, `silver.v_product_and_description`, and `silver.v_product_model_catalog_description` using actual renamed columns only, no assumed business-key columns before validation.
   - Added a hard rule that view-based Silver tables must derive dedup keys from validated renamed columns only; if the expected key column is absent after rename, fail immediately with the actual column list.
 
+### Iteration 4 — 2026-05-17 15:50:57Z — failed layer: bronze (run: 20260517-144627-02c2b7)
+- **Root cause (1-line summary)**: Bronze build reached session cancellation because Bronze ingestion was under-constrained and did not require source-by-source fail-fast validation, especially for source views and partition helper columns.
+- **What was changed**:
+  - Tightened `## Generic guidance` with Bronze-specific blocking execution, lightweight checkpoints, and immediate termination on first Bronze failure.
+  - Tightened `## Bronze` to define exact Bronze build order, mandatory per-object preflight/post-write validations, and explicit source schema handling for base tables vs `v_*` views.
+  - Added an explicit rule for `bronze.sales_order_header` to derive and retain `order_year` only after validating `OrderDate`, and to never assume view key columns during Bronze landing.
+
 ## Inputs
 - Workspace: `d97c0ec7-74ac-4f12-9e70-124cb0d5a4ad`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -116,6 +123,11 @@ Cross-cutting code rules:
 - Silver notebook control flow must be strictly linear and blocking: read one Bronze table, build one Silver table, validate it, checkpoint it with a lightweight action, write it, read it back once to verify schema/readability, then and only then proceed to the next Silver table.
 - For Bronze or Silver source views, always inspect the actual source schema first, then perform `snake_case` rename, then persist exactly the validated renamed column list. Do not assume key column names for a view until after that inspection and rename have completed.
 - For any `v_*` table in Silver, freeze the renamed column list into a named Python variable immediately after the rename checkpoint and use only that validated list in subsequent dedup/final projection logic. Never hand-type additional inferred column names later in the transform.
+- In Bronze, build and validate one source object at a time in the exact order defined in `## Bronze`. Do not start the next Bronze object until the current one has passed source existence validation, source-column validation, pre-write checkpoint, write success, and post-write readback.
+- If any Bronze table or view fails validation or write, stop the notebook immediately after `_save_error('bronze', e)` and `raise`; do not continue attempting later Bronze objects.
+- In Bronze, after each source read and after each non-trivial transformation step, immediately force a lightweight Spark action before moving on. Use only `limit(1).collect()`, `take(1)`, or `count()` when row-count validation is explicitly required.
+- Bronze notebook control flow must be strictly linear and blocking: read one source object, validate schema, add only the allowed Bronze metadata/helper columns for that object, checkpoint it, write it, read it back once to verify schema/readability, then and only then proceed to the next source object.
+- In Bronze, do not infer or require business keys for `v_*` source objects during landing. Land the source view columns exactly as provided by the source plus Bronze metadata columns only.
 
 Required notebook cell commenting standard:
 - EACH code cell must start with a short markdown-style Python comment block.
@@ -160,6 +172,20 @@ Land each selected source object into the `bronze` schema as 1:1 raw Delta table
 - Load type: full snapshot ingestion for all listed tables/views unless the user later edits to introduce incremental logic based on `ModifiedDate`.
 - Write mode: idempotent overwrite per table for each run.
 - Table naming: `bronze.address`, `bronze.customer`, `bronze.customer_address`, `bronze.product`, `bronze.product_category`, `bronze.product_description`, `bronze.product_model`, `bronze.product_model_product_description`, `bronze.sales_order_detail`, `bronze.sales_order_header`, `bronze.v_get_all_categories`, `bronze.v_product_and_description`, `bronze.v_product_model_catalog_description`.
+- Bronze build order must be exactly:
+  1. `bronze.address`
+  2. `bronze.customer`
+  3. `bronze.customer_address`
+  4. `bronze.product`
+  5. `bronze.product_category`
+  6. `bronze.product_description`
+  7. `bronze.product_model`
+  8. `bronze.product_model_product_description`
+  9. `bronze.sales_order_detail`
+  10. `bronze.sales_order_header`
+  11. `bronze.v_get_all_categories`
+  12. `bronze.v_product_and_description`
+  13. `bronze.v_product_model_catalog_description`
 - Metadata columns to append to every bronze table:
   - `ingested_at_utc`
   - `run_id`
@@ -169,51 +195,115 @@ Land each selected source object into the `bronze` schema as 1:1 raw Delta table
   - `source_object_name`
   - `source_record_hash` from all business columns
 - Partitioning:
-  - `bronze.sales_order_header`: partition by `order_year` derived from `OrderDate`
+  - `bronze.sales_order_header`: partition by persisted helper column `order_year` derived from validated source column `OrderDate`
   - `bronze.sales_order_detail`: no partition initially unless volume proves large; detail lacks a natural date without joining header
   - All other tables/views: no partitioning due to likely small/master/reference size
 - Schema drift handling:
-  - Enforce expected schema from provided column lists
+  - Enforce expected schema from provided column lists for base tables
+  - For `v_*` source views, do not enforce guessed business-key columns; only validate that the source object exists and has a non-empty schema before landing
   - Log and fail on missing required source columns
   - Optionally allow additive columns only if user edits the spec to support schema evolution
 
+### Bronze execution contract
+- For each Bronze object, execution must be blocking and fail-fast with these checkpoints in order:
+  1. validate source object exists in the source lakehouse
+  2. read the source object into a named `*_source_df`
+  3. immediately validate the source schema:
+     - for base tables, assert the required source columns listed below exist before any further transform
+     - for `v_*` views, capture the exact source column list into a named variable and assert it is non-empty
+  4. immediately run a lightweight checkpoint action on `*_source_df`
+  5. add only the allowed Bronze metadata columns and any explicitly allowed helper column for that object into a named `*_bronze_df`
+  6. validate the final Bronze schema before write
+  7. immediately run a lightweight checkpoint action on `*_bronze_df`
+  8. write the Bronze table
+  9. read the Bronze table back and verify schema/readability with a lightweight action
+- For every Bronze object, create a dedicated `*_bronze_df` variable that contains exactly the persisted source business columns in their original source names/order, plus the Bronze metadata columns, plus only explicitly allowed helper columns for that object.
+- No Bronze transform may rename source business columns, deduplicate rows, or infer/introduce analytical attributes beyond the explicit helper column `order_year` on `bronze.sales_order_header`.
+- If any Bronze object fails any checkpoint above, stop immediately and do not continue to later Bronze objects.
+
 ### Table-specific landing notes
 - `SalesLT/Address`
+  - Required source columns: `AddressID`, `AddressLine1`, `AddressLine2`, `City`, `StateProvince`, `CountryRegion`, `PostalCode`, `rowguid`, `ModifiedDate`
   - Raw primary key candidate: `AddressID`
   - Preserve address text exactly; no trimming/standardization in Bronze
+
 - `SalesLT/Customer`
+  - Required source columns: `CustomerID`, `NameStyle`, `Title`, `FirstName`, `MiddleName`, `LastName`, `Suffix`, `CompanyName`, `SalesPerson`, `EmailAddress`, `Phone`, `PasswordHash`, `PasswordSalt`, `rowguid`, `ModifiedDate`
   - Raw primary key candidate: `CustomerID`
   - Keep sensitive columns `PasswordHash` and `PasswordSalt` in Bronze only
+
 - `SalesLT/CustomerAddress`
+  - Required source columns: `CustomerID`, `AddressID`, `AddressType`, `rowguid`, `ModifiedDate`
   - Junction table between customer and address
   - Composite key candidate: `CustomerID`, `AddressID`, `AddressType`
+
 - `SalesLT/Product`
+  - Required source columns: `ProductID`, `Name`, `ProductNumber`, `Color`, `StandardCost`, `ListPrice`, `Size`, `Weight`, `ProductCategoryID`, `ProductModelID`, `SellStartDate`, `SellEndDate`, `DiscontinuedDate`, `ThumbNailPhoto`, `ThumbNailPhotoFileName`, `rowguid`, `ModifiedDate`
   - Raw primary key candidate: `ProductID`
   - Preserve binary `ThumbNailPhoto` in Bronze; likely exclude from Silver/Gold analytics
+
 - `SalesLT/ProductCategory`
+  - Required source columns: `ProductCategoryID`, `ParentProductCategoryID`, `Name`, `rowguid`, `ModifiedDate`
   - Raw primary key candidate: `ProductCategoryID`
   - Contains parent-child hierarchy via `ParentProductCategoryID`
+
 - `SalesLT/ProductDescription`
+  - Required source columns: `ProductDescriptionID`, `Description`, `rowguid`, `ModifiedDate`
   - Raw primary key candidate: `ProductDescriptionID`
+
 - `SalesLT/ProductModel`
+  - Required source columns: `ProductModelID`, `Name`, `CatalogDescription`, `rowguid`, `ModifiedDate`
   - Raw primary key candidate: `ProductModelID`
+
 - `SalesLT/ProductModelProductDescription`
+  - Required source columns: `ProductModelID`, `ProductDescriptionID`, `Culture`, `rowguid`, `ModifiedDate`
   - Bridge table among product model, description, and culture
   - Composite key candidate: `ProductModelID`, `ProductDescriptionID`, `Culture`
+
 - `SalesLT/SalesOrderDetail`
+  - Required source columns: `SalesOrderID`, `SalesOrderDetailID`, `OrderQty`, `ProductID`, `UnitPrice`, `UnitPriceDiscount`, `LineTotal`, `rowguid`, `ModifiedDate`
   - Transaction line fact candidate
   - Composite key candidate: `SalesOrderID`, `SalesOrderDetailID`
+
 - `SalesLT/SalesOrderHeader`
+  - Required source columns: `SalesOrderID`, `SalesOrderNumber`, `PurchaseOrderNumber`, `AccountNumber`, `CustomerID`, `BillToAddressID`, `ShipToAddressID`, `ShipMethod`, `OrderDate`, `DueDate`, `ShipDate`, `Status`, `OnlineOrderFlag`, `SubTotal`, `TaxAmt`, `Freight`, `TotalDue`, `SalesPerson`, `rowguid`, `ModifiedDate`
   - Order header fact candidate
   - Raw primary key candidate: `SalesOrderID`
+  - Mandatory helper-column rule:
+    - derive `order_year` only from validated source column `OrderDate`
+    - add `order_year` in the named `sales_order_header_bronze_df` before write
+    - do not attempt to derive `order_year` if `OrderDate` is missing; fail immediately instead
+  - Final persisted columns for this Bronze table must be exactly:
+    - all original source columns in original source order
+    - `order_year`
+    - all Bronze metadata columns
+
 - `SalesLT/vGetAllCategories`
+  - Required process only:
+    - validate the source view exists
+    - inspect and capture the exact source column list
+    - assert the source column list is non-empty
+    - land exactly those source columns plus Bronze metadata columns
   - Reference view already flattening category hierarchy
-  - Key candidate: `ProductCategoryID`
+  - Do not require or infer `ProductCategoryID` during Bronze landing
+
 - `SalesLT/vProductAndDescription`
-  - Enriched product text view by `ProductID`, `Culture`
+  - Required process only:
+    - validate the source view exists
+    - inspect and capture the exact source column list
+    - assert the source column list is non-empty
+    - land exactly those source columns plus Bronze metadata columns
+  - Enriched product text view by source-provided columns only
+  - Do not require or infer `ProductID` or `Culture` during Bronze landing
+
 - `SalesLT/vProductModelCatalogDescription`
-  - Wide descriptive view by `ProductModelID`
-  - Treat as analytic enrichment source, not transactional source
+  - Required process only:
+    - validate the source view exists
+    - inspect and capture the exact source column list
+    - assert the source column list is non-empty
+    - land exactly those source columns plus Bronze metadata columns
+  - Wide descriptive view by source-provided columns only
+  - Do not require or infer `ProductModelID` during Bronze landing
 
 ## Silver
 Standardize names, types, deduplicate, remove clearly non-analytic sensitive/binary fields where appropriate, and produce conformed clean tables in the `silver` schema.
@@ -608,96 +698,4 @@ Build only these four Gold tables for the final curated layer and semantic model
 - `gold.dim_sales`
 - `gold.fact_sales`
 
-Do not materialize alternative Gold tables such as `gold.dim_address`, `gold.dim_date`, `gold.dim_ship_method`, `gold.bridge_customer_address`, `gold.fact_sales_order_line`, or `gold.fact_sales_order_header` in place of the four requested outputs. They may be used as temporary DataFrames during notebook execution, but the persisted Gold outputs for this run must be exactly the four requested tables above.
-
-### Gold source table and column contract
-Use these Silver tables and only these validated key columns for Gold joins:
-- `silver.customer` as `c`
-  - required columns: `customer_id`, `customer_name_preferred`, `full_name`, `company_name`, `email_address`, `phone`, `name_style`, `modified_date`
-  - optional column: `sales_person`
-  - if `c.sales_person` is absent, `gold.dim_customer` must still build successfully and emit `sales_person` as null
-- `silver.customer_address` as `ca`
-  - required columns: `customer_id`, `address_id`, `address_type`
-- `silver.address` as `a`
-  - required columns: `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`
-- `silver.product` as `p`
-  - required columns: `product_id`, `name`, `product_number`, `color`, `size`, `weight`, `standard_cost`, `list_price`, `product_category_id`, `product_model_id`, `is_discontinued`, `is_sellable_currently`
-- `silver.product_category` as `pc_child`
-  - required columns: `product_category_id`, `parent_product_category_id`, `name`
-- `silver.product_category` as `pc_parent`
-  - required columns: `product_category_id`, `name`
-- `silver.product_model` as `pm`
-  - required columns: `product_model_id`
-  - optional column: `name`
-  - if `pm.name` is absent, `gold.dim_product` must still build successfully and emit `product_model_name` as null
-- `silver.product_model_product_description` as `pmpd`
-  - required columns: `product_model_id`, `product_description_id`, `culture`
-- `silver.product_description` as `pd`
-  - required columns: `product_description_id`, `description`
-- `silver.sales_order_header` as `h`
-  - required columns: `sales_order_id`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `bill_to_address_id`, `ship_to_address_id`, `order_date`, `due_date`, `ship_date`, `status`, `order_status_desc`, `online_order_flag`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`
-  - salesperson source contract:
-    - preferred required column for salesperson derivation: `sales_person`
-    - if `h.sales_person` does not exist after schema validation, use `salesperson` only if that exact snake_case/renamed column is present in Silver
-    - do not guess any other header column name for salesperson
-    - once resolved, immediately normalize it to a single temporary column named `sales_person_source` before any further select/join logic
-- `silver.sales_order_detail` as `d`
-  - required columns: `sales_order_id`, `sales_order_detail_id`, `product_id`, `order_qty`, `unit_price`, `unit_price_discount`, `gross_line_amount`, `discount_amount`, `net_line_amount`
-
-If any required column above is missing, fail immediately with a clear error naming the table alias and column. For optional columns, emit the required Gold output column as null rather than failing.
-
-### Shared salesperson derivation contract
-- Build one reusable expression/temporary projection for cleaned salesperson values and reuse it identically in both `gold.dim_sales` and `gold.fact_sales`.
-- Input to the cleaning expression must be the resolved header column `sales_person_source`.
-- Cleaning logic for `sales_person_clean`:
-  - cast source to string
-  - remove leading `adventureworks/` case-insensitively
-  - then remove trailing digits at the end of the string
-  - then trim whitespace
-  - if the cleaned result is empty string, set to null
-- Do not reference raw `h.sales_person` directly in multiple places after resolution; resolve once to `sales_person_source`, then derive `sales_person_clean`.
-
-### Gold build sequencing and validation contract
-- Build the four Gold tables in this exact order:
-  1. `gold.dim_customer`
-  2. `gold.dim_product`
-  3. `gold.dim_sales`
-  4. `gold.fact_sales`
-- For each table, before write:
-  - validate the final DataFrame contains exactly the specified output columns and no extras
-  - validate the required grain key columns are present and non-null
-  - validate uniqueness at the declared grain
-- For each table, after write:
-  - immediately read back the persisted Gold table
-  - verify the readback schema matches the specified output column list exactly
-  - verify the readback is queryable with at least a lightweight action
-- If any validation fails, stop immediately and do not continue to subsequent Gold tables.
-- Do not chain all four Gold writes inside one broad `try` that masks which table failed; each table must have its own explicit validation-and-write block.
-- Mandatory per-table execution checkpoints:
-  1. validate source Silver table existence and required columns
-  2. build each intermediate DataFrame step named in this spec
-  3. after each intermediate step, assert required columns for that step exist before proceeding
-  4. materialize/check the final DataFrame before write
-  5. write the table
-  6. read the table back and verify schema/readability
-- No later Gold table may start until all six checkpoints above have succeeded for the current table.
-
-### Global Spark column-reference rules (apply to all Gold tables)
-These rules exist to prevent recurring `UNRESOLVED_COLUMN` analyzer errors.
-- Never pass dotted strings like `"c.customer_id"`, `"ca.address_type"`, `"h.sales_person"`, or `"pc_child.name"` to `F.col(...)`, `withColumn(...)`, `Window.partitionBy(...)`, `Window.orderBy(...)`, or `select(...)`. Spark treats `"c.customer_id"` as a single column literally named `c.customer_id`, which does not resolve once any projection or rename has been applied.
-- Alias scope (`.alias("c")`, `.alias("ca"), ...)` is only valid inside the SAME `select` / `join` expression that introduces it. Once you produce a new DataFrame via `select(...)` or `withColumn(...)`, the dotted alias form is gone and you must reference plain column names.
-- For any column that will later be referenced by a `Window`, a `withColumn`, or a downstream join after a projection, first materialize it as a flat, unambiguous helper column (e.g. `rank_customer_id`, `rank_address_type`, `sales_person_source`) in the same select that introduces the join aliases.
-- Before applying a window, `withColumn`, or final projection, do not drop columns that the next step still needs. Helper / source columns may only be dropped in the FINAL select that produces the Gold output schema.
-
-### `gold.dim_customer`
-- Grain: exactly one row per `customer_id`.
-- Join path:
-  - start from `silver.customer c`
-  - left join `silver.customer_address ca` on `c.customer_id = ca.customer_id`
-  - left join `silver.address a` on `ca.address_id = a.address_id`
-- Mandatory implementation pattern for this table:
-  - Step 1: build `dim_customer_joined_df` from the three-table join. In the SAME select that produces this DataFrame, create unambiguous, non-dotted ranking helper columns so the window never depends on alias-qualified names:
-    - `rank_customer_id`   = `c.customer_id`
-    - `rank_address_type`  = `ca.address_type`
-    - `rank_address_id`    = `ca.address_id`
-    Also keep every source attribute needed for the final projection (
+Do not materialize alternative Gold tables such as `gold.dim_address`, `gold.dim_date`, `gold.dim_ship_method`, `gold.bridge_customer_address`, `gold.fact_sales_order_line
