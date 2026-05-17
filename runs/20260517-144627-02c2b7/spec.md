@@ -44,6 +44,13 @@
   - Tightened `## Silver` to define an exact Silver build order, required per-table checkpoints, and mandatory source/final schema assertions before and after each write.
   - Added explicit Silver table column contracts and derived-column dependency rules so transforms only reference validated `snake_case` columns that still exist at each step.
 
+### Iteration 2 — 2026-05-17 15:46:49Z — failed layer: silver (run: 20260517-144627-02c2b7)
+- **Root cause (1-line summary)**: Silver still failed at session level because the spec did not force lightweight execution checkpoints after each intermediate Silver step, allowing lazy analyzer/runtime failures to accumulate until Fabric cancelled the session.
+- **What was changed**:
+  - Tightened `## Generic guidance` to require a lightweight Spark action after every non-trivial Silver intermediate DataFrame and immediate termination on the first failing Silver table.
+  - Tightened `## Silver` to mandate named intermediate DataFrames, exact checkpoint actions, and per-table preflight/post-write validation sequencing.
+  - Added an explicit no-batching rule: do not build multiple Silver tables or defer multiple writes/actions within the same unresolved execution chain.
+
 ## Inputs
 - Workspace: `d97c0ec7-74ac-4f12-9e70-124cb0d5a4ad`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -97,7 +104,9 @@ Cross-cutting code rules:
 - In Silver, build and validate one table at a time in the exact order defined in `## Silver`. Do not start the next Silver table until the current one has passed source-column validation, transform-step validation, final-schema validation, key validation, write success, and post-write readback.
 - If any Silver table fails validation or write, stop the notebook immediately after `_save_error('silver', e)` and `raise`; do not continue attempting later Silver tables.
 - In Silver, every intermediate transformation step that changes schema shape (`select`, `drop`, `withColumn`, dedup/ranking, aggregation, join) must be followed by an explicit schema assertion naming the DataFrame variable and the required columns for the next step.
-- Silver notebook control flow must be strictly linear and blocking: read one Bronze table, build one Silver table, validate it, write it, read it back once to verify schema/readability, then and only then proceed to the next Silver table.
+- In Silver, after every non-trivial intermediate DataFrame is created, immediately force a lightweight Spark action before moving on. Use one of these checkpoint actions only: `limit(1).collect()`, `take(1)`, or `count()` when row-count validation is explicitly required. This applies to post-rename DataFrames, post-derived-column DataFrames, ranked/deduped DataFrames, final projection DataFrames, and post-write readback DataFrames.
+- Do not batch unresolved Silver work: never create multiple Silver table DataFrames and then trigger actions later. Finish all validations, checkpoint actions, and the write/readback for the current Silver table before reading or transforming the next Silver source table.
+- Silver notebook control flow must be strictly linear and blocking: read one Bronze table, build one Silver table, validate it, checkpoint it with a lightweight action, write it, read it back once to verify schema/readability, then and only then proceed to the next Silver table.
 
 Required notebook cell commenting standard:
 - EACH code cell must start with a short markdown-style Python comment block.
@@ -232,20 +241,26 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
 - For each Silver table, execution must be blocking and fail-fast with these checkpoints in order:
   1. validate Bronze source table exists
   2. validate required Bronze source columns before rename
-  3. perform `snake_case` renaming
+  3. perform `snake_case` renaming into a named `*_renamed_df`
   4. validate required post-rename column names before any further transformation
-  5. apply derived columns in dependency order
-  6. apply dedup/ranking using only columns that exist on that DataFrame at that step
-  7. project exactly the intended persisted columns plus required audit columns
-  8. validate final schema exactly
-  9. validate required key columns are non-null
-  10. validate uniqueness at declared grain
-  11. write the table
-  12. read the table back and verify schema/readability
+  5. immediately run a lightweight checkpoint action on `*_renamed_df` (`limit(1).collect()` or `take(1)`)
+  6. apply derived columns in dependency order into a named `*_derived_df` when derivations are required
+  7. validate the derived-step schema and immediately run a lightweight checkpoint action on `*_derived_df`
+  8. apply dedup/ranking using only columns that exist on that DataFrame at that step into a named `*_dedup_df`
+  9. validate the dedup/ranking-step schema and immediately run a lightweight checkpoint action on `*_dedup_df`
+  10. project exactly the intended persisted columns plus required audit columns into a named `*_final_df`
+  11. validate final schema exactly
+  12. validate required key columns are non-null
+  13. validate uniqueness at declared grain
+  14. immediately run a lightweight checkpoint action on `*_final_df`
+  15. write the table
+  16. read the table back and verify schema/readability with a lightweight action
 - If any Silver table fails any checkpoint above, stop immediately and do not continue to later Silver tables.
 - For every Silver table, create a dedicated `*_final_df` variable that contains exactly the persisted columns for that table before write.
 - No Silver transform may reference original Bronze/PascalCase names after the rename-to-`snake_case` step. After rename, use only `snake_case` names.
 - Do not assume optional columns exist in Silver source data. If a transform depends on a non-required column, first validate it exists; otherwise either emit the output as null only where the spec explicitly allows, or fail clearly.
+- Do not combine multiple Silver tables in a shared transform/write loop that delays Spark actions. Each Silver table must complete all schema assertions, checkpoint actions, write, and readback before the next table starts.
+- For Silver tables with no derived columns, still create the named intermediate DataFrames `*_renamed_df`, `*_dedup_df`, and `*_final_df` and run the required schema assertions and lightweight checkpoint actions at each stage.
 
 ### Silver table specifications
 - `silver.address`
@@ -254,6 +269,10 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required columns after rename: `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`, `rowguid`, `modified_date`
   - Key: `address_id`
   - Dedup key: `address_id`
+  - Intermediate DataFrame contract:
+    - `address_renamed_df` must contain the required post-rename columns
+    - `address_dedup_df` must contain the same business columns before final audit-column projection
+    - `address_final_df` must contain exactly the final persisted columns plus audit columns
   - Final business columns must be exactly:
     - `address_id`
     - `address_line1`
@@ -272,6 +291,11 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required columns after rename: `customer_id`, `name_style`, `title`, `first_name`, `middle_name`, `last_name`, `suffix`, `company_name`, `sales_person`, `email_address`, `phone`, `rowguid`, `modified_date`
   - Key: `customer_id`
   - Dedup key: `customer_id`
+  - Intermediate DataFrame contract:
+    - `customer_renamed_df` must contain all required post-rename columns
+    - `customer_derived_df` must add only `full_name` and `customer_name_preferred`
+    - `customer_dedup_df` must preserve `full_name` and `customer_name_preferred`
+    - `customer_final_df` must contain exactly the final persisted columns plus audit columns
   - Derived-column order is mandatory:
     1. derive `full_name` from `title`, `first_name`, `middle_name`, `last_name`, `suffix`
     2. derive `customer_name_preferred` using `company_name` when present, else `full_name`
@@ -298,6 +322,10 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required Bronze columns before rename: `CustomerID`, `AddressID`, `AddressType`, `rowguid`, `ModifiedDate`
   - Required columns after rename: `customer_id`, `address_id`, `address_type`, `rowguid`, `modified_date`
   - Dedup key: `customer_id`, `address_id`, `address_type`
+  - Intermediate DataFrame contract:
+    - `customer_address_renamed_df` must contain the required post-rename columns
+    - `customer_address_dedup_df` must preserve exactly the business columns needed for final output
+    - `customer_address_final_df` must contain exactly the final persisted columns plus audit columns
   - Final business columns must be exactly:
     - `customer_id`
     - `address_id`
@@ -313,6 +341,11 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required columns after rename: `product_id`, `name`, `product_number`, `color`, `standard_cost`, `list_price`, `size`, `weight`, `product_category_id`, `product_model_id`, `sell_start_date`, `sell_end_date`, `discontinued_date`, `thumbnail_photo_file_name`, `rowguid`, `modified_date`
   - Key: `product_id`
   - Dedup key: `product_id`
+  - Intermediate DataFrame contract:
+    - `product_renamed_df` must contain all required post-rename columns
+    - `product_derived_df` must add only `is_discontinued` and `is_sellable_currently`
+    - `product_dedup_df` must preserve both derived flags and all final business columns
+    - `product_final_df` must contain exactly the final persisted columns plus audit columns
   - Derived-column order is mandatory:
     1. derive `is_discontinued` from `discontinued_date.isNotNull()`
     2. derive `is_sellable_currently` using existing columns on the DataFrame at that step only, with this exact intent:
@@ -350,6 +383,10 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required columns after rename: `product_category_id`, `parent_product_category_id`, `name`, `rowguid`, `modified_date`
   - Key: `product_category_id`
   - Dedup key: `product_category_id`
+  - Intermediate DataFrame contract:
+    - `product_category_renamed_df` must contain the required post-rename columns
+    - `product_category_dedup_df` must contain the same business columns before final audit-column projection
+    - `product_category_final_df` must contain exactly the final persisted columns plus audit columns
   - Final business columns must be exactly:
     - `product_category_id`
     - `parent_product_category_id`
@@ -364,6 +401,10 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required columns after rename: `product_description_id`, `description`, `rowguid`, `modified_date`
   - Key: `product_description_id`
   - Dedup key: `product_description_id`
+  - Intermediate DataFrame contract:
+    - `product_description_renamed_df` must contain the required post-rename columns
+    - `product_description_dedup_df` must contain the same business columns before final audit-column projection
+    - `product_description_final_df` must contain exactly the final persisted columns plus audit columns
   - Final business columns must be exactly:
     - `product_description_id`
     - `description`
@@ -377,6 +418,10 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required columns after rename: `product_model_id`, `name`, `rowguid`, `modified_date`
   - Key: `product_model_id`
   - Dedup key: `product_model_id`
+  - Intermediate DataFrame contract:
+    - `product_model_renamed_df` must contain the required post-rename columns
+    - `product_model_dedup_df` must contain the same business columns before final audit-column projection
+    - `product_model_final_df` must contain exactly the final persisted columns plus audit columns
   - Final business columns must be exactly:
     - `product_model_id`
     - `name`
@@ -389,6 +434,10 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required Bronze columns before rename: `ProductModelID`, `ProductDescriptionID`, `Culture`, `rowguid`, `ModifiedDate`
   - Required columns after rename: `product_model_id`, `product_description_id`, `culture`, `rowguid`, `modified_date`
   - Dedup key: `product_model_id`, `product_description_id`, `culture`
+  - Intermediate DataFrame contract:
+    - `product_model_product_description_renamed_df` must contain the required post-rename columns
+    - `product_model_product_description_dedup_df` must preserve exactly the business columns needed for final output
+    - `product_model_product_description_final_df` must contain exactly the final persisted columns plus audit columns
   - Final business columns must be exactly:
     - `product_model_id`
     - `product_description_id`
@@ -403,6 +452,11 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required columns after rename: `sales_order_id`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `bill_to_address_id`, `ship_to_address_id`, `ship_method`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sub_total`, `tax_amt`, `freight`, `total_due`, `sales_person`, `rowguid`, `modified_date`
   - Key: `sales_order_id`
   - Dedup key: `sales_order_id`
+  - Intermediate DataFrame contract:
+    - `sales_order_header_renamed_df` must contain all required post-rename columns
+    - `sales_order_header_derived_df` must add only `order_date_key`, `due_date_key`, `ship_date_key`, `order_year`, `order_month`, `order_status_desc`
+    - `sales_order_header_dedup_df` must preserve all six derived columns and all final business columns
+    - `sales_order_header_final_df` must contain exactly the final persisted columns plus audit columns
   - Derived-column order is mandatory:
     1. `order_date_key` from `order_date`
     2. `due_date_key` from `due_date`
@@ -445,6 +499,11 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Required columns after rename: `sales_order_id`, `sales_order_detail_id`, `order_qty`, `product_id`, `unit_price`, `unit_price_discount`, `line_total`, `rowguid`, `modified_date`
   - Key: `sales_order_id`, `sales_order_detail_id`
   - Dedup key: `sales_order_id`, `sales_order_detail_id`
+  - Intermediate DataFrame contract:
+    - `sales_order_detail_renamed_df` must contain all required post-rename columns
+    - `sales_order_detail_derived_df` must add only `gross_line_amount`, `discount_amount`, `net_line_amount`
+    - `sales_order_detail_dedup_df` must preserve all three derived columns and all final business columns
+    - `sales_order_detail_final_df` must contain exactly the final persisted columns plus audit columns
   - Derived-column order is mandatory:
     1. `gross_line_amount = order_qty * unit_price`
     2. `discount_amount = order_qty * unit_price * unit_price_discount`
@@ -467,18 +526,30 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
 - `silver.v_get_all_categories`
   - Source: `bronze.v_get_all_categories`
   - Dedup key: `product_category_id`
+  - Intermediate DataFrame contract:
+    - `v_get_all_categories_renamed_df` must be created from the full renamed view schema
+    - `v_get_all_categories_dedup_df` must preserve the validated renamed columns
+    - `v_get_all_categories_final_df` must persist the renamed columns plus audit columns only
   - After `snake_case` rename, validate the actual column set from source and persist the renamed view columns plus audit columns only
   - Use as optional hierarchy helper in Gold
 
 - `silver.v_product_and_description`
   - Source: `bronze.v_product_and_description`
   - Dedup key: `product_id`, `culture`
+  - Intermediate DataFrame contract:
+    - `v_product_and_description_renamed_df` must be created from the full renamed view schema
+    - `v_product_and_description_dedup_df` must preserve the validated renamed columns
+    - `v_product_and_description_final_df` must persist the renamed columns plus audit columns only
   - After `snake_case` rename, validate the actual column set from source and persist the renamed view columns plus audit columns only
   - Optional multilingual product description helper
 
 - `silver.v_product_model_catalog_description`
   - Source: `bronze.v_product_model_catalog_description`
   - Dedup key: `product_model_id`
+  - Intermediate DataFrame contract:
+    - `v_product_model_catalog_description_renamed_df` must be created from the full renamed view schema
+    - `v_product_model_catalog_description_dedup_df` must preserve the validated renamed columns
+    - `v_product_model_catalog_description_final_df` must persist the renamed columns plus audit columns only
   - After `snake_case` rename, validate the actual column set from source and persist the renamed view columns plus audit columns only
   - Optional wide model attribute helper
 
@@ -636,113 +707,4 @@ These rules exist to prevent recurring `UNRESOLVED_COLUMN` analyzer errors.
     - Do NOT reference `c.*`, `ca.*`, or `a.*` alias-qualified columns AFTER the Step 1 select that produced `dim_customer_joined_df`. The alias scope ends at that select.
     - Do NOT define the window AFTER renaming columns to their final Gold names (e.g. against `customer_address_type` / `customer_address_id`). The window must be defined against the `rank_*` helper columns from Step 1.
     - Do NOT use `.alias("c")` / `.alias("ca")` and then expect `F.col("c.customer_id")` to work outside a `selectExpr` / SQL string context.
-- Self-check before writing `gold.dim_customer`:
-  - Print/log the schema of `dim_customer_joined_df` and `dim_customer_ranked_df`. The ranked DataFrame must contain `_rn`, `rank_customer_id`, `rank_address_type`, `rank_address_id`.
-- Final validation checks before writing `gold.dim_customer`:
-  - required output columns must match this list exactly
-  - `customer_id` must be non-null
-  - `customer_id` must be unique
-- Output columns must be exactly:
-  - `customer_id`
-  - `customer_name_preferred`
-  - `full_name`
-  - `company_name`
-  - `sales_person`
-  - `email_address`
-  - `phone`
-  - `name_style`
-  - `customer_address_type`
-  - `customer_address_id`
-  - `customer_address_line1`
-  - `customer_address_line2`
-  - `customer_city`
-  - `customer_state_province`
-  - `customer_country_region`
-  - `customer_postal_code`
-  - `modified_date`
-- `sales_person` in `gold.dim_customer` comes only from `silver.customer.sales_person` when that optional column exists; otherwise output null as `sales_person`.
-- Use explicit renames from joined aliases; do not leave duplicate raw `address_id`, `city`, `state_province`, or `postal_code` columns unqualified.
-
-### `gold.dim_product`
-- Grain: exactly one row per `product_id`.
-- Mandatory enrichment route for this run: use base tables and bridge tables, not source views, to avoid column-name uncertainty.
-- Join path:
-  - start from `silver.product p`
-  - left join `silver.product_category pc_child` on `p.product_category_id = pc_child.product_category_id`
-  - left join `silver.product_category pc_parent` on `pc_child.parent_product_category_id = pc_parent.product_category_id`
-  - left join english-only bridge `silver.product_model_product_description pmpd` on `p.product_model_id = pmpd.product_model_id AND upper(pmpd.culture) = 'EN'`
-  - left join `silver.product_description pd` on `pmpd.product_description_id = pd.product_description_id`
-  - left join `silver.product_model pm` on `p.product_model_id = pm.product_model_id`
-- Mandatory implementation pattern for this table:
-  - Step 1: create `pmpd_en_df` containing only english rows and only columns `product_model_id`, `product_description_id`.
-  - Step 2: deduplicate english bridge rows to one row per `product_model_id` by lowest `product_description_id`, resulting in `pmpd_en_dedup_df`.
-  - Step 3: validate `pmpd_en_dedup_df` uniqueness on `product_model_id`.
-  - Step 4: create `dim_product_joined_df` from the specified joins. In the SAME select, project `pc_child.name as subcategory_src` and `pc_parent.name as category_src` so neither is referenced by an unaliased `name` later.
-  - Step 5: validate `dim_product_joined_df` contains all source columns needed for the final projection, including `subcategory_src` and `category_src`.
-  - Step 6: create `dim_product_final_df` by projecting exactly the final columns below.
-- Category hierarchy rule:
-  - `subcategory` = `subcategory_src` (i.e. `pc_child.name`)
-  - `category` = `category_src` (i.e. `pc_parent.name`)
-  - If `pc_child.parent_product_category_id` is null, then set:
-    - `subcategory = subcategory_src`
-    - `category = null`
-- English description rule:
-  - keep only one english bridge row per `product_model_id`
-  - if multiple english rows exist, choose the lowest `product_description_id`
-  - perform this bridge dedup in a dedicated intermediate DataFrame before joining to `p`
-- Final validation checks before writing `gold.dim_product`:
-  - required output columns must match this list exactly
-  - `product_id` must be non-null
-  - `product_id` must be unique
-- Output columns must be exactly:
-  - `product_id`
-  - `product_name` from `p.name`
-  - `product_number`
-  - `color`
-  - `size`
-  - `weight`
-  - `standard_cost`
-  - `list_price`
-  - `product_category_id`
-  - `product_model_id`
-  - `product_model_name` from `pm.name` when present, else null
-  - `product_description` from `pd.description`
-  - `category`
-  - `subcategory`
-  - `is_discontinued`
-  - `is_sellable_currently`
-- Self-join safety:
-  - never reference unaliased `name` or unaliased `product_category_id`
-  - always project `pc_child.name as subcategory_src` and `pc_parent.name as category_src` in the Step 4 join select, and reference only those helper names downstream
-
-### `gold.dim_sales`
-- Grain: exactly one row per cleaned salesperson value present in `silver.sales_order_header`.
-- Source: `silver.sales_order_header h`
-- Resolve the source salesperson column from the header contract above into `sales_person_source`, then derive `sales_person_clean` from that resolved field.
-- Mandatory implementation pattern for this table:
-  - Step 1: create `dim_sales_source_df` from header with only the resolved `sales_person_source`.
-  - Step 2: validate `dim_sales_source_df` contains `sales_person_source`.
-  - Step 3: create `dim_sales_clean_df` with `sales_person_clean`.
-  - Step 4: create `dim_sales_final_df` by filtering to non-null `sales_person_clean` and selecting distinct `sales_person_clean`.
-- Keep only non-null distinct cleaned salesperson values.
-- Final validation checks before writing `gold.dim_sales`:
-  - required output columns must match this list exactly
-  - `sales_person_clean` must be non-null
-  - `sales_person_clean` must be unique
-- Output columns must be exactly:
-  - `sales_person_clean`
-
-### `gold.fact_sales`
-- Grain: exactly one row per `sales_order_id`, `sales_order_detail_id`.
-- Join path:
-  - start from `silver.sales_order_detail d`
-  - inner join `silver.sales_order_header h` on `d.sales_order_id = h.sales_order_id`
-- Mandatory implementation pattern for this table:
-  - Step 1: create `fact_sales_joined_df` from the specified inner join and immediately resolve `sales_person_source` from header in that same joined step.
-  - Step 2: validate `fact_sales_joined_df` contains all required header/detail source columns and `sales_person_source`.
-  - Step 3: create `fact_sales_final_df` by deriving `sales_person_clean` from the shared salesperson derivation contract and projecting the final output list only.
-- After joining, immediately project to the final output list only; do not keep duplicate header/detail columns in an intermediate persisted DataFrame.
-- `sales_person_clean` in fact must be derived from the shared salesperson derivation contract using the resolved header field `sales_person_source`.
-- Final validation checks before writing `gold.fact_sales`:
-  - required output columns must match this list exactly
-  - `sales_order_id` and `sales_order_detail
+- Self-check
