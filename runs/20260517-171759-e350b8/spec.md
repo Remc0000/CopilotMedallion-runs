@@ -23,6 +23,13 @@
   - Updated **Silver common rules** to use source-specific tie-breakers when `modified_date` is absent and to make `rowguid`/`modified_date` optional passthrough columns rather than mandatory on every Silver table.
   - Updated the affected **Silver** table specs to name the exact expected columns for bridge/view tables and to require fail-fast schema assertions for the true business keys only.
 
+### Iteration 4 — 2026-05-17 17:50:23Z — failed layer: silver (run: 20260517-171759-e350b8)
+- **Root cause (1-line summary)**: Silver session likely failed because the spec forced strict required columns for helper views/tables whose real SalesLT schemas can vary, especially `CatalogDescription` on `ProductModel` and optional helper-view attributes.
+- **What was changed**:
+  - Tightened **Generic guidance** to distinguish mandatory business-key columns from optional descriptive columns and to require schema-driven projection for helper/view-style objects.
+  - Updated **Silver common rules** to forbid failing on non-key descriptive columns unless the spec explicitly marks them as mandatory for downstream joins.
+  - Relaxed the affected **Silver** table specs so `silver.product_model` requires only `ProductModelID` and `Name`, with `CatalogDescription` optional, and reinforced that helper views must only project columns that actually exist after schema inspection.
+
 ## Inputs
 - Workspace: `581484c6-28a0-48c9-8931-644c455e9376`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -75,6 +82,8 @@ Cross-cutting code rules:
 - For every Silver table, first inspect and log the Bronze schema, then build a per-table required-column set. Deduplication and ordering must only use columns actually present in that source object.
 - If a Bronze source object lacks `ModifiedDate`, use `bronze_ingest_ts` as the deterministic latest-row tie-breaker. Do not reference `modified_date` in window specs, selects, or output projections unless it exists in the source and has been renamed into Silver.
 - If a Bronze source object lacks `rowguid`, omit `rowguid` from the Silver output schema for that table rather than fabricating or referencing it.
+- In Silver, only business keys and columns explicitly needed by downstream Gold joins are mandatory. Descriptive attributes that are not used as keys or required join inputs must be treated as optional unless the spec explicitly says otherwise.
+- For helper views and semi-structured descriptive source objects, project only columns confirmed by schema inspection; never fail the whole Silver run because an optional descriptive column such as `catalog_description`, `summary`, or similar text attribute is absent.
 
 Notebook cell comment requirement:
 - EACH code cell must start with a short markdown-style comment block using Python comments.
@@ -194,6 +203,10 @@ Common Silver rules:
 - Remove or mask sensitive fields not needed analytically.
 - `rowguid` and `modified_date` are optional passthrough columns in Silver. Include them only for tables where the Bronze schema contains `rowguid` and `ModifiedDate` respectively after snake_case renaming.
 - For bridge tables and helper views, do not assume system columns exist; required Silver outputs are limited to the explicitly named business columns plus audit columns, unless schema validation confirms extra passthrough columns.
+- For each Silver table, separate columns into:
+  - mandatory business keys / downstream join columns
+  - optional descriptive passthrough columns
+- Only the mandatory set may trigger a fail-fast schema assertion. Optional descriptive columns should be included when present and omitted when absent.
 
 ### silver.address
 - Source: `bronze.address`
@@ -280,16 +293,16 @@ Common Silver rules:
 
 ### silver.product_model
 - Source: `bronze.product_model`
-- Required Bronze columns before rename: `ProductModelID`, `Name`, `CatalogDescription`
-- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
+- Required Bronze columns before rename: `ProductModelID`, `Name`
+- Optional Bronze passthrough columns: `CatalogDescription`, `rowguid`, `ModifiedDate`
 - Dedup key: `product_model_id`
 - Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - trim `name`
-  - keep `catalog_description` as long text
+  - include `catalog_description` only if Bronze schema actually contains `CatalogDescription`
 - Audit/output columns:
-  - required: `product_model_id`, `name`, `catalog_description`, audit columns
-  - optional when present in source: `rowguid`, `modified_date`
+  - required: `product_model_id`, `name`, audit columns
+  - optional when present in source: `catalog_description`, `rowguid`, `modified_date`
 
 ### silver.product_model_product_description
 - Source: `bronze.product_model_product_description`
