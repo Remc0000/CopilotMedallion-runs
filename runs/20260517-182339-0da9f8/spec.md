@@ -23,6 +23,13 @@
   - Sharpened `## Silver` with mandatory exact snake_case column mappings for all base tables used downstream and explicit instructions to fail fast per table when required columns are missing.
   - Added Silver output-shape constraints for `customer`, `customer_address`, `product`, `product_category`, `product_description`, `product_model`, `product_model_product_description`, `sales_order_header`, and `sales_order_detail` so downstream Gold-required columns are guaranteed.
 
+### Iteration 4 — 2026-05-17 18:54:19Z — failed layer: silver (run: 20260517-182339-0da9f8)
+- **Root cause (1-line summary)**: Silver still allowed a session-wide failure pattern because optional/helper tables and FK validations were underspecified, letting one failing Silver statement cancel the full session.
+- **What was changed**:
+  - Tightened `## Generic guidance` to require truly independent Silver executions, with helper/view tables treated as non-blocking and FK checks logged rather than enforced as hard failures.
+  - Sharpened `## Silver` to define build priority, mandatory base tables versus optional helper tables, and exact behavior when optional Bronze views or FK counterparts are unavailable.
+  - Added explicit instruction that only missing required source columns for the current table may fail that table; downstream table absence must not cause the current Silver transformation to fail.
+
 ## Inputs
 - Workspace: `842742ca-c3dd-46d6-b034-f4d7cddc8d5c`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -71,9 +78,13 @@ Cross-cutting code rules:
 - For each Gold table, create a narrow intermediate dataframe immediately after each join path and keep only the explicitly required columns for the next step. Do not carry unused columns forward.
 - If an optional output column is not available from the exact specified Silver source column, omit that output column from the Gold table rather than inferring a substitute column name.
 - Before writing any Gold table, assert both conditions: expected output columns exist and the dataframe grain matches the spec's key uniqueness rule.
-- Silver notebooks must build each Silver table in an isolated step: one source-read validation step, one rename/type/cleaning step, one dedup step, one write step. Do not execute a single multi-statement SQL script or a long dependency chain across Silver tables in one session.
-- For Silver, fail fast per table with a clear error if any required source column for that table is missing after Bronze read; do not continue to subsequent Silver tables after a required-column failure in the current table.
+- Silver notebooks must build each Silver table in an isolated step: one source-read validation step, one rename/type/cleaning step, one dedup step, one write step.
+- Do not execute a single multi-statement SQL script or a long dependency chain across Silver tables in one session.
+- For Silver, only the current table's required Bronze source columns may trigger a hard failure for that current table.
 - For Silver base tables that feed Gold, do not guess column names from views or alternates. Use the exact Bronze source columns defined in the Silver table specification below and emit the exact snake_case output column names defined there.
+- Silver helper/view tables are optional enrichments, not build blockers. If an optional Bronze view table is absent, unreadable, or fails its own transformation, log the issue and continue with the remaining Silver base-table builds.
+- Foreign-key validation in Silver must be non-blocking: perform referential checks only if the referenced Silver table already exists in the current run context; otherwise skip the FK check and continue. Do not fail a Silver table because another Silver table has not yet been built.
+- Silver execution order must prioritize base tables first and helper/view tables last to minimize session-wide cancellation risk.
 
 Notebook authoring rule for every generated notebook:
 - EACH code cell must start with a short markdown comment block using Python comments.
@@ -183,7 +194,21 @@ Standard Silver objectives:
 - Standardize null handling, trim strings, normalize booleans, and derive lightweight helper columns.
 - Run `OPTIMIZE` after load for larger tables; focus on `silver.sales_order_header`, `silver.sales_order_detail`, and `silver.product`.
 - Build and write each Silver table independently; no shared temp-view chain across multiple Silver outputs.
+- Build order is mandatory:
+  1. `silver.address`
+  2. `silver.customer`
+  3. `silver.customer_address`
+  4. `silver.product_category`
+  5. `silver.product_description`
+  6. `silver.product_model`
+  7. `silver.product_model_product_description`
+  8. `silver.product`
+  9. `silver.sales_order_header`
+  10. `silver.sales_order_detail`
+  11. optional helper tables: `silver.v_get_all_categories`, `silver.v_product_and_description`, `silver.v_product_model_catalog_description`
 - For each Silver table below, first validate the exact Bronze source columns named in the mapping/spec. If any required source column is missing, fail that table immediately with a clear error that names the missing column(s) and table.
+- A failure in one optional helper/view Silver table must not prevent completion of the required Silver base tables.
+- FK validation checks are informational/data-quality checks only in Silver. They must not block the write of an otherwise valid current table.
 
 Silver table specifications:
 
@@ -270,7 +295,7 @@ Dedup key: (`customer_id`, `address_id`, `address_type`)
 Alternative if duplicate address types appear unexpectedly: dedup on (`customer_id`, `address_id`) and keep latest `modified_date`
 Cleaning:
 - trim `address_type`
-- validate foreign keys against `silver.customer.customer_id` and `silver.address.address_id`
+- validate foreign keys against `silver.customer.customer_id` and `silver.address.address_id` only if those tables already exist; otherwise skip FK validation and continue
 
 ### `silver.product`
 Required Bronze source: `bronze.product`
@@ -311,6 +336,8 @@ Cleaning:
 FK expectations:
 - `product_category_id` -> `silver.product_category.product_category_id`
 - `product_model_id` -> `silver.product_model.product_model_id`
+FK validation rule:
+- perform these FK checks only if `silver.product_category` and `silver.product_model` already exist; otherwise skip the FK check and continue without failure
 
 ### `silver.product_category`
 Required Bronze source: `bronze.product_category`
@@ -387,7 +414,7 @@ Dedup key: (`product_model_id`, `product_description_id`, `culture`)
 Dedup rule: keep latest `modified_date`
 Cleaning:
 - normalize `culture` to lower-case
-- validate FKs to `product_model` and `product_description`
+- validate FKs to `product_model` and `product_description` only if those tables already exist; otherwise skip FK validation and continue
 
 ### `silver.sales_order_header`
 Required Bronze source: `bronze.sales_order_header`
@@ -428,6 +455,8 @@ FK expectations:
 - `customer_id` -> `silver.customer.customer_id`
 - `ship_to_address_id` -> `silver.address.address_id`
 - `bill_to_address_id` -> `silver.address.address_id`
+FK validation rule:
+- perform these FK checks only if referenced tables already exist; otherwise skip the FK check and continue without failure
 
 ### `silver.sales_order_detail`
 Required Bronze source: `bronze.sales_order_detail`
@@ -452,32 +481,54 @@ Dedup rule: keep latest `modified_date`
 Cleaning:
 - cast numeric fields explicitly
 - derive `net_unit_price = unit_price - unit_price_discount`
-- validate FKs:
+- validate FKs only if referenced tables already exist:
   - `sales_order_id` -> `silver.sales_order_header.sales_order_id`
   - `product_id` -> `silver.product.product_id`
+- if those referenced tables are not yet available in the current run, skip FK validation and continue
 
 ### `silver.v_get_all_categories`
-- Dedup key: `product_category_id`
-- Use as optional helper table only.
-- Cleaning:
-  - rename to snake_case
-- Modeling note:
-  - Because this is a view over category data, prefer base tables as system-of-record and use this only to simplify category rollups if values reconcile.
+Required Bronze source: `bronze.v_get_all_categories` only if present and readable
+
+Build classification:
+- optional helper table only
+- must be built after all required Silver base tables complete
+
+Dedup key: `product_category_id`
+Cleaning:
+- rename to snake_case
+Modeling note:
+- Because this is a view over category data, prefer base tables as system-of-record and use this only to simplify category rollups if values reconcile.
+Failure handling:
+- if the Bronze helper view is missing, unreadable, or has unexpected columns, log and skip this table without failing the Silver layer
 
 ### `silver.v_product_and_description`
-- Dedup key: (`product_id`, `culture`) preferred
-- Use as optional helper table only.
-- Modeling note:
-  - Prefer normalized base path `product -> product_model -> product_model_product_description -> product_description` when multilingual detail is needed.
-  - Use this view if it materially simplifies description retrieval and reconciles row counts.
+Required Bronze source: `bronze.v_product_and_description` only if present and readable
+
+Build classification:
+- optional helper table only
+- must be built after all required Silver base tables complete
+
+Dedup key: (`product_id`, `culture`) preferred
+Modeling note:
+- Prefer normalized base path `product -> product_model -> product_model_product_description -> product_description` when multilingual detail is needed.
+- Use this view if it materially simplifies description retrieval and reconciles row counts.
+Failure handling:
+- if the Bronze helper view is missing, unreadable, or has unexpected columns, log and skip this table without failing the Silver layer
 
 ### `silver.v_product_model_catalog_description`
-- Dedup key: `product_model_id`
-- Use as optional helper table only.
-- Cleaning:
-  - snake_case all descriptive attributes
-- Modeling note:
-  - This view is useful for rich product model attributes, but because it overlaps with `product_model`, treat it as enrichment rather than primary source.
+Required Bronze source: `bronze.v_product_model_catalog_description` only if present and readable
+
+Build classification:
+- optional helper table only
+- must be built after all required Silver base tables complete
+
+Dedup key: `product_model_id`
+Cleaning:
+- snake_case all descriptive attributes
+Modeling note:
+- This view is useful for rich product model attributes, but because it overlaps with `product_model`, treat it as enrichment rather than primary source.
+Failure handling:
+- if the Bronze helper view is missing, unreadable, or has unexpected columns, log and skip this table without failing the Silver layer
 
 ## Gold
 Materialize exactly four Gold tables in schema `gold`: `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
