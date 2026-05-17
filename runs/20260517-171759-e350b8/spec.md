@@ -1,0 +1,566 @@
+# Run Spec 20260517-170731-a2063c
+
+## Inputs
+- Workspace: `581484c6-28a0-48c9-8931-644c455e9376`
+- Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
+- Tables to ingest into Bronze:
+  - `SalesLT/Address`
+  - `SalesLT/Customer`
+  - `SalesLT/CustomerAddress`
+  - `SalesLT/Product`
+  - `SalesLT/ProductCategory`
+  - `SalesLT/ProductDescription`
+  - `SalesLT/ProductModel`
+  - `SalesLT/ProductModelProductDescription`
+  - `SalesLT/SalesOrderDetail`
+  - `SalesLT/SalesOrderHeader`
+  - `SalesLT/vGetAllCategories`
+  - `SalesLT/vProductAndDescription`
+  - `SalesLT/vProductModelCatalogDescription`
+- Target Lakehouse: **CopilotMedallion_20260517_170731**
+
+## Generic guidance
+Apply these reference skills/agents at all times:
+- FabricDataEngineer agent: https://github.com/microsoft/skills-for-fabric/blob/main/agents/FabricDataEngineer.agent.md
+- e2e-medallion-architecture skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/e2e-medallion-architecture
+- spark-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/spark-authoring-cli
+- powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
+- powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
+- powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+
+Cross-cutting code rules:
+- Use defensive column references in every transformation: assert required columns exist before select, rename, join, filter, aggregate, or write.
+- After every join, immediately project an explicit column list using aliases prefixed by table role to avoid ambiguous names.
+- Before every `groupBy` / `agg`, assert all grouping and aggregate input columns exist.
+- For REST/API responses, use defensive handling and fail fast with `if x is None: raise ...` before any `.get()` access.
+- Do not use `saveAsTable`; write with explicit Lakehouse paths or managed table patterns supported by the target runtime.
+- Use parameter cells at the top of every notebook for workspace, source lakehouse, target lakehouse, schema, load type, and run id.
+- Use idempotent overwrite patterns for full loads and deterministic merge/upsert patterns where incremental logic is later added.
+- Wrap notebook logic in error-loud `try/except`; on exception call `_save_error(layer, e)` and re-raise.
+- Add standard audit columns consistently: `ingest_run_id`, `ingest_ts`, `source_system`, `source_table`, and where useful `record_hash`.
+- Enforce snake_case naming in Silver and Gold.
+- Never silently drop unexpected duplicates; quarantine or log them where business keys should be unique.
+- Treat binary/image columns carefully; keep in Bronze, and only propagate to Silver/Gold if there is a clear reporting use case.
+
+Notebook cell comment requirement:
+- EACH code cell must start with a short markdown-style comment block using Python comments.
+- Required pattern:
+  - `# ---`
+  - `# <1-3 human-readable lines describing what the cell is doing and why>`
+- Never emit a code cell with no leading comment block.
+- Keep comments concise and scroll-friendly so a Fabric user can understand each cell at a glance.
+
+## Bronze
+Land each source object into a `bronze` schema with minimal transformation, preserving source fidelity.
+
+Common Bronze pattern for all tables/views:
+- Read from source Lakehouse table/view as-is.
+- Add metadata columns:
+  - `bronze_ingest_run_id`
+  - `bronze_ingest_ts`
+  - `bronze_source_system` = `SalesLT`
+  - `bronze_source_object` = source object name
+- Write mode: overwrite for this initial build spec.
+- Partitioning:
+  - Partition large transactional tables by date derived from source timestamp where available.
+  - Do not partition small dimensions/junctions/views unless row volume later justifies it.
+- Preserve original column casing and types in Bronze.
+- Keep all source columns, including `rowguid`, `ModifiedDate`, and binary columns.
+
+### Bronze table landing plan
+- `bronze.address`
+  - Source: `SalesLT/Address`
+  - Natural key candidate: `AddressID`
+  - Partitioning: none
+  - Notes: retain address lines, geographic fields, `ModifiedDate`
+
+- `bronze.customer`
+  - Source: `SalesLT/Customer`
+  - Natural key candidate: `CustomerID`
+  - Partitioning: none
+  - Notes: retain PII-like fields and security-sensitive fields (`PasswordHash`, `PasswordSalt`) in Bronze only; flag for removal in Silver
+
+- `bronze.customer_address`
+  - Source: `SalesLT/CustomerAddress`
+  - Natural key candidate: composite (`CustomerID`, `AddressID`, `AddressType`)
+  - Partitioning: none
+  - Notes: this appears to be a junction/bridge between customers and addresses
+
+- `bronze.product`
+  - Source: `SalesLT/Product`
+  - Natural key candidate: `ProductID`
+  - Partitioning: none
+  - Notes: retain binary `ThumbNailPhoto` in Bronze; retain price/cost dates and category/model keys
+
+- `bronze.product_category`
+  - Source: `SalesLT/ProductCategory`
+  - Natural key candidate: `ProductCategoryID`
+  - Partitioning: none
+  - Notes: preserve parent-child hierarchy via `ParentProductCategoryID`
+
+- `bronze.product_description`
+  - Source: `SalesLT/ProductDescription`
+  - Natural key candidate: `ProductDescriptionID`
+  - Partitioning: none
+
+- `bronze.product_model`
+  - Source: `SalesLT/ProductModel`
+  - Natural key candidate: `ProductModelID`
+  - Partitioning: none
+
+- `bronze.product_model_product_description`
+  - Source: `SalesLT/ProductModelProductDescription`
+  - Natural key candidate: composite (`ProductModelID`, `ProductDescriptionID`, `Culture`)
+  - Partitioning: none
+  - Notes: bridge between product model and multilingual descriptions
+
+- `bronze.sales_order_detail`
+  - Source: `SalesLT/SalesOrderDetail`
+  - Natural key candidate: composite (`SalesOrderID`, `SalesOrderDetailID`)
+  - Partitioning: by `ModifiedDate` month or derived `modified_year_month`
+  - Notes: transactional line-level table, likely fact grain input
+
+- `bronze.sales_order_header`
+  - Source: `SalesLT/SalesOrderHeader`
+  - Natural key candidate: `SalesOrderID`
+  - Partitioning: by `OrderDate` month
+  - Notes: transactional order header, likely fact/order grain input
+
+- `bronze.v_get_all_categories`
+  - Source: `SalesLT/vGetAllCategories`
+  - Natural key candidate: `ProductCategoryID`
+  - Partitioning: none
+  - Notes: derived/category flattening view; ingest for convenience but prefer base tables for authoritative lineage
+
+- `bronze.v_product_and_description`
+  - Source: `SalesLT/vProductAndDescription`
+  - Natural key candidate: composite (`ProductID`, `Culture`)
+  - Partitioning: none
+  - Notes: convenience denormalized view combining product/model/description fields
+
+- `bronze.v_product_model_catalog_description`
+  - Source: `SalesLT/vProductModelCatalogDescription`
+  - Natural key candidate: `ProductModelID`
+  - Partitioning: none
+  - Notes: extended product-model attributes; likely useful for product enrichment
+
+## Silver
+Standardize, clean, deduplicate, and conform data into `silver` schema with snake_case names and reporting-safe attributes.
+
+Common Silver rules:
+- Rename all columns to snake_case.
+- Add:
+  - `silver_loaded_ts`
+  - `silver_run_id`
+  - `is_current` = true for current-state full load outputs
+  - `record_hash` over business content columns for change detection readiness
+- Preserve source business keys as integer/string columns.
+- Deduplicate using the latest `modified_date` where available; if ties remain, keep the latest `bronze_ingest_ts`.
+- Quarantine duplicates that violate expected PK uniqueness.
+- Remove or mask sensitive fields not needed analytically.
+
+### silver.address
+- Source: `bronze.address`
+- Dedup key: `address_id`
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - trim text fields
+  - standardize empty strings to null for `address_line2`
+  - retain `city`, `state_province`, `country_region`, `postal_code`
+- Audit/output columns:
+  - `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`, `rowguid`, `modified_date`, audit columns
+
+### silver.customer
+- Source: `bronze.customer`
+- Dedup key: `customer_id`
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - trim name/contact fields
+  - create `full_name` from available title/first/middle/last/suffix for convenience
+  - retain `company_name`, `sales_person`, `email_address`, `phone`
+  - drop `password_hash` and `password_salt` from Silver for security
+- Audit/output columns:
+  - `customer_id`, `name_style`, `title`, `first_name`, `middle_name`, `last_name`, `suffix`, `full_name`, `company_name`, `sales_person`, `email_address`, `phone`, `rowguid`, `modified_date`, audit columns
+
+### silver.customer_address
+- Source: `bronze.customer_address`
+- Dedup key: (`customer_id`, `address_id`, `address_type`)
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - trim `address_type`
+  - keep as bridge table
+- Audit/output columns:
+  - `customer_id`, `address_id`, `address_type`, `rowguid`, `modified_date`, audit columns
+
+### silver.product
+- Source: `bronze.product`
+- Dedup key: `product_id`
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - trim descriptive fields
+  - retain measures: `standard_cost`, `list_price`, `weight`
+  - retain lifecycle dates: `sell_start_date`, `sell_end_date`, `discontinued_date`
+  - drop `thumbnail_photo` from Silver unless image reporting is explicitly required
+  - retain `thumbnail_photo_file_name`
+- Audit/output columns:
+  - `product_id`, `name`, `product_number`, `color`, `standard_cost`, `list_price`, `size`, `weight`, `product_category_id`, `product_model_id`, `sell_start_date`, `sell_end_date`, `discontinued_date`, `thumbnail_photo_file_name`, `rowguid`, `modified_date`, audit columns
+
+### silver.product_category
+- Source: `bronze.product_category`
+- Dedup key: `product_category_id`
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - trim `name`
+  - preserve hierarchy via `parent_product_category_id`
+- Audit/output columns:
+  - `product_category_id`, `parent_product_category_id`, `name`, `rowguid`, `modified_date`, audit columns
+
+### silver.product_description
+- Source: `bronze.product_description`
+- Dedup key: `product_description_id`
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - trim `description`
+- Audit/output columns:
+  - `product_description_id`, `description`, `rowguid`, `modified_date`, audit columns
+
+### silver.product_model
+- Source: `bronze.product_model`
+- Dedup key: `product_model_id`
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - trim `name`
+  - keep `catalog_description` as long text
+- Audit/output columns:
+  - `product_model_id`, `name`, `catalog_description`, `rowguid`, `modified_date`, audit columns
+
+### silver.product_model_product_description
+- Source: `bronze.product_model_product_description`
+- Dedup key: (`product_model_id`, `product_description_id`, `culture`)
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - uppercase/normalize `culture`
+- Audit/output columns:
+  - `product_model_id`, `product_description_id`, `culture`, `rowguid`, `modified_date`, audit columns
+
+### silver.sales_order_header
+- Source: `bronze.sales_order_header`
+- Dedup key: `sales_order_id`
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - trim string fields
+  - retain order milestone timestamps and shipping/billing/customer keys
+  - derive `order_date_key`, `due_date_key`, `ship_date_key` as `yyyyMMdd` integers for Gold/date joins
+- Audit/output columns:
+  - `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `credit_card_approval_code`, `sub_total`, `tax_amt`, `freight`, `total_due`, `comment`, `rowguid`, `modified_date`, `order_date_key`, `due_date_key`, `ship_date_key`, audit columns
+
+### silver.sales_order_detail
+- Source: `bronze.sales_order_detail`
+- Dedup key: (`sales_order_id`, `sales_order_detail_id`)
+- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Cleansing:
+  - retain quantity and price metrics
+  - derive `gross_line_amount` = `order_qty * unit_price`
+  - derive `discount_amount` = `order_qty * unit_price * unit_price_discount`
+- Audit/output columns:
+  - `sales_order_id`, `sales_order_detail_id`, `order_qty`, `product_id`, `unit_price`, `unit_price_discount`, `line_total`, `gross_line_amount`, `discount_amount`, `rowguid`, `modified_date`, audit columns
+
+### silver.v_get_all_categories
+- Source: `bronze.v_get_all_categories`
+- Dedup key: `product_category_id`
+- Use case:
+  - optional helper table for flattened category reporting
+  - not authoritative over `product_category`; use base table lineage for core dimensions
+- Output columns:
+  - `parent_product_category_name`, `product_category_name`, `product_category_id`, audit columns
+
+### silver.v_product_and_description
+- Source: `bronze.v_product_and_description`
+- Dedup key: (`product_id`, `culture`)
+- Use case:
+  - optional helper enrichment for product descriptions by culture
+- Output columns:
+  - `product_id`, `name`, `product_model`, `culture`, `description`, audit columns
+
+### silver.v_product_model_catalog_description
+- Source: `bronze.v_product_model_catalog_description`
+- Dedup key: `product_model_id`
+- Use case:
+  - optional helper enrichment for product model attributes
+- Output columns:
+  - `product_model_id`, `name`, `summary`, `manufacturer`, `copyright`, `product_url`, `warranty_period`, `warranty_description`, `no_of_years`, `maintenance_description`, `wheel`, `saddle`, `pedal`, `bike_frame`, `crankset`, `picture_angle`, `picture_size`, `product_photo_id`, `material`, `color`, `product_line`, `style`, `rider_experience`, `rowguid`, `modified_date`, audit columns
+
+### Silver optimization
+- Run `OPTIMIZE` on:
+  - `silver.sales_order_header`
+  - `silver.sales_order_detail`
+  - `silver.product`
+- Z-order / clustering preference if supported:
+  - `sales_order_header`: `sales_order_id`, `customer_id`, `order_date_key`
+  - `sales_order_detail`: `sales_order_id`, `product_id`
+  - `product`: `product_id`, `product_category_id`, `product_model_id`
+
+I want to end up with the following tables:
+Dim_Customer -> join customer, customeraddress, address (notice there are multiple address types for a customer. I only need the address type Main Office),. Leave all relevant/meaningfull fields
+Dim_Product -> join product, productcategory, productdescription, productmodel, productmodelproductdescription. Please notice that in productcategory there is a self join. So in the end I have the category (which is the parent category) and a subcategory. Also notice that in productmodelproductdescription there is a culture field, filter this on en
+Dim_Sales --> Use the salesperson field from salesorderheader, but remove the adventureworks/ in front of the name and remove the last number at the end off the name
+Fact_Sales --> join salesorderdetail and salesorderheader and keep all relevant fields
+
+## Semantic model
+Create a Direct Lake semantic model over the Gold tables produced from the requested design:
+- `dim_customer`
+- `dim_product`
+- `dim_sales`
+- `fact_sales`
+
+Use a star schema centered on `fact_sales`, with supporting dimensions for customer, product, and salesperson, plus a date dimension derived from fact date keys for time intelligence.
+
+### Semantic model tables
+- `dim_date`
+- `dim_customer`
+- `dim_product`
+- `dim_sales`
+- `fact_sales`
+
+### Relationships
+- `fact_sales[customer_id] -> dim_customer[customer_id]`
+- `fact_sales[product_id] -> dim_product[product_id]`
+- `fact_sales[sales_person] -> dim_sales[sales_person]`
+- `fact_sales[order_date_key] -> dim_date[date_key]` active
+- `fact_sales[due_date_key] -> dim_date[date_key]` inactive
+- `fact_sales[ship_date_key] -> dim_date[date_key]` inactive
+
+### Modeling notes
+- `dim_customer` should expose the customer grain only, already filtered in Gold to the `Main Office` address type where present.
+- `dim_customer` should include meaningful descriptive attributes from customer and address, such as:
+  - `customer_id`
+  - `full_name`
+  - `company_name`
+  - `sales_person`
+  - `email_address`
+  - `phone`
+  - `address_type`
+  - `address_id`
+  - `address_line1`
+  - `address_line2`
+  - `city`
+  - `state_province`
+  - `country_region`
+  - `postal_code`
+- `dim_product` should expose the product grain with enriched descriptive attributes from product, product category self-join, product model, and English product description, such as:
+  - `product_id`
+  - `name`
+  - `product_number`
+  - `color`
+  - `size`
+  - `weight`
+  - `standard_cost`
+  - `list_price`
+  - `product_model_id`
+  - `product_model_name`
+  - `product_category_id`
+  - `category`
+  - `subcategory`
+  - `culture`
+  - `description`
+  - `sell_start_date`
+  - `sell_end_date`
+  - `discontinued_date`
+- `dim_sales` should contain the cleaned salesperson domain from Gold, using the transformed salesperson value with `adventureworks/` removed and trailing numeric suffix removed.
+- `fact_sales` should be the primary report-facing fact and include relevant joined header/detail fields, including:
+  - order identifiers: `sales_order_id`, `sales_order_detail_id`, `sales_order_number`
+  - date keys/dates: `order_date`, `due_date`, `ship_date`, `order_date_key`, `due_date_key`, `ship_date_key`
+  - customer/product/salesperson keys: `customer_id`, `product_id`, `sales_person`
+  - shipping/billing/order descriptors: `status`, `online_order_flag`, `purchase_order_number`, `account_number`, `ship_method`, `ship_to_address_id`, `bill_to_address_id`, `comment`
+  - numeric measures: `order_qty`, `unit_price`, `unit_price_discount`, `gross_line_amount`, `discount_amount`, `line_total`, `sub_total`, `tax_amt`, `freight`, `total_due`
+- Hide audit columns, hashes, lineage columns, and technical helper columns from report view.
+- If `dim_sales` contains one row per cleaned salesperson, ensure the relationship is one-to-many from `dim_sales` to `fact_sales`.
+
+### Explicit measures
+Propose these initial DAX measures:
+- `Total Sales = SUM(fact_sales[line_total])`
+- `Total Orders = DISTINCTCOUNT(fact_sales[sales_order_id])`
+- `Total Order Lines = DISTINCTCOUNT(fact_sales[sales_order_detail_id])`
+- `Total Quantity = SUM(fact_sales[order_qty])`
+- `Gross Sales = SUM(fact_sales[gross_line_amount])`
+- `Total Discount Amount = SUM(fact_sales[discount_amount])`
+- `Average Unit Price = AVERAGE(fact_sales[unit_price])`
+- `Average Order Value = DIVIDE(SUM(fact_sales[total_due]), DISTINCTCOUNT(fact_sales[sales_order_id]))`
+- `Total Freight = SUM(fact_sales[freight])`
+- `Total Tax = SUM(fact_sales[tax_amt])`
+- `Products Sold = DISTINCTCOUNT(fact_sales[product_id])`
+- `Customers Buying = DISTINCTCOUNT(fact_sales[customer_id])`
+
+Optional time-intelligence measures after `dim_date` is marked:
+- `Sales YTD`
+- `Sales YoY`
+- `Orders MTD`
+
+### Semantic model UX recommendations
+- Format `Total Sales`, `Gross Sales`, `Total Discount Amount`, `Average Order Value`, `Total Freight`, and `Total Tax` as currency.
+- Mark `dim_date` as the date table using `date_key` / full date column.
+- Sort month name by month number in `dim_date`.
+- Use friendly display names:
+  - `dim_customer` → `Dim Customer`
+  - `dim_product` → `Dim Product`
+  - `dim_sales` → `Dim Sales`
+  - `fact_sales` → `Fact Sales`
+- Hide foreign key columns from dimensions where duplicate descriptive fields are already exposed, but keep business keys available if users need drillthrough.
+- Set default summarization to `Do not summarize` for IDs and descriptive text columns.
+
+## Report
+Build a Power BI report tailored to the final Gold model with `fact_sales` as the main analytical table and dimensions `dim_customer`, `dim_product`, and `dim_sales`.
+
+### Page 1: Sales Overview
+Visuals:
+- KPI cards:
+  - `Total Sales`
+  - `Total Orders`
+  - `Average Order Value`
+  - `Total Quantity`
+- Line chart:
+  - `Total Sales` by `dim_date[month]` and year
+- Clustered bar chart:
+  - `Total Sales` by `dim_product[category]`
+- Clustered bar chart:
+  - `Total Sales` by `dim_sales[sales_person]`
+- Donut chart:
+  - `Total Sales` by `fact_sales[online_order_flag]`
+- Matrix:
+  - `dim_customer[company_name]` or `dim_customer[full_name]` by `Total Sales`, `Total Orders`, `Total Quantity`
+
+Slicers:
+- order date
+- category
+- subcategory
+- salesperson
+- customer
+- ship method
+- online order flag
+
+### Page 2: Product Analysis
+Visuals:
+- Bar chart:
+  - top products by `Total Sales` using `dim_product[name]`
+- Bar chart:
+  - `Total Sales` by `dim_product[subcategory]`
+- Treemap:
+  - `category` > `subcategory` sized by `Total Sales`
+- Scatter plot:
+  - `Gross Sales` vs `Total Discount Amount` by `dim_product[name]`
+- Table:
+  - `dim_product[name]`, `product_number`, `category`, `subcategory`, `product_model_name`, `color`, `size`, `list_price`, with `Total Sales` and `Total Quantity`
+- Optional detail visual:
+  - English product `description` for selected product
+
+Slicers:
+- category
+- subcategory
+- product model
+- color
+
+### Page 3: Customer & Geography
+Visuals:
+- Bar chart:
+  - top customers by `Total Sales`
+- Map or filled map if data quality is sufficient:
+  - `Total Sales` by `dim_customer[country_region]`, `state_province`, `city`
+- Matrix:
+  - geography hierarchy `country_region` > `state_province` > `city` with `Total Sales`, `Total Orders`, `Customers Buying`
+- Table:
+  - `full_name`, `company_name`, `email_address`, `phone`, `address_line1`, `city`, `state_province`, `country_region`, `postal_code`, `Total Sales`
+- Card or slicer note:
+  - indicate that customer address data reflects only `Main Office` address type from Gold
+
+Slicers:
+- country_region
+- state_province
+- city
+- customer
+
+### Page 4: Salesperson & Order Detail
+Visuals:
+- Bar chart:
+  - `Total Sales` by `dim_sales[sales_person]`
+- Column chart:
+  - `Total Orders` by `fact_sales[status]`
+- Column chart:
+  - `Total Sales` by `fact_sales[ship_method]`
+- Trend chart:
+  - `Total Orders` by order date
+- Table:
+  - order-level/line-level detail using `sales_order_number`, `sales_order_id`, `sales_order_detail_id`, `order_date`, customer, salesperson, product, `order_qty`, `unit_price`, `line_total`, `tax_amt`, `freight`, `total_due`
+- Optional decomposition tree:
+  - `Total Sales` by salesperson > category > subcategory > customer
+
+Slicers:
+- salesperson
+- status
+- ship method
+- order date
+
+### Page 5: Data Quality
+Visuals:
+- Card:
+  - Gold row count snapshots for `dim_customer`, `dim_product`, `dim_sales`, `fact_sales`
+- Table:
+  - duplicate-key exceptions by Gold table
+- Table:
+  - referential integrity failures for:
+    - `fact_sales.customer_id` not in `dim_customer`
+    - `fact_sales.product_id` not in `dim_product`
+    - `fact_sales.sales_person` not in `dim_sales`
+- Card set:
+  - null key violations
+  - orphan fact rows
+  - missing `Main Office` customer address coverage
+  - missing English (`en`) product description coverage
+- Trend or snapshot visual:
+  - test outcomes by run id / load timestamp
+
+## Data Agent
+Create an AISkill grounded on the semantic model.
+
+### Role
+- Sales analytics assistant for the `SalesLT` domain using the final Gold model centered on `fact_sales`.
+- Helps business users answer questions about sales trends, product performance, customer purchasing, salesperson performance, shipping patterns, and core data quality status using only the published semantic model.
+
+### Domain hints
+- The central fact table is `fact_sales`, built from joined sales order detail and sales order header data.
+- Customer analysis should use `dim_customer`, which already includes customer and address information and is limited to the `Main Office` address type in Gold.
+- Product analysis should use `dim_product`, which already includes:
+  - product attributes
+  - parent `category`
+  - child `subcategory`
+  - English (`en`) product description/model enrichment
+- Salesperson analysis should use `dim_sales`, where salesperson names have been cleaned by removing the `adventureworks/` prefix and trailing numeric suffix.
+- Sales amounts for most analysis should use line-level measures such as `Total Sales`, `Gross Sales`, and `Total Discount Amount`.
+- Order-level charges such as freight and tax come from the joined fields on `fact_sales`.
+- Time analysis should use `dim_date` with the active order date relationship unless the user explicitly asks for due date or ship date logic.
+
+### Starter questions
+- What are total sales and total orders by month?
+- Which categories and subcategories generate the most sales?
+- Who are the top customers by sales amount?
+- Which salespeople generate the highest sales?
+- How much discount are we giving by product or subcategory?
+- What is the average order value over time?
+- How do online orders compare with offline orders?
+- Which ship methods are associated with the highest sales?
+- What are sales by country, state, and city based on Main Office addresses?
+- Which English-described products have the highest quantity sold?
+- Are there any orphan fact rows or missing customer/product/salesperson keys?
+
+### Guardrails
+- Use only the semantic model tables and explicit measures; do not invent fields not present in the model.
+- Prefer `fact_sales` measures for sales analysis.
+- Use `dim_customer` for customer and geography questions, and remember it reflects only `Main Office` address records where available.
+- Use `dim_product[category]` and `dim_product[subcategory]` for product hierarchy questions rather than inventing other hierarchies.
+- Use cleaned salesperson values from `dim_sales`; do not reintroduce the raw `adventureworks/` prefix or numeric suffix.
+- Do not expose hidden technical columns, hashes, or audit fields unless the user explicitly asks for data quality metadata.
+- Do not reveal Bronze-only sensitive fields such as password-related columns.
+- If a user asks for unsupported concepts such as returns, inventory, margin, profit, or payments beyond available columns, state that the model does not currently include those data points.
+- If a user asks for non-English product descriptions, state that the modeled product description is filtered to English (`en`) in Gold.
+- When comparing totals, clarify whether the user wants line-level sales (`line_total` / `Total Sales`) or header-derived order totals (`total_due` / `Average Order Value`).
+- If the user asks for customer addresses beyond `Main Office`, state that the current Gold dimension was intentionally limited to that address type.
