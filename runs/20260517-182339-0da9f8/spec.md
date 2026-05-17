@@ -9,6 +9,13 @@
   - Rewrote `## Gold` to define exact source tables, required join keys, required filters, canonical output column names, and dedup/grain rules for `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
   - Clarified salesperson cleaning logic and category self-join output naming to prevent ambiguous references.
 
+### Iteration 2 — 2026-05-17 18:41:39Z — failed layer: gold (run: 20260517-182339-0da9f8)
+- **Root cause (1-line summary)**: Gold build still allowed non-deterministic/multi-step statements that could fail session-wide; the product and customer dimension joins need explicit staged projections and mandatory pre-checks on exact Silver columns before any Gold write.
+- **What was changed**:
+  - Tightened `## Generic guidance` with a mandatory staged Gold build pattern: pre-validate columns, create one intermediate projection per join path, and write each Gold table independently with no chained SQL statements.
+  - Sharpened `## Gold` with exact required Silver column names, explicit intermediate join paths, deterministic row-reduction rules, and a prohibition on using any non-specified columns in `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
+  - Added explicit fallback behavior for missing optional descriptive columns so the build omits them rather than guessing alternate names or failing the session.
+
 ## Inputs
 - Workspace: `842742ca-c3dd-46d6-b034-f4d7cddc8d5c`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -53,6 +60,10 @@ Cross-cutting code rules:
 - For any self-join, especially `silver.product_category`, use distinct aliases and materialize renamed columns immediately after the join. Do not reference duplicated column names without aliases.
 - For Gold builds, validate the presence of these exact Silver columns before transformation: `customer_id`, `address_id`, `address_type`, `product_id`, `product_category_id`, `parent_product_category_id`, `product_model_id`, `product_description_id`, `culture`, `sales_order_id`, `sales_order_detail_id`, and `sales_person`.
 - If an expected descriptive column is absent in a helper/view path, fall back to the normalized base-table path defined in the spec rather than guessing alternate column names.
+- Gold notebooks must build each Gold table in an isolated step: one validation step, one transformation step, one write step, then move to the next table. Do not submit one chained SQL script or a long sequence of dependent temp views that can cancel the whole Spark session on first failure.
+- For each Gold table, create a narrow intermediate dataframe immediately after each join path and keep only the explicitly required columns for the next step. Do not carry unused columns forward.
+- If an optional output column is not available from the exact specified Silver source column, omit that output column from the Gold table rather than inferring a substitute column name.
+- Before writing any Gold table, assert both conditions: expected output columns exist and the dataframe grain matches the spec's key uniqueness rule.
 
 Notebook authoring rule for every generated notebook:
 - EACH code cell must start with a short markdown comment block using Python comments.
@@ -292,6 +303,10 @@ General Gold rules:
 - Gold tables must be idempotent full-overwrite builds.
 - Exclude audit/lineage columns unless specifically needed for reporting.
 - Exclude `password_hash`, `password_salt`, binary columns, and any accidental duplicate technical columns.
+- Build each Gold table as its own isolated dataframe pipeline and write independently.
+- Before building each Gold table, validate that the exact required source columns named below exist; if a required column is missing, fail fast with a clear error naming that column and table.
+- Do not reference any Silver column not explicitly named in the table specification below.
+- Use dataframe transforms or SQL CTEs with one named stage per join path; do not embed all joins, filters, deduplication, and final projection in one statement.
 
 ### `gold.dim_customer`
 Business intent:
@@ -303,15 +318,23 @@ Required source tables and aliases:
 - `silver.customer_address` as `ca`
 - `silver.address` as `a`
 
-Required filter and join logic:
-- Filter `ca.address_type = 'Main Office'` before joining to customer/address.
-- Join `c.customer_id = ca.customer_id`
-- Join `ca.address_id = a.address_id`
-- Use left joins from `c` so customers without a `Main Office` address are still retained if present.
-- If multiple `Main Office` rows exist for the same customer, keep exactly one row per `customer_id` using deterministic precedence:
-  1. latest `ca.modified_date` if available
-  2. latest `a.modified_date` if needed
-  3. lowest `ca.address_id` as final tie-breaker
+Required source columns:
+- From `c`: `customer_id`, `full_name`, `company_name`, `name_style`, `title`, `first_name`, `middle_name`, `last_name`, `suffix`
+- Optional from `c`: `email_address`, `phone`
+- From `ca`: `customer_id`, `address_id`, `address_type`
+- Optional from `ca`: `modified_date`
+- From `a`: `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`
+- Optional from `a`: `modified_date`
+
+Required staged logic:
+1. Create `ca_main_office` from `ca` filtered to `address_type = 'Main Office'` and projected to only `customer_id`, `address_id`, `address_type`, optional `modified_date`.
+2. If multiple `Main Office` rows exist for the same `customer_id`, reduce `ca_main_office` to one row per `customer_id` using deterministic precedence:
+   1. latest `ca.modified_date` if present
+   2. latest `a.modified_date` after the address join if needed
+   3. lowest `address_id`
+3. Left join `c.customer_id = ca_main_office.customer_id`.
+4. Left join `ca_main_office.address_id = a.address_id`.
+5. Immediately project only the canonical output columns listed below.
 
 Canonical output columns:
 - `customer_id` from `c.customer_id`
@@ -324,10 +347,10 @@ Canonical output columns:
 - `middle_name` from `c.middle_name`
 - `last_name` from `c.last_name`
 - `suffix` from `c.suffix`
-- `email_address` only if intentionally exposed; otherwise omit
-- `phone` only if intentionally exposed; otherwise omit
+- `email_address` from `c.email_address` only if that exact column exists and is intentionally exposed; otherwise omit
+- `phone` from `c.phone` only if that exact column exists and is intentionally exposed; otherwise omit
 - `address_id` from `a.address_id`
-- `address_type` from `ca.address_type`
+- `address_type` from `ca_main_office.address_type`
 - `address_line1` from `a.address_line1`
 - `address_line2` from `a.address_line2`
 - `city` from `a.city`
@@ -351,14 +374,53 @@ Required source tables and aliases:
 - `silver.product_model_product_description` as `pmpd`
 - `silver.product_description` as `pd`
 
-Required filter and join logic:
-- Start from `p`.
-- Join child category: `p.product_category_id = pc_child.product_category_id`
-- Self-join parent category: `pc_child.parent_product_category_id = pc_parent.product_category_id`
-- Join model: `p.product_model_id = pm.product_model_id`
-- Join model-description bridge with English filter: `p.product_model_id = pmpd.product_model_id AND pmpd.culture = 'en'`
-- Join description: `pmpd.product_description_id = pd.product_description_id`
-- Use left joins so products remain even when some enrichment is missing.
+Required source columns:
+- From `p`: `product_id`, `name`, `product_number`, `color`, `size`, `standard_cost`, `list_price`, `sell_start_date`, `sell_end_date`, `discontinued_date`, `is_discontinued`, `is_currently_sellable`, `product_category_id`, `product_model_id`
+- From `pc_child`: `product_category_id`, `parent_product_category_id`, `name`
+- From `pc_parent`: `product_category_id`, `name`
+- From `pm`: `product_model_id`, `name`
+- From `pmpd`: `product_model_id`, `product_description_id`, `culture`
+- From `pd`: `product_description_id`, `description`
+- Optional timestamps for deterministic ranking: `pmpd.modified_date`, `pd.modified_date`
+
+Required staged logic:
+1. Create `product_category_stage` starting from `p` and left joining `pc_child` on `p.product_category_id = pc_child.product_category_id`.
+2. Self-join `pc_parent` on `pc_child.parent_product_category_id = pc_parent.product_category_id`.
+3. Immediately project this stage to:
+   - `product_id`
+   - `product_name`
+   - `product_number`
+   - `color`
+   - `size`
+   - `standard_cost`
+   - `list_price`
+   - `sell_start_date`
+   - `sell_end_date`
+   - `discontinued_date`
+   - `is_discontinued`
+   - `is_currently_sellable`
+   - `product_model_id`
+   - `product_category_id` from `pc_child.product_category_id`
+   - `parent_product_category_id` from `pc_parent.product_category_id`
+   - `subcategory_name` from `pc_child.name`
+   - `category_name` from `pc_parent.name`
+4. Create `product_description_stage` from `p`, `pm`, `pmpd`, and `pd` only:
+   - left join `pm` on `p.product_model_id = pm.product_model_id`
+   - left join `pmpd` on `p.product_model_id = pmpd.product_model_id AND pmpd.culture = 'en'`
+   - left join `pd` on `pmpd.product_description_id = pd.product_description_id`
+5. Reduce `product_description_stage` to one row per `product_id` using deterministic precedence:
+   1. `pmpd.culture = 'en'`
+   2. lowest `pmpd.product_description_id`
+   3. latest `pd.modified_date` if present
+6. Project `product_description_stage` to only:
+   - `product_id`
+   - `product_model_id` from `pm.product_model_id`
+   - `product_model_name` from `pm.name`
+   - `product_description_id` from `pd.product_description_id`
+   - `product_description` from `pd.description`
+   - `culture` from `pmpd.culture`
+7. Join `product_category_stage.product_id = product_description_stage.product_id`.
+8. Immediately project only the canonical output columns below.
 
 Category naming rule:
 - `subcategory_name` = `pc_child.name`
@@ -372,33 +434,30 @@ Category naming rule:
 Description rule:
 - Use only the normalized path through `product_model_product_description` and `product_description`.
 - Do not use `silver.v_product_and_description` in Gold for this table.
-- If multiple English descriptions exist for the same `product_id`, keep one row per `product_id` using deterministic precedence:
-  1. `pmpd.culture = 'en'`
-  2. lowest `pmpd.product_description_id`
-  3. latest `pd.modified_date` if needed
+- If no English description exists, retain the product row with null `product_description_id`, `product_description`, and `culture`.
 
 Canonical output columns:
-- `product_id` from `p.product_id`
-- `product_name` from `p.name`
-- `product_number` from `p.product_number`
-- `color` from `p.color`
-- `size` from `p.size`
-- `standard_cost` from `p.standard_cost`
-- `list_price` from `p.list_price`
-- `sell_start_date` from `p.sell_start_date`
-- `sell_end_date` from `p.sell_end_date`
-- `discontinued_date` from `p.discontinued_date`
-- `is_discontinued` from `p.is_discontinued`
-- `is_currently_sellable` from `p.is_currently_sellable`
-- `product_model_id` from `pm.product_model_id`
-- `product_model_name` from `pm.name`
-- `product_description_id` from `pd.product_description_id`
-- `product_description` from `pd.description`
-- `culture` from `pmpd.culture`
-- `product_category_id` from `pc_child.product_category_id`
-- `parent_product_category_id` from `pc_parent.product_category_id`
-- `subcategory_name` from `pc_child.name`
-- `category_name` from `pc_parent.name`
+- `product_id`
+- `product_name`
+- `product_number`
+- `color`
+- `size`
+- `standard_cost`
+- `list_price`
+- `sell_start_date`
+- `sell_end_date`
+- `discontinued_date`
+- `is_discontinued`
+- `is_currently_sellable`
+- `product_model_id`
+- `product_model_name`
+- `product_description_id`
+- `product_description`
+- `culture`
+- `product_category_id`
+- `parent_product_category_id`
+- `subcategory_name`
+- `category_name`
 
 Explicit constraint:
 - Final table grain must be exactly one row per `product_id`.
@@ -409,6 +468,9 @@ Business intent:
 
 Required source table:
 - `silver.sales_order_header` as `soh`
+
+Required source columns:
+- `sales_person`
 
 Cleaning rule for salesperson:
 - Source column is exactly `soh.sales_person`.
@@ -437,12 +499,16 @@ Required source tables and aliases:
 - `silver.sales_order_detail` as `sod`
 - `silver.sales_order_header` as `soh`
 
-Required join logic:
-- Join `sod.sales_order_id = soh.sales_order_id`
-- Use `sod` as the driving table to preserve one row per sales line.
+Required source columns:
+- From `sod`: `sales_order_id`, `sales_order_detail_id`, `product_id`, `order_qty`, `unit_price`, `unit_price_discount`, `net_unit_price`, `line_total`
+- From `soh`: `sales_order_id`, `customer_id`, `sales_person`, `order_date`, `due_date`, `ship_date`, `order_date_key`, `due_date_key`, `ship_date_key`, `sales_order_number`, `purchase_order_number`, `account_number`, `ship_method`, `online_order_flag`, `sub_total`, `tax_amt`, `freight`, `total_due`
 
-Salesperson rule:
-- Derive `sales_person` in `fact_sales` using the exact same cleaning logic defined for `gold.dim_sales` from `soh.sales_person`.
+Required staged logic:
+1. Start from `sod` as the driving table.
+2. Left join `soh` on `sod.sales_order_id = soh.sales_order_id`.
+3. Derive cleaned `sales_person` using the exact same logic as `gold.dim_sales` from `soh.sales_person`.
+4. Immediately project only the canonical output columns below.
+5. Assert uniqueness of (`sales_order_id`, `sales_order_detail_id`) before write.
 
 Canonical output columns:
 - `sales_order_id` from `sod.sales_order_id`
