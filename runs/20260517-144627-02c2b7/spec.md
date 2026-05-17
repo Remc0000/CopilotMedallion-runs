@@ -1,5 +1,14 @@
 # Run Spec 20260517-144043-a594f6
 
+## Updated specs
+
+### Iteration 1 — 2026-05-17 14:52:28Z — failed layer: gold (run: 20260517-144627-02c2b7)
+- **Root cause (1-line summary)**: Gold build likely failed due to under-specified joins/column names in the requested custom Gold tables (`dim_customer`, `dim_product`, `dim_sales`, `fact_sales`), especially around self-join/category hierarchy and flattened customer-address logic.
+- **What was changed**:
+  - Tightened `## Gold` to define the exact required Gold tables, their grains, deterministic flattening rules, join paths, aliases, and output column names.
+  - Added explicit rules for the product category self-join and english-only product description selection, plus cleaned salesperson derivation logic.
+  - Tightened `## Semantic model` to align strictly to the four requested Gold tables and their exact join keys/field names.
+
 ## Inputs
 - Workspace: `d97c0ec7-74ac-4f12-9e70-124cb0d5a4ad`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -27,7 +36,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules:
 - Use defensive column references everywhere; assert required columns exist before select, join, dedup, rename, filter, aggregate, and write.
@@ -41,6 +50,8 @@ Cross-cutting code rules:
 - Add audit/control columns consistently across layers, including load timestamp, run id, source system/table, and record hash where useful.
 - Optimize physical layout after writes using partition-aware maintenance only where justified by the actual data shape; avoid unnecessary partitioning on small dimensions.
 - Treat source views (`vGetAllCategories`, `vProductAndDescription`, `vProductModelCatalogDescription`) as read-only source entities; do not assume they are canonical over base tables unless explicitly chosen in Gold.
+- In Gold, do not infer column names from business descriptions. Use only validated Silver column names after `snake_case` conversion and fail early if an expected column is absent.
+- In Gold self-joins and bridge-based enrichments, every input DataFrame must be aliased and every selected output column must be explicitly renamed to its final Gold name in the same projection step.
 
 Required notebook cell commenting standard:
 - EACH code cell must start with a short markdown-style Python comment block.
@@ -218,6 +229,167 @@ Dim_Sales --> Use the salesperson field from salesorderheader, but remove the ad
 Fact_Sales --> join salesorderdetail and salesorderheader and keep all relevant fields
 Use below for more insights, but what I just described is your end goal in gold
 
+### Gold implementation rules for this run
+Build only these four Gold tables for the final curated layer and semantic model:
+- `gold.dim_customer`
+- `gold.dim_product`
+- `gold.dim_sales`
+- `gold.fact_sales`
+
+Do not materialize alternative Gold tables such as `gold.dim_address`, `gold.dim_date`, `gold.dim_ship_method`, `gold.bridge_customer_address`, `gold.fact_sales_order_line`, or `gold.fact_sales_order_header` in place of the four requested outputs. They may be used as temporary DataFrames during notebook execution, but the persisted Gold outputs for this run must be exactly the four requested tables above.
+
+### Gold source table and column contract
+Use these Silver tables and only these validated key columns for Gold joins:
+- `silver.customer` as `c`
+  - required columns: `customer_id`, `customer_name_preferred`, `full_name`, `company_name`, `sales_person`, `email_address`, `phone`, `name_style`, `modified_date`
+- `silver.customer_address` as `ca`
+  - required columns: `customer_id`, `address_id`, `address_type`
+- `silver.address` as `a`
+  - required columns: `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`
+- `silver.product` as `p`
+  - required columns: `product_id`, `name`, `product_number`, `color`, `size`, `weight`, `standard_cost`, `list_price`, `product_category_id`, `product_model_id`, `is_discontinued`, `is_sellable_currently`
+- `silver.product_category` as `pc_child`
+  - required columns: `product_category_id`, `parent_product_category_id`, `name`
+- `silver.product_category` as `pc_parent`
+  - required columns: `product_category_id`, `name`
+- `silver.product_model` as `pm`
+  - required columns: `product_model_id`, `name`
+- `silver.product_model_product_description` as `pmpd`
+  - required columns: `product_model_id`, `product_description_id`, `culture`
+- `silver.product_description` as `pd`
+  - required columns: `product_description_id`, `description`
+- `silver.sales_order_header` as `h`
+  - required columns: `sales_order_id`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `bill_to_address_id`, `ship_to_address_id`, `order_date`, `due_date`, `ship_date`, `status`, `order_status_desc`, `online_order_flag`, `sales_person`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`
+- `silver.sales_order_detail` as `d`
+  - required columns: `sales_order_id`, `sales_order_detail_id`, `product_id`, `order_qty`, `unit_price`, `unit_price_discount`, `gross_line_amount`, `discount_amount`, `net_line_amount`
+
+If any required column above is missing, fail immediately with a clear error naming the table alias and column.
+
+### `gold.dim_customer`
+- Grain: exactly one row per `customer_id`.
+- Join path:
+  - start from `silver.customer c`
+  - left join `silver.customer_address ca` on `c.customer_id = ca.customer_id`
+  - left join `silver.address a` on `ca.address_id = a.address_id`
+- Deterministic flattening rule for customers with multiple addresses:
+  - rank addresses per customer with this precedence:
+    1. `address_type = 'Main Office'`
+    2. `address_type = 'Primary'`
+    3. `address_type = 'Billing'`
+    4. `address_type = 'Home'`
+    5. `address_type = 'Shipping'`
+    6. any other non-null `address_type` alphabetically
+    7. lowest `address_id`
+  - keep only rank 1 per `customer_id`
+- Output columns must be exactly:
+  - `customer_id`
+  - `customer_name_preferred`
+  - `full_name`
+  - `company_name`
+  - `sales_person`
+  - `email_address`
+  - `phone`
+  - `name_style`
+  - `customer_address_type`
+  - `customer_address_id`
+  - `customer_address_line1`
+  - `customer_address_line2`
+  - `customer_city`
+  - `customer_state_province`
+  - `customer_country_region`
+  - `customer_postal_code`
+  - `modified_date`
+- Use explicit renames from joined aliases; do not leave duplicate raw `address_id`, `city`, `state_province`, or `postal_code` columns unqualified.
+
+### `gold.dim_product`
+- Grain: exactly one row per `product_id`.
+- Mandatory enrichment route for this run: use base tables and bridge tables, not source views, to avoid column-name uncertainty.
+- Join path:
+  - start from `silver.product p`
+  - left join `silver.product_category pc_child` on `p.product_category_id = pc_child.product_category_id`
+  - left join `silver.product_category pc_parent` on `pc_child.parent_product_category_id = pc_parent.product_category_id`
+  - left join english-only bridge `silver.product_model_product_description pmpd` on `p.product_model_id = pmpd.product_model_id AND upper(pmpd.culture) = 'EN'`
+  - left join `silver.product_description pd` on `pmpd.product_description_id = pd.product_description_id`
+  - left join `silver.product_model pm` on `p.product_model_id = pm.product_model_id`
+- Category hierarchy rule:
+  - `subcategory` = `pc_child.name`
+  - `category` = `pc_parent.name`
+  - If `pc_child.parent_product_category_id` is null, then set:
+    - `subcategory = pc_child.name`
+    - `category = null`
+- English description rule:
+  - keep only one english bridge row per `product_model_id`
+  - if multiple english rows exist, choose the lowest `product_description_id`
+- Output columns must be exactly:
+  - `product_id`
+  - `product_name` from `p.name`
+  - `product_number`
+  - `color`
+  - `size`
+  - `weight`
+  - `standard_cost`
+  - `list_price`
+  - `product_category_id`
+  - `product_model_id`
+  - `product_model_name` from `pm.name`
+  - `product_description` from `pd.description`
+  - `category`
+  - `subcategory`
+  - `is_discontinued`
+  - `is_sellable_currently`
+- Self-join safety:
+  - never reference unaliased `name` or unaliased `product_category_id`
+  - always project `pc_child.name as subcategory` and `pc_parent.name as category`
+
+### `gold.dim_sales`
+- Grain: exactly one row per cleaned salesperson value present in `silver.sales_order_header`.
+- Source: `silver.sales_order_header h`
+- Use `h.sales_person`, not `silver.customer.sales_person`.
+- Cleaning logic for `sales_person_clean`:
+  - remove leading `adventureworks/` case-insensitively
+  - then remove trailing digits at the end of the string
+  - then trim whitespace
+  - if the cleaned result is empty string, set to null
+- Keep only non-null distinct cleaned salesperson values.
+- Output columns must be exactly:
+  - `sales_person_clean`
+
+### `gold.fact_sales`
+- Grain: exactly one row per `sales_order_id`, `sales_order_detail_id`.
+- Join path:
+  - start from `silver.sales_order_detail d`
+  - inner join `silver.sales_order_header h` on `d.sales_order_id = h.sales_order_id`
+- Output columns must be exactly:
+  - `sales_order_id`
+  - `sales_order_detail_id`
+  - `customer_id`
+  - `product_id`
+  - `sales_person_clean`
+  - `sales_order_number`
+  - `purchase_order_number`
+  - `account_number`
+  - `order_date`
+  - `due_date`
+  - `ship_date`
+  - `status`
+  - `order_status_desc`
+  - `online_order_flag`
+  - `ship_method`
+  - `bill_to_address_id`
+  - `ship_to_address_id`
+  - `order_qty`
+  - `unit_price`
+  - `unit_price_discount`
+  - `gross_line_amount`
+  - `discount_amount`
+  - `net_line_amount`
+  - `sub_total`
+  - `tax_amt`
+  - `freight`
+  - `total_due`
+- `sales_person_clean` in fact must be derived from `h.sales_person` using the exact same cleaning rule as `gold.dim_sales`.
+- Do not carry raw duplicate columns from both header and detail after the join; explicitly select only the columns listed above.
+
 ### Gold table classification based on actual columns
 - Fact-like transactional tables:
   - `sales_order_header` because it has order dates, customer/address references, and monetary totals
@@ -243,7 +415,7 @@ Primary recommendation: line-level sales star centered on order detail, with ord
 #### Dimensions
 - `gold.dim_customer`
   - Grain: one row per `customer_id`
-  - Source: `silver.customer`
+  - Source: `silver.customer` flattened with `silver.customer_address` and `silver.address` using the deterministic address ranking rule above
   - Attributes:
     - `customer_id`
     - `customer_name_preferred`
@@ -253,24 +425,19 @@ Primary recommendation: line-level sales star centered on order detail, with ord
     - `email_address`
     - `phone`
     - `name_style`
+    - `customer_address_type`
+    - `customer_address_id`
+    - `customer_address_line1`
+    - `customer_address_line2`
+    - `customer_city`
+    - `customer_state_province`
+    - `customer_country_region`
+    - `customer_postal_code`
     - `modified_date`
-  - Note: customer currently has no direct geography; geography can be modeled through address bridges
-
-- `gold.dim_address`
-  - Grain: one row per `address_id`
-  - Source: `silver.address`
-  - Attributes:
-    - `address_id`
-    - `address_line1`
-    - `address_line2`
-    - `city`
-    - `state_province`
-    - `country_region`
-    - `postal_code`
 
 - `gold.dim_product`
   - Grain: one row per `product_id`
-  - Source: `silver.product` enriched from category/model/description helpers
+  - Source: `silver.product` enriched from `silver.product_category`, `silver.product_model`, `silver.product_model_product_description`, and `silver.product_description`
   - Attributes:
     - `product_id`
     - `product_name`
@@ -281,59 +448,35 @@ Primary recommendation: line-level sales star centered on order detail, with ord
     - `standard_cost`
     - `list_price`
     - `product_category_id`
-    - `product_category_name`
-    - `parent_product_category_name`
     - `product_model_id`
     - `product_model_name`
     - `product_description`
-    - `culture` where a single preferred culture is selected
+    - `category`
+    - `subcategory`
     - `is_discontinued`
     - `is_sellable_currently`
-  - Default enrichment choice:
-    - category names from `silver.v_get_all_categories`
-    - product description from `silver.v_product_and_description` filtered to a preferred culture if multiple exist
-    - model attributes optionally from `silver.v_product_model_catalog_description`
-  - Alternative:
-    - use only base tables + `product_model_product_description` + `product_description` to avoid dependence on source views
 
-- `gold.dim_date`
-  - Grain: one row per calendar date used by order, due, and ship dates
-  - Generated dimension with standard date attributes
-  - Keys:
-    - `date_key`
-    - `date`
-    - `year`, `quarter`, `month`, `month_name`, `week`, `day`
-
-- `gold.dim_ship_method`
-  - Grain: one row per distinct `ship_method`
+- `gold.dim_sales`
+  - Grain: one row per cleaned salesperson value
   - Source: `silver.sales_order_header`
-  - Useful because ship method is descriptive and repeated
-
-- `gold.bridge_customer_address`
-  - Grain: one row per `customer_id`, `address_id`, `address_type`
-  - Source: `silver.customer_address`
-  - Keep as bridge instead of flattening because a customer may have multiple addresses and types
+  - Attributes:
+    - `sales_person_clean`
 
 #### Facts
-- `gold.fact_sales_order_line`
+- `gold.fact_sales`
   - Grain: one row per `sales_order_id`, `sales_order_detail_id`
   - Source: `silver.sales_order_detail` joined to `silver.sales_order_header`
   - Foreign keys:
-    - `sales_order_id` degenerate order number context
     - `customer_id`
     - `product_id`
-    - `ship_to_address_id`
-    - `bill_to_address_id`
-    - `order_date_key`
-    - `due_date_key`
-    - `ship_date_key`
-    - `ship_method`
+    - `sales_person_clean`
   - Degenerate dimensions:
     - `sales_order_number`
     - `purchase_order_number`
     - `account_number`
     - `status`
     - `online_order_flag`
+    - `ship_method`
   - Measures:
     - `order_qty`
     - `unit_price`
@@ -341,31 +484,16 @@ Primary recommendation: line-level sales star centered on order detail, with ord
     - `gross_line_amount`
     - `discount_amount`
     - `net_line_amount`
-  - Rationale: best analytic grain for product, customer, and revenue analysis
-
-- `gold.fact_sales_order_header`
-  - Grain: one row per `sales_order_id`
-  - Source: `silver.sales_order_header`
-  - Foreign keys:
-    - `customer_id`
-    - `ship_to_address_id`
-    - `bill_to_address_id`
-    - `order_date_key`
-    - `due_date_key`
-    - `ship_date_key`
-    - `ship_method`
-  - Measures:
     - `sub_total`
     - `tax_amt`
     - `freight`
     - `total_due`
-  - Use case: order-level trend analysis without line duplication
 
 ### Alternative Gold modeling choices the user may edit
-- Option 1: Keep both `fact_sales_order_line` and `fact_sales_order_header` as proposed.
-- Option 2: Keep only `fact_sales_order_line` and allocate all reporting to line grain; simpler model but care needed not to sum header-level totals after joining.
-- Option 3: Build a single denormalized `dim_product_enriched` using source views as authoritative for category/description text; simpler but more dependent on view semantics.
-- Proposed default: Option 1 with shared conformed dimensions.
+- Option 1: Keep only the four requested final Gold outputs: `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
+- Option 2: Later add helper dimensions such as date or ship method if the user explicitly requests them.
+- Option 3: Later switch product enrichment to source views if the user explicitly wants view-driven semantics.
+- Proposed default: Option 1 with the exact four requested persisted Gold tables.
 
 ### Data quality tests
 Apply at minimum these 5 standard tests across Bronze/Silver/Gold, plus targeted RI checks.
@@ -373,7 +501,9 @@ Apply at minimum these 5 standard tests across Bronze/Silver/Gold, plus targeted
 1. Row count reconciliation
 - Compare source object count to Bronze
 - Compare Bronze to Silver after dedup
-- Compare Silver line/header counts to Gold facts
+- Compare `silver.sales_order_detail` count to `gold.fact_sales`
+- Compare distinct `silver.customer.customer_id` count to `gold.dim_customer`
+- Compare distinct `silver.product.product_id` count to `gold.dim_product`
 
 2. No-null primary key tests
 - `customer.customer_id`
@@ -383,6 +513,9 @@ Apply at minimum these 5 standard tests across Bronze/Silver/Gold, plus targeted
 - `product_model.product_model_id`
 - `sales_order_header.sales_order_id`
 - `sales_order_detail.sales_order_id`, `sales_order_detail.sales_order_detail_id`
+- `gold.dim_customer.customer_id`
+- `gold.dim_product.product_id`
+- `gold.fact_sales.sales_order_id`, `gold.fact_sales.sales_order_detail_id`
 
 3. Unique primary/composite key tests
 - `customer_id`
@@ -394,6 +527,10 @@ Apply at minimum these 5 standard tests across Bronze/Silver/Gold, plus targeted
 - `sales_order_id + sales_order_detail_id`
 - `customer_id + address_id + address_type`
 - `product_model_id + product_description_id + culture`
+- `gold.dim_customer.customer_id`
+- `gold.dim_product.product_id`
+- `gold.dim_sales.sales_person_clean`
+- `gold.fact_sales.sales_order_id + gold.fact_sales.sales_order_detail_id`
 
 4. Referential integrity tests
 - `sales_order_header.customer_id -> customer.customer_id`
@@ -405,6 +542,9 @@ Apply at minimum these 5 standard tests across Bronze/Silver/Gold, plus targeted
 - `product.product_model_id -> product_model.product_model_id`
 - `customer_address.customer_id -> customer.customer_id`
 - `customer_address.address_id -> address.address_id`
+- `gold.fact_sales.customer_id -> gold.dim_customer.customer_id`
+- `gold.fact_sales.product_id -> gold.dim_product.product_id`
+- `gold.fact_sales.sales_person_clean -> gold.dim_sales.sales_person_clean`
 
 5. Domain/value checks
 - `order_qty > 0`
@@ -432,7 +572,8 @@ Create a Direct Lake semantic model on top of the four Gold tables explicitly re
   - One row per `customer_id`
   - Includes customer descriptive columns from `silver.customer`
   - Includes flattened address context from `silver.customer_address` and `silver.address`
-  - Expose customer/address attributes such as:
+  - Flattening must use the deterministic Gold rule defined above so the table remains exactly one row per `customer_id`
+  - Expose:
     - `customer_id`
     - `customer_name_preferred`
     - `full_name`
@@ -440,13 +581,20 @@ Create a Direct Lake semantic model on top of the four Gold tables explicitly re
     - `email_address`
     - `phone`
     - `sales_person`
-    - address-related descriptive fields retained in Gold
-  - If multiple customer addresses exist, Gold must define a deterministic flattening rule so semantic model remains one row per `customer_id`
+    - `customer_address_type`
+    - `customer_address_id`
+    - `customer_address_line1`
+    - `customer_address_line2`
+    - `customer_city`
+    - `customer_state_province`
+    - `customer_country_region`
+    - `customer_postal_code`
+    - `modified_date`
 
 - `dim_product`
   - One row per `product_id`
   - Includes joined attributes from product, product category self-join, product model, english-only product model/product description bridge, and product description
-  - Expose product hierarchy fields such as:
+  - Expose:
     - `product_id`
     - `product_name`
     - `product_number`
@@ -470,17 +618,16 @@ Create a Direct Lake semantic model on top of the four Gold tables explicitly re
     - trailing numeric suffix is removed
   - Expose:
     - `sales_person_clean`
-  - If Gold also keeps the original raw salesperson value, hide it by default in the semantic model
 
 - `fact_sales`
   - Grain: one row per `sales_order_id`, `sales_order_detail_id`
   - Joined from `sales_order_detail` and `sales_order_header`
-  - Expose relevant line and header context needed for reporting, including:
+  - Expose:
     - `sales_order_id`
     - `sales_order_detail_id`
     - `customer_id`
     - `product_id`
-    - cleaned salesperson key/column matching `dim_sales`
+    - `sales_person_clean`
     - `sales_order_number`
     - `purchase_order_number`
     - `account_number`
@@ -525,7 +672,6 @@ Because the requested Gold design does not call for a separate date dimension, k
 ### Recommended hidden fields
 - Hide audit columns, hashes, and ETL control fields
 - Hide raw technical lineage columns
-- Hide duplicate/raw salesperson field if both raw and cleaned salesperson are present
 - Hide rowguid-like technical identifiers if surfaced
 - Hide address identifier columns in `fact_sales` unless drillthrough requires them
 
