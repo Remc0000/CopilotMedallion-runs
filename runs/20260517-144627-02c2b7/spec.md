@@ -30,6 +30,13 @@
   - Tightened `## Gold` with a mandatory build order, pre-write validation checks, and explicit row-level uniqueness/null-key assertions for each of the four required Gold tables.
   - Added an explicit implementation rule that each Gold table must be materialized from its own final DataFrame and validated before starting the next Gold table.
 
+### Iteration 2 — 2026-05-17 15:22:53Z — failed layer: gold (run: 20260517-144627-02c2b7)
+- **Root cause (1-line summary)**: Gold execution still reached session cancellation because the spec did not force per-table schema assertions and immediate fail-fast checkpoints before and after each Gold transformation step.
+- **What was changed**:
+  - Tightened `## Generic guidance` to require explicit schema/row-count checkpoints after each intermediate Gold step and immediate notebook termination on the first failed assertion.
+  - Tightened `## Gold` with mandatory per-table preflight checks, intermediate step names, and write verification for `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
+  - Added a stricter rule that no later Gold table may start until the prior table has passed source-column validation, final-column validation, key validation, and post-write readability verification.
+
 ## Inputs
 - Workspace: `d97c0ec7-74ac-4f12-9e70-124cb0d5a4ad`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -78,6 +85,8 @@ Cross-cutting code rules:
 - In Gold, build and validate one table at a time in this exact order: `gold.dim_customer`, then `gold.dim_product`, then `gold.dim_sales`, then `gold.fact_sales`. Do not start the next Gold table until the current one has passed schema, null-key, and uniqueness checks and has been written successfully.
 - For each Gold table, create a dedicated final DataFrame variable containing exactly the persisted output columns for that table. Validate that final DataFrame before write, write it, then clear/release intermediate DataFrames before building the next Gold table.
 - If any Gold table fails validation or write, stop the notebook immediately after `_save_error('gold', e)` and `raise`; do not continue attempting later Gold tables, because that can lead to session-wide statement failure/cancellation.
+- In Gold, add explicit fail-fast checkpoints after each intermediate build step: source read, join result, ranking/dedup result, final projection, pre-write validation, and post-write readback. Each checkpoint must assert expected columns exist; for ranking/dedup/final steps it must also assert the DataFrame is instantiable and countable without error.
+- Gold notebook control flow must be strictly linear and blocking: build one table, validate it, write it, read it back once to verify schema/readability, then and only then proceed to the next table. Never queue or lazily defer multiple Gold actions before validating the current table.
 
 Required notebook cell commenting standard:
 - EACH code cell must start with a short markdown-style Python comment block.
@@ -321,8 +330,20 @@ If any required column above is missing, fail immediately with a clear error nam
   - validate the final DataFrame contains exactly the specified output columns and no extras
   - validate the required grain key columns are present and non-null
   - validate uniqueness at the declared grain
+- For each table, after write:
+  - immediately read back the persisted Gold table
+  - verify the readback schema matches the specified output column list exactly
+  - verify the readback is queryable with at least a lightweight action
 - If any validation fails, stop immediately and do not continue to subsequent Gold tables.
 - Do not chain all four Gold writes inside one broad `try` that masks which table failed; each table must have its own explicit validation-and-write block.
+- Mandatory per-table execution checkpoints:
+  1. validate source Silver table existence and required columns
+  2. build each intermediate DataFrame step named in this spec
+  3. after each intermediate step, assert required columns for that step exist before proceeding
+  4. materialize/check the final DataFrame before write
+  5. write the table
+  6. read the table back and verify schema/readability
+- No later Gold table may start until all six checkpoints above have succeeded for the current table.
 
 ### `gold.dim_customer`
 - Grain: exactly one row per `customer_id`.
@@ -331,10 +352,12 @@ If any required column above is missing, fail immediately with a clear error nam
   - left join `silver.customer_address ca` on `c.customer_id = ca.customer_id`
   - left join `silver.address a` on `ca.address_id = a.address_id`
 - Mandatory implementation pattern for this table:
-  - Step 1: create a joined customer-address DataFrame that still retains alias-qualified source columns needed for ranking, specifically `c.customer_id`, `ca.address_type`, and `ca.address_id`, plus the customer/address attributes needed for final output.
-  - Step 2: apply the window function and `row_number()` on that joined DataFrame before any final renaming/projection that would remove `c.*`, `ca.*`, or `a.*` alias-qualified references.
-  - Step 3: filter to `_rn = 1`.
-  - Step 4: only after filtering to rank 1, project the final Gold column names exactly as specified below.
+  - Step 1: create `dim_customer_joined_df` that still retains alias-qualified source columns needed for ranking, specifically `c.customer_id`, `ca.address_type`, and `ca.address_id`, plus the customer/address attributes needed for final output.
+  - Step 2: validate `dim_customer_joined_df` contains the ranking columns and all final source attributes before continuing.
+  - Step 3: create `dim_customer_ranked_df` by applying the window function and `row_number()` on `dim_customer_joined_df` before any final renaming/projection that would remove `c.*`, `ca.*`, or `a.*` alias-qualified references.
+  - Step 4: validate `dim_customer_ranked_df` contains `_rn` and the ranking columns.
+  - Step 5: create `dim_customer_filtered_df` by filtering to `_rn = 1`.
+  - Step 6: only after filtering to rank 1, create `dim_customer_final_df` that projects the final Gold column names exactly as specified below.
 - Deterministic flattening rule for customers with multiple addresses:
   - rank addresses per customer with this precedence:
     1. `address_type = 'Main Office'`
@@ -384,6 +407,13 @@ If any required column above is missing, fail immediately with a clear error nam
   - left join english-only bridge `silver.product_model_product_description pmpd` on `p.product_model_id = pmpd.product_model_id AND upper(pmpd.culture) = 'EN'`
   - left join `silver.product_description pd` on `pmpd.product_description_id = pd.product_description_id`
   - left join `silver.product_model pm` on `p.product_model_id = pm.product_model_id`
+- Mandatory implementation pattern for this table:
+  - Step 1: create `pmpd_en_df` containing only english rows and only columns `product_model_id`, `product_description_id`.
+  - Step 2: deduplicate english bridge rows to one row per `product_model_id` by lowest `product_description_id`, resulting in `pmpd_en_dedup_df`.
+  - Step 3: validate `pmpd_en_dedup_df` uniqueness on `product_model_id`.
+  - Step 4: create `dim_product_joined_df` from the specified joins.
+  - Step 5: validate `dim_product_joined_df` contains all source columns needed for the final projection.
+  - Step 6: create `dim_product_final_df` by projecting exactly the final columns below.
 - Category hierarchy rule:
   - `subcategory` = `pc_child.name`
   - `category` = `pc_parent.name`
@@ -423,6 +453,11 @@ If any required column above is missing, fail immediately with a clear error nam
 - Grain: exactly one row per cleaned salesperson value present in `silver.sales_order_header`.
 - Source: `silver.sales_order_header h`
 - Resolve the source salesperson column from the header contract above into `sales_person_source`, then derive `sales_person_clean` from that resolved field.
+- Mandatory implementation pattern for this table:
+  - Step 1: create `dim_sales_source_df` from header with only the resolved `sales_person_source`.
+  - Step 2: validate `dim_sales_source_df` contains `sales_person_source`.
+  - Step 3: create `dim_sales_clean_df` with `sales_person_clean`.
+  - Step 4: create `dim_sales_final_df` by filtering to non-null `sales_person_clean` and selecting distinct `sales_person_clean`.
 - Keep only non-null distinct cleaned salesperson values.
 - Final validation checks before writing `gold.dim_sales`:
   - required output columns must match this list exactly
@@ -436,6 +471,10 @@ If any required column above is missing, fail immediately with a clear error nam
 - Join path:
   - start from `silver.sales_order_detail d`
   - inner join `silver.sales_order_header h` on `d.sales_order_id = h.sales_order_id`
+- Mandatory implementation pattern for this table:
+  - Step 1: create `fact_sales_joined_df` from the specified inner join and immediately resolve `sales_person_source` from header in that same joined step.
+  - Step 2: validate `fact_sales_joined_df` contains all required header/detail source columns and `sales_person_source`.
+  - Step 3: create `fact_sales_final_df` by deriving `sales_person_clean` from the shared salesperson derivation contract and projecting the final output list only.
 - After joining, immediately project to the final output list only; do not keep duplicate header/detail columns in an intermediate persisted DataFrame.
 - `sales_person_clean` in fact must be derived from the shared salesperson derivation contract using the resolved header field `sales_person_source`.
 - Final validation checks before writing `gold.fact_sales`:
@@ -915,5 +954,4 @@ Sales analytics assistant for customer, product hierarchy, salesperson, and sale
 - Do not infer unsupported business concepts such as margin, profit, inventory, returns, targets, quotas, or commissions unless explicitly modeled.
 - Do not use `password_hash`, `password_salt`, binary image content, or hidden technical columns in responses.
 - When answering geography questions, rely only on customer/address fields actually retained in `dim_customer`.
-- When a question asks for order totals using `total_due`, `sub_total`, `tax_amt`, or `freight`, be careful about line-grain duplication and clarify if the model exposes those as repeated line attributes.
-- Refuse unsupported write-back or operational actions; this agent is analytic and read-only.
+- When a question asks for order totals using `total_due`, `sub_total`, `tax_amt`, or `freight`, be careful about line-gr
