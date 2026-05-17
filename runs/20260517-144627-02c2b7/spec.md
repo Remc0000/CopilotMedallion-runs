@@ -16,6 +16,20 @@
   - Tightened `## Gold` with explicit fallback/derivation rules for salesperson fields and stricter column contracts for `sales_order_header`, `customer`, and `product_model`.
   - Added mandatory implementation guidance to build `dim_sales` and `fact_sales` from a shared cleaned-salesperson expression and to use only explicitly listed output columns.
 
+### Iteration 3 — 2026-05-17 15:13:41Z — failed layer: gold (run: 20260517-144627-02c2b7)
+- **Root cause (1-line summary)**: UNRESOLVED_COLUMN on `c.customer_id` in `gold.dim_customer` windowing because the row-number ranking was applied after alias-qualified columns had already been projected/renamed away.
+- **What was changed**:
+  - Tightened `## Generic guidance` to forbid referencing source aliases after a projection that removes those aliases, especially in window specs, filters, and later transforms.
+  - Tightened `## Gold` / `gold.dim_customer` with a mandatory two-step build pattern: rank on alias-qualified join output first, then project final renamed columns after filtering to rank 1.
+  - Added an explicit window-column contract for `dim_customer` using only `c.customer_id`, `ca.address_type`, and `ca.address_id` before the final select.
+
+### Iteration 1 — 2026-05-17 15:16:19Z — failed layer: gold (run: 20260517-144627-02c2b7)
+- **Root cause (1-line summary)**: Gold run still failed at session level because Gold transformations remain under-constrained for execution safety; the build must stage and validate each Gold table independently before continuing.
+- **What was changed**:
+  - Tightened `## Generic guidance` to require fail-fast, table-by-table Gold validation and to stop immediately on the first Gold table error instead of continuing until session cancellation.
+  - Tightened `## Gold` with a mandatory build order, pre-write validation checks, and explicit row-level uniqueness/null-key assertions for each of the four required Gold tables.
+  - Added an explicit implementation rule that each Gold table must be materialized from its own final DataFrame and validated before starting the next Gold table.
+
 ## Inputs
 - Workspace: `d97c0ec7-74ac-4f12-9e70-124cb0d5a4ad`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -47,7 +61,7 @@ Apply these reference skills/agents at all times:
 
 Cross-cutting code rules:
 - Use defensive column references everywhere; assert required columns exist before select, join, dedup, rename, filter, aggregate, and write.
-- After every join, immediately project to an explicit alias-prefixed/select-renamed column list to prevent ambiguous names from propagating.
+- After every join, immediately project to an explicit alias-prefixed/select-renamed column list to prevent ambiguous names from propagating, unless a downstream window/filter in the same logical build step still needs alias-qualified columns; in that case, keep the needed alias-qualified columns through the ranking/filter step and only then perform the final renamed projection.
 - Before every `groupBy`/`agg`, assert all grouping and aggregation input columns exist.
 - For REST/API responses, use defensive handling and raise early: `if x is None: raise ...` before any `.get()` access.
 - Never use `saveAsTable`; write using idempotent Delta overwrite/merge patterns against paths or managed table APIs supported by Fabric notebooks.
@@ -60,6 +74,10 @@ Cross-cutting code rules:
 - In Gold, do not infer column names from business descriptions. Use only validated Silver column names after `snake_case` conversion and fail early if an expected column is absent.
 - In Gold self-joins and bridge-based enrichments, every input DataFrame must be aliased and every selected output column must be explicitly renamed to its final Gold name in the same projection step.
 - Before implementing any Gold table, inspect the actual Silver schema and reconcile it to this spec. If a field in the business request is not a validated Silver column, derive it only from the explicit fallback rules in this spec; otherwise fail early with a clear missing-column error instead of guessing an alternative column name.
+- Never reference an alias-qualified column name after a projection/select step that has removed or renamed that alias-qualified column. This applies especially to `Window.partitionBy`, `Window.orderBy`, `filter`, `withColumn`, and `dropDuplicates`. If a later step needs `c.customer_id`, `ca.address_type`, or similar alias-qualified fields, perform that later step before the final renaming/projection.
+- In Gold, build and validate one table at a time in this exact order: `gold.dim_customer`, then `gold.dim_product`, then `gold.dim_sales`, then `gold.fact_sales`. Do not start the next Gold table until the current one has passed schema, null-key, and uniqueness checks and has been written successfully.
+- For each Gold table, create a dedicated final DataFrame variable containing exactly the persisted output columns for that table. Validate that final DataFrame before write, write it, then clear/release intermediate DataFrames before building the next Gold table.
+- If any Gold table fails validation or write, stop the notebook immediately after `_save_error('gold', e)` and `raise`; do not continue attempting later Gold tables, because that can lead to session-wide statement failure/cancellation.
 
 Required notebook cell commenting standard:
 - EACH code cell must start with a short markdown-style Python comment block.
@@ -293,12 +311,30 @@ If any required column above is missing, fail immediately with a clear error nam
   - if the cleaned result is empty string, set to null
 - Do not reference raw `h.sales_person` directly in multiple places after resolution; resolve once to `sales_person_source`, then derive `sales_person_clean`.
 
+### Gold build sequencing and validation contract
+- Build the four Gold tables in this exact order:
+  1. `gold.dim_customer`
+  2. `gold.dim_product`
+  3. `gold.dim_sales`
+  4. `gold.fact_sales`
+- For each table, before write:
+  - validate the final DataFrame contains exactly the specified output columns and no extras
+  - validate the required grain key columns are present and non-null
+  - validate uniqueness at the declared grain
+- If any validation fails, stop immediately and do not continue to subsequent Gold tables.
+- Do not chain all four Gold writes inside one broad `try` that masks which table failed; each table must have its own explicit validation-and-write block.
+
 ### `gold.dim_customer`
 - Grain: exactly one row per `customer_id`.
 - Join path:
   - start from `silver.customer c`
   - left join `silver.customer_address ca` on `c.customer_id = ca.customer_id`
   - left join `silver.address a` on `ca.address_id = a.address_id`
+- Mandatory implementation pattern for this table:
+  - Step 1: create a joined customer-address DataFrame that still retains alias-qualified source columns needed for ranking, specifically `c.customer_id`, `ca.address_type`, and `ca.address_id`, plus the customer/address attributes needed for final output.
+  - Step 2: apply the window function and `row_number()` on that joined DataFrame before any final renaming/projection that would remove `c.*`, `ca.*`, or `a.*` alias-qualified references.
+  - Step 3: filter to `_rn = 1`.
+  - Step 4: only after filtering to rank 1, project the final Gold column names exactly as specified below.
 - Deterministic flattening rule for customers with multiple addresses:
   - rank addresses per customer with this precedence:
     1. `address_type = 'Main Office'`
@@ -309,6 +345,14 @@ If any required column above is missing, fail immediately with a clear error nam
     6. any other non-null `address_type` alphabetically
     7. lowest `address_id`
   - keep only rank 1 per `customer_id`
+- Window specification contract for `dim_customer`:
+  - `partitionBy` must use the pre-projection customer key from the joined DataFrame (`c.customer_id`, or an equivalent temporary column retained specifically for ranking before final renaming).
+  - `orderBy` must use the pre-projection customer-address columns from the joined DataFrame (`ca.address_type`, `ca.address_id`, or equivalent temporary columns retained specifically for ranking before final renaming).
+  - Do not build the final renamed output first and then try to reference `c.customer_id`, `ca.address_type`, or `ca.address_id` in `withColumn(row_number...)`; those alias-qualified columns no longer exist after the final projection.
+- Final validation checks before writing `gold.dim_customer`:
+  - required output columns must match this list exactly
+  - `customer_id` must be non-null
+  - `customer_id` must be unique
 - Output columns must be exactly:
   - `customer_id`
   - `customer_name_preferred`
@@ -349,6 +393,11 @@ If any required column above is missing, fail immediately with a clear error nam
 - English description rule:
   - keep only one english bridge row per `product_model_id`
   - if multiple english rows exist, choose the lowest `product_description_id`
+  - perform this bridge dedup in a dedicated intermediate DataFrame before joining to `p`
+- Final validation checks before writing `gold.dim_product`:
+  - required output columns must match this list exactly
+  - `product_id` must be non-null
+  - `product_id` must be unique
 - Output columns must be exactly:
   - `product_id`
   - `product_name` from `p.name`
@@ -375,6 +424,10 @@ If any required column above is missing, fail immediately with a clear error nam
 - Source: `silver.sales_order_header h`
 - Resolve the source salesperson column from the header contract above into `sales_person_source`, then derive `sales_person_clean` from that resolved field.
 - Keep only non-null distinct cleaned salesperson values.
+- Final validation checks before writing `gold.dim_sales`:
+  - required output columns must match this list exactly
+  - `sales_person_clean` must be non-null
+  - `sales_person_clean` must be unique
 - Output columns must be exactly:
   - `sales_person_clean`
 
@@ -385,6 +438,10 @@ If any required column above is missing, fail immediately with a clear error nam
   - inner join `silver.sales_order_header h` on `d.sales_order_id = h.sales_order_id`
 - After joining, immediately project to the final output list only; do not keep duplicate header/detail columns in an intermediate persisted DataFrame.
 - `sales_person_clean` in fact must be derived from the shared salesperson derivation contract using the resolved header field `sales_person_source`.
+- Final validation checks before writing `gold.fact_sales`:
+  - required output columns must match this list exactly
+  - `sales_order_id` and `sales_order_detail_id` must both be non-null
+  - the pair (`sales_order_id`, `sales_order_detail_id`) must be unique
 - Output columns must be exactly:
   - `sales_order_id`
   - `sales_order_detail_id`
