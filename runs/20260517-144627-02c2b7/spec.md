@@ -37,13 +37,6 @@
   - Tightened `## Gold` with mandatory per-table preflight checks, intermediate step names, and write verification for `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
   - Added a stricter rule that no later Gold table may start until the prior table has passed source-column validation, final-column validation, key validation, and post-write readability verification.
 
-### Iteration 3 — 2026-05-17 15:30:12Z — failed layer: silver (run: 20260517-144627-02c2b7)
-- **Root cause (1-line summary)**: Silver session was cancelled after statement failures because Silver transformations were still under-specified on exact retained columns, dedup ordering, and per-table fail-fast validation.
-- **What was changed**:
-  - Tightened `## Generic guidance` with the same blocking, per-table validation discipline already required in Gold, now explicitly applied to Silver.
-  - Tightened `## Silver` with an exact required build order, per-table source/target column contracts, deterministic dedup ordering rules, and post-write readback validation.
-  - Added an explicit rule to build Silver final DataFrames with exactly the declared output columns only, and to stop immediately on the first Silver table failure.
-
 ## Inputs
 - Workspace: `d97c0ec7-74ac-4f12-9e70-124cb0d5a4ad`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -90,14 +83,10 @@ Cross-cutting code rules:
 - Before implementing any Gold table, inspect the actual Silver schema and reconcile it to this spec. If a field in the business request is not a validated Silver column, derive it only from the explicit fallback rules in this spec; otherwise fail early with a clear missing-column error instead of guessing an alternative column name.
 - Never reference an alias-qualified column name after a projection/select step that has removed or renamed that alias-qualified column. This applies especially to `Window.partitionBy`, `Window.orderBy`, `filter`, `withColumn`, and `dropDuplicates`. If a later step needs `c.customer_id`, `ca.address_type`, or similar alias-qualified fields, perform that later step before the final renaming/projection.
 - In Gold, build and validate one table at a time in this exact order: `gold.dim_customer`, then `gold.dim_product`, then `gold.dim_sales`, then `gold.fact_sales`. Do not start the next Gold table until the current one has passed schema, null-key, and uniqueness checks and has been written successfully.
-- For each Gold table, create a dedicated final DataFrame variable containing exactly the persisted output columns for that table. Validate that final DataFrame before write, write it, then clear/release intermediate DataFrames before building the next Gold table.
+- For each Gold table, create a dedicated final DataFrame variable containing exactly the persisted output columns for that table. Validate that final DataFrame before write, write it, then clear/release intermediate DataFrames before building the next table.
 - If any Gold table fails validation or write, stop the notebook immediately after `_save_error('gold', e)` and `raise`; do not continue attempting later Gold tables, because that can lead to session-wide statement failure/cancellation.
 - In Gold, add explicit fail-fast checkpoints after each intermediate build step: source read, join result, ranking/dedup result, final projection, pre-write validation, and post-write readback. Each checkpoint must assert expected columns exist; for ranking/dedup/final steps it must also assert the DataFrame is instantiable and countable without error.
 - Gold notebook control flow must be strictly linear and blocking: build one table, validate it, write it, read it back once to verify schema/readability, then and only then proceed to the next table. Never queue or lazily defer multiple Gold actions before validating the current table.
-- Apply the same fail-fast discipline to Silver: build and validate one Silver table at a time, write it, read it back, and only then continue to the next Silver table.
-- If any Silver table fails validation or write, stop the notebook immediately after `_save_error('silver', e)` and `raise`; do not continue attempting later Silver tables.
-- For every Silver table, validate source Bronze existence, required source columns, intermediate DataFrame schema, final DataFrame exact column list, non-null key columns, uniqueness at the declared grain, and post-write readability.
-- In Silver, do not keep pass-through columns by implication. Each Silver table must be written from a dedicated final DataFrame containing exactly the columns explicitly listed in this spec for that table, plus the required Silver audit columns.
 
 Required notebook cell commenting standard:
 - EACH code cell must start with a short markdown-style Python comment block.
@@ -107,6 +96,34 @@ Required notebook cell commenting standard:
   - `# ---`
   - `# Read raw bronze table and apply schema enforcement.`
   - `# Drops rows where any required key is null.`
+
+### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
+These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
+
+Rule A — No dotted alias strings.
+- Never pass dotted strings like "c.customer_id", "ca.address_type", "h.sales_person", or "pc_child.name" to F.col(...), withColumn(...), Window.partitionBy(...), Window.orderBy(...), or select(...). Spark treats "c.customer_id" as a single column literally named c.customer_id, which does not resolve once any projection or rename has been applied.
+- Alias scope (.alias("c"), .alias("ca"), ...) is only valid inside the SAME select / join expression that introduces it. Once you produce a new DataFrame via select(...) or withColumn(...), the dotted alias form is gone and you must reference plain column names.
+
+Rule B — Materialize helper columns before they are needed downstream.
+- For any column that will later be referenced by a Window, a withColumn, or a downstream join after a projection, first materialize it as a flat, unambiguous helper column (e.g. rank_customer_id, rank_address_type, sales_person_source) in the same select that introduces the join aliases.
+
+Rule C — Do not drop a column before its last consumer has run.
+- Before adding a withColumn, verify every F.col(...) referenced by that expression still exists on the DataFrame at that step. If a previous select(...) projection removed it, either:
+  - (preferred) move the withColumn BEFORE the projection that drops the source column, OR
+  - keep the source column in the projection, OR
+  - re-derive the value from a column that IS still present (often a boolean/flag that was computed earlier from the same source).
+- Example of the failure to avoid: dropping discontinued_date in a select(...) and then later writing F.when(F.col('discontinued_date').isNotNull(), ...) inside withColumn('is_sellable_currently', ...). The column is gone and Spark raises UNRESOLVED_COLUMN.
+- When a boolean flag derived from a raw column already exists on the DataFrame (e.g. is_discontinued derived from discontinued_date), prefer reusing the flag (F.col('is_discontinued')) over re-reading the dropped raw column.
+
+Rule D — Order of derived-column computations matters.
+- When building several derived columns where one depends on another (e.g. is_discontinued, then is_sellable_currently which uses is_discontinued), add them in dependency order with sequential withColumn calls, and reference the already-derived flag in the next expression — do NOT reach back to a raw source column that may have been dropped.
+
+Rule E — Validate schema between non-trivial transformation steps.
+- After any select(...) / drop(...) / heavy withColumn chain, and BEFORE the next step that depends on specific columns, assert those columns exist. Fail fast with an error message that names the missing column and the DataFrame variable, so the auto-fixer gets an actionable diagnostic instead of a deep analyzer stack trace.
+
+Rule F — Self-check pattern for every withColumn / Window.
+- For every withColumn(name, expr) and every Window definition, confirm: "Every column referenced inside expr / inside the window's partitionBy / orderBy exists on the DataFrame at this exact point." If not, fix per Rule C before generating the code.
+
 
 ## Bronze
 Land each selected source object into the `bronze` schema as 1:1 raw Delta tables with minimal transformation and consistent metadata.
@@ -188,130 +205,30 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
 - Exclude highly sensitive/non-analytic fields from downstream conformed analytics:
   - Drop `password_hash`, `password_salt` from `silver.customer`
   - Drop `thumbnail_photo` from `silver.product` unless the user wants image reporting scenarios
-- Build and validate Silver tables one at a time in this exact order:
-  1. `silver.address`
-  2. `silver.customer`
-  3. `silver.customer_address`
-  4. `silver.product`
-  5. `silver.product_category`
-  6. `silver.product_description`
-  7. `silver.product_model`
-  8. `silver.product_model_product_description`
-  9. `silver.sales_order_header`
-  10. `silver.sales_order_detail`
-  11. `silver.v_get_all_categories`
-  12. `silver.v_product_and_description`
-  13. `silver.v_product_model_catalog_description`
-- For each Silver table:
-  - validate source Bronze table existence before reading
-  - validate required Bronze source columns after `snake_case` normalization and before any transformation
-  - create a dedicated `<table>_final_df` containing exactly the specified retained/derived columns plus `silver_loaded_at_utc`, `run_id`, `record_hash`
-  - validate the final DataFrame exact column list before write
-  - validate key non-nullness and uniqueness at the declared grain before write
-  - write the table
-  - read the written table back and verify schema/readability before proceeding
-- If a Silver source table lacks `modified_date`, deduplicate deterministically by the declared dedup key using a stable fallback order:
-  1. non-null dedup key columns first
-  2. then ascending dedup key columns
-  3. then ascending `rowguid` if present
-  4. else no additional business-column guessing; keep the first row from the stable ordered window
-- If a Silver source table has `modified_date`, the dedup window must order by:
-  1. `modified_date` descending nulls last
-  2. `rowguid` descending nulls last when present
-  3. dedup key columns ascending
-- Do not apply `dropDuplicates()` blindly on whole rows for Silver conformance tables. Use the declared dedup key and deterministic windowed row selection.
 
 ### Silver table specifications
 - `silver.address`
   - Source: `bronze.address`
   - Key: `address_id`
   - Dedup key: `address_id`
-  - Required source columns after snake_case: `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `address_id`
-    - `address_line1`
-    - `address_line2`
-    - `city`
-    - `state_province`
-    - `country_region`
-    - `postal_code`
-    - `rowguid`
-    - `modified_date`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
+  - Retain: `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`, `rowguid`, `modified_date`
 - `silver.customer`
   - Source: `bronze.customer`
   - Key: `customer_id`
   - Dedup key: `customer_id`
-  - Required source columns after snake_case: `customer_id`, `name_style`, `title`, `first_name`, `middle_name`, `last_name`, `suffix`, `company_name`, `sales_person`, `email_address`, `phone`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `customer_id`
-    - `name_style`
-    - `title`
-    - `first_name`
-    - `middle_name`
-    - `last_name`
-    - `suffix`
-    - `company_name`
-    - `sales_person`
-    - `email_address`
-    - `phone`
-    - `rowguid`
-    - `modified_date`
-    - `full_name`
-    - `customer_name_preferred`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
+  - Retain: `name_style`, `title`, `first_name`, `middle_name`, `last_name`, `suffix`, `company_name`, `sales_person`, `email_address`, `phone`, `rowguid`, `modified_date`
   - Add derived columns:
     - `full_name` from name parts
     - `customer_name_preferred` choosing `company_name` when present, otherwise `full_name`
-  - `full_name` derivation contract:
-    - concatenate `title`, `first_name`, `middle_name`, `last_name`, `suffix` in that logical order using single spaces between non-null non-blank parts
-    - trim final result
-    - if final result is empty, set to null
 - `silver.customer_address`
   - Source: `bronze.customer_address`
   - Dedup key: `customer_id`, `address_id`, `address_type`
-  - Required source columns after snake_case: `customer_id`, `address_id`, `address_type`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `customer_id`
-    - `address_id`
-    - `address_type`
-    - `rowguid`
-    - `modified_date`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
   - Retain junction structure for later billing/shipping role-play logic
 - `silver.product`
   - Source: `bronze.product`
   - Key: `product_id`
   - Dedup key: `product_id`
-  - Required source columns after snake_case: `product_id`, `name`, `product_number`, `color`, `standard_cost`, `list_price`, `size`, `weight`, `product_category_id`, `product_model_id`, `sell_start_date`, `sell_end_date`, `discontinued_date`, `thumbnail_photo_file_name`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `product_id`
-    - `name`
-    - `product_number`
-    - `color`
-    - `standard_cost`
-    - `list_price`
-    - `size`
-    - `weight`
-    - `product_category_id`
-    - `product_model_id`
-    - `sell_start_date`
-    - `sell_end_date`
-    - `discontinued_date`
-    - `thumbnail_photo_file_name`
-    - `rowguid`
-    - `modified_date`
-    - `is_discontinued`
-    - `is_sellable_currently`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
+  - Retain: `name`, `product_number`, `color`, `standard_cost`, `list_price`, `size`, `weight`, `product_category_id`, `product_model_id`, `sell_start_date`, `sell_end_date`, `discontinued_date`, `thumbnail_photo_file_name`, `rowguid`, `modified_date`
   - Add derived flags:
     - `is_discontinued`
     - `is_sellable_currently`
@@ -319,90 +236,21 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Source: `bronze.product_category`
   - Key: `product_category_id`
   - Dedup key: `product_category_id`
-  - Required source columns after snake_case: `product_category_id`, `parent_product_category_id`, `name`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `product_category_id`
-    - `parent_product_category_id`
-    - `name`
-    - `rowguid`
-    - `modified_date`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
 - `silver.product_description`
   - Source: `bronze.product_description`
   - Key: `product_description_id`
   - Dedup key: `product_description_id`
-  - Required source columns after snake_case: `product_description_id`, `description`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `product_description_id`
-    - `description`
-    - `rowguid`
-    - `modified_date`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
 - `silver.product_model`
   - Source: `bronze.product_model`
   - Key: `product_model_id`
   - Dedup key: `product_model_id`
-  - Required source columns after snake_case: `product_model_id`, `name`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `product_model_id`
-    - `name`
-    - `rowguid`
-    - `modified_date`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
 - `silver.product_model_product_description`
   - Source: `bronze.product_model_product_description`
   - Dedup key: `product_model_id`, `product_description_id`, `culture`
-  - Required source columns after snake_case: `product_model_id`, `product_description_id`, `culture`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `product_model_id`
-    - `product_description_id`
-    - `culture`
-    - `rowguid`
-    - `modified_date`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
 - `silver.sales_order_header`
   - Source: `bronze.sales_order_header`
   - Key: `sales_order_id`
   - Dedup key: `sales_order_id`
-  - Required source columns after snake_case: `sales_order_id`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `sales_person`, `bill_to_address_id`, `ship_to_address_id`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `sales_order_id`
-    - `sales_order_number`
-    - `purchase_order_number`
-    - `account_number`
-    - `customer_id`
-    - `sales_person`
-    - `bill_to_address_id`
-    - `ship_to_address_id`
-    - `order_date`
-    - `due_date`
-    - `ship_date`
-    - `status`
-    - `online_order_flag`
-    - `ship_method`
-    - `sub_total`
-    - `tax_amt`
-    - `freight`
-    - `total_due`
-    - `rowguid`
-    - `modified_date`
-    - `order_date_key`
-    - `due_date_key`
-    - `ship_date_key`
-    - `order_year`
-    - `order_month`
-    - `order_status_desc`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
   - Retain transactional columns and add:
     - `order_date_key` as `yyyyMMdd` integer from `order_date`
     - `due_date_key` as `yyyyMMdd` integer from `due_date`
@@ -412,23 +260,6 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
   - Source: `bronze.sales_order_detail`
   - Key: `sales_order_id`, `sales_order_detail_id`
   - Dedup key: `sales_order_id`, `sales_order_detail_id`
-  - Required source columns after snake_case: `sales_order_id`, `sales_order_detail_id`, `order_qty`, `product_id`, `unit_price`, `unit_price_discount`, `line_total`, `rowguid`, `modified_date`
-  - Final output columns must be exactly:
-    - `sales_order_id`
-    - `sales_order_detail_id`
-    - `order_qty`
-    - `product_id`
-    - `unit_price`
-    - `unit_price_discount`
-    - `line_total`
-    - `rowguid`
-    - `modified_date`
-    - `gross_line_amount`
-    - `discount_amount`
-    - `net_line_amount`
-    - `silver_loaded_at_utc`
-    - `run_id`
-    - `record_hash`
   - Add derived columns:
     - `gross_line_amount = order_qty * unit_price`
     - `discount_amount = order_qty * unit_price * unit_price_discount`
@@ -436,26 +267,14 @@ Standardize names, types, deduplicate, remove clearly non-analytic sensitive/bin
 - `silver.v_get_all_categories`
   - Source: `bronze.v_get_all_categories`
   - Dedup key: `product_category_id`
-  - Required source columns after snake_case: validate actual Bronze schema first, then require at minimum `product_category_id`
-  - Final output columns:
-    - retain only validated source columns from the view after snake_case normalization
-    - plus `silver_loaded_at_utc`, `run_id`, `record_hash`
   - Use as optional hierarchy helper in Gold
 - `silver.v_product_and_description`
   - Source: `bronze.v_product_and_description`
   - Dedup key: `product_id`, `culture`
-  - Required source columns after snake_case: validate actual Bronze schema first, then require at minimum `product_id`, `culture`
-  - Final output columns:
-    - retain only validated source columns from the view after snake_case normalization
-    - plus `silver_loaded_at_utc`, `run_id`, `record_hash`
   - Optional multilingual product description helper
 - `silver.v_product_model_catalog_description`
   - Source: `bronze.v_product_model_catalog_description`
   - Dedup key: `product_model_id`
-  - Required source columns after snake_case: validate actual Bronze schema first, then require at minimum `product_model_id`
-  - Final output columns:
-    - retain only validated source columns from the view after snake_case normalization
-    - plus `silver_loaded_at_utc`, `run_id`, `record_hash`
   - Optional wide model attribute helper
 
 ### Silver modeling note
@@ -865,4 +684,527 @@ Apply at minimum these 5 standard tests across Bronze/Silver/Gold, plus targeted
 - Compare Bronze to Silver after dedup
 - Compare `silver.sales_order_detail` count to `gold.fact_sales`
 - Compare distinct `silver.customer.customer_id` count to `gold.dim_customer`
-- Compare distinct `silver.product.product
+- Compare distinct `silver.product.product_id` count to `gold.dim_product`
+
+2. No-null primary key tests
+- `customer.customer_id`
+- `address.address_id`
+- `product.product_id`
+- `product_category.product_category_id`
+- `product_model.product_model_id`
+- `sales_order_header.sales_order_id`
+- `sales_order_detail.sales_order_id`, `sales_order_detail.sales_order_detail_id`
+- `gold.dim_customer.customer_id`
+- `gold.dim_product.product_id`
+- `gold.fact_sales.sales_order_id`, `gold.fact_sales.sales_order_detail_id`
+
+3. Unique primary/composite key tests
+- `customer_id`
+- `address_id`
+- `product_id`
+- `product_category_id`
+- `product_model_id`
+- `sales_order_id`
+- `sales_order_id + sales_order_detail_id`
+- `customer_id + address_id + address_type`
+- `product_model_id + product_description_id + culture`
+- `gold.dim_customer.customer_id`
+- `gold.dim_product.product_id`
+- `gold.dim_sales.sales_person_clean`
+- `gold.fact_sales.sales_order_id + gold.fact_sales.sales_order_detail_id`
+
+4. Referential integrity tests
+- `sales_order_header.customer_id -> customer.customer_id`
+- `sales_order_header.ship_to_address_id -> address.address_id`
+- `sales_order_header.bill_to_address_id -> address.address_id`
+- `sales_order_detail.sales_order_id -> sales_order_header.sales_order_id`
+- `sales_order_detail.product_id -> product.product_id`
+- `product.product_category_id -> product_category.product_category_id`
+- `product.product_model_id -> product_model.product_model_id`
+- `customer_address.customer_id -> customer.customer_id`
+- `customer_address.address_id -> address.address_id`
+- `gold.fact_sales.customer_id -> gold.dim_customer.customer_id`
+- `gold.fact_sales.product_id -> gold.dim_product.product_id`
+- `gold.fact_sales.sales_person_clean -> gold.dim_sales.sales_person_clean`
+
+5. Domain/value checks
+- `order_qty > 0`
+- `unit_price >= 0`
+- `line_total >= 0`
+- `sub_total >= 0`, `tax_amt >= 0`, `freight >= 0`, `total_due >= 0`
+- `status` within known observed codes from source
+- `unit_price_discount` between 0 and 1 if represented as a rate
+- `ship_date >= order_date` when ship date is not null
+- `due_date >= order_date` when due date is not null
+
+## Semantic model
+Create a Direct Lake semantic model on top of the four persisted Gold tables only:
+- `gold.dim_customer`
+- `gold.dim_product`
+- `gold.dim_sales`
+- `gold.fact_sales`
+
+Do not introduce additional semantic tables such as a date dimension, address dimension, ship method dimension, or helper bridge tables for this run.
+
+### Semantic model tables
+- Dimensions:
+  - `dim_customer`
+  - `dim_product`
+  - `dim_sales`
+- Fact:
+  - `fact_sales`
+
+### Exposed columns by table
+Expose only the Gold output columns defined upstream.
+
+- `dim_customer`
+  - `customer_id`
+  - `customer_name_preferred`
+  - `full_name`
+  - `company_name`
+  - `sales_person`
+  - `email_address`
+  - `phone`
+  - `name_style`
+  - `customer_address_type`
+  - `customer_address_id`
+  - `customer_address_line1`
+  - `customer_address_line2`
+  - `customer_city`
+  - `customer_state_province`
+  - `customer_country_region`
+  - `customer_postal_code`
+  - `modified_date`
+
+- `dim_product`
+  - `product_id`
+  - `product_name`
+  - `product_number`
+  - `color`
+  - `size`
+  - `weight`
+  - `standard_cost`
+  - `list_price`
+  - `product_category_id`
+  - `product_model_id`
+  - `product_model_name`
+  - `product_description`
+  - `category`
+  - `subcategory`
+  - `is_discontinued`
+  - `is_sellable_currently`
+
+- `dim_sales`
+  - `sales_person_clean`
+
+- `fact_sales`
+  - `sales_order_id`
+  - `sales_order_detail_id`
+  - `customer_id`
+  - `product_id`
+  - `sales_person_clean`
+  - `sales_order_number`
+  - `purchase_order_number`
+  - `account_number`
+  - `order_date`
+  - `due_date`
+  - `ship_date`
+  - `status`
+  - `order_status_desc`
+  - `online_order_flag`
+  - `ship_method`
+  - `bill_to_address_id`
+  - `ship_to_address_id`
+  - `order_qty`
+  - `unit_price`
+  - `unit_price_discount`
+  - `gross_line_amount`
+  - `discount_amount`
+  - `net_line_amount`
+  - `sub_total`
+  - `tax_amt`
+  - `freight`
+  - `total_due`
+
+### Relationships
+Create a simple star schema with single-direction filter propagation from dimensions to fact.
+
+- `fact_sales[customer_id]` -> `dim_customer[customer_id]`
+- `fact_sales[product_id]` -> `dim_product[product_id]`
+- `fact_sales[sales_person_clean]` -> `dim_sales[sales_person_clean]`
+
+Relationship requirements:
+- Cardinality must reflect the Gold grains:
+  - `dim_customer` 1 -> * `fact_sales`
+  - `dim_product` 1 -> * `fact_sales`
+  - `dim_sales` 1 -> * `fact_sales`
+- Do not create relationships using `bill_to_address_id`, `ship_to_address_id`, `product_category_id`, or `product_model_id` because no corresponding semantic dimension tables are part of this run.
+
+### Date handling
+Keep dates directly on `fact_sales`; do not add a separate date table.
+
+- Primary reporting date: `fact_sales[order_date]`
+- Additional available dates:
+  - `fact_sales[due_date]`
+  - `fact_sales[ship_date]`
+
+Modeling note:
+- Set `order_date` as the default date field used in report visuals.
+- If auto date/time behavior is configurable, keep the design simple and avoid introducing extra semantic complexity beyond the three fact date columns already present.
+
+### Field organization and usability
+- Put descriptive customer attributes in the `dim_customer` table for browsing.
+- Put hierarchy-driving product attributes in the `dim_product` table:
+  - `category`
+  - `subcategory`
+  - `product_name`
+- Use `dim_sales[sales_person_clean]` as the only salesperson dimension attribute.
+- Keep degenerate order attributes on `fact_sales`:
+  - `sales_order_number`
+  - `purchase_order_number`
+  - `account_number`
+  - `status`
+  - `order_status_desc`
+  - `online_order_flag`
+  - `ship_method`
+
+### Hidden fields
+Hide fields that are mainly technical or likely to confuse report authors unless needed for detail views:
+- `fact_sales[sales_order_id]`
+- `fact_sales[sales_order_detail_id]`
+- `fact_sales[bill_to_address_id]`
+- `fact_sales[ship_to_address_id]`
+- `dim_customer[customer_address_id]`
+- `dim_product[product_category_id]`
+- `dim_product[product_model_id]`
+
+Keep visible:
+- business-descriptive columns
+- analytic measures
+- relationship keys only if needed for troubleshooting/model validation
+
+### Measures
+Create measures from `fact_sales` only, using exact Gold column names.
+
+Safe line-level measures:
+- `Sales Amount = SUM(fact_sales[net_line_amount])`
+- `Gross Sales Amount = SUM(fact_sales[gross_line_amount])`
+- `Discount Amount = SUM(fact_sales[discount_amount])`
+- `Order Quantity = SUM(fact_sales[order_qty])`
+- `Order Count = DISTINCTCOUNT(fact_sales[sales_order_id])`
+- `Customer Count = DISTINCTCOUNT(fact_sales[customer_id])`
+- `Product Count = DISTINCTCOUNT(fact_sales[product_id])`
+- `Salesperson Count = DISTINCTCOUNT(fact_sales[sales_person_clean])`
+- `Average Selling Price = DIVIDE([Sales Amount], [Order Quantity])`
+
+Header-repeated measures that must be labeled carefully:
+- `Header Sub Total = SUM(fact_sales[sub_total])`
+- `Header Tax Amount = SUM(fact_sales[tax_amt])`
+- `Header Freight Amount = SUM(fact_sales[freight])`
+- `Header Total Due = SUM(fact_sales[total_due])`
+- `Average Header Total Due per Order = DIVIDE([Header Total Due], [Order Count])`
+
+Recommended measure descriptions:
+- `Sales Amount`, `Gross Sales Amount`, `Discount Amount`, and `Order Quantity` are line-safe and preferred for most analysis.
+- `Header Sub Total`, `Header Tax Amount`, `Header Freight Amount`, and `Header Total Due` are repeated from header onto each order line in `fact_sales` and may overstate totals when aggregated across multiple lines per order.
+
+### Semantic model notes
+- Product hierarchy analysis must use:
+  - `dim_product[category]`
+  - `dim_product[subcategory]`
+  - `dim_product[product_name]`
+- Salesperson analysis must use `dim_sales[sales_person_clean]` or `fact_sales[sales_person_clean]`, with the dimension preferred for slicers and grouping.
+- Customer geography analysis must use the flattened address columns already present in `dim_customer`.
+- `dim_customer[sales_person]` is a customer attribute from the customer source and is not the same business role as the cleaned salesperson dimension derived from sales order header. Prefer `dim_sales[sales_person_clean]` for order/salesperson analysis.
+
+## Report
+Build a Power BI report strictly aligned to the four-table Gold model:
+- `dim_customer`
+- `dim_product`
+- `dim_sales`
+- `fact_sales`
+
+Use only the semantic model fields and measures defined above. Prefer line-safe measures for most visuals.
+
+### Page 1: Sales Overview
+Visuals:
+- KPI cards:
+  - `Sales Amount`
+  - `Order Count`
+  - `Customer Count`
+  - `Salesperson Count`
+- Line chart:
+  - Axis: `fact_sales[order_date]`
+  - Values: `Sales Amount`
+- Clustered bar chart:
+  - Axis: `dim_sales[sales_person_clean]`
+  - Values: `Sales Amount`
+- Clustered column chart:
+  - Axis: `dim_product[category]`
+  - Legend: `dim_product[subcategory]`
+  - Values: `Sales Amount`
+- Donut chart:
+  - Legend: `fact_sales[online_order_flag]`
+  - Values: `Sales Amount`
+
+Slicers:
+- `fact_sales[order_date]`
+- `dim_sales[sales_person_clean]`
+- `dim_product[category]`
+- `dim_product[subcategory]`
+- `dim_customer[customer_name_preferred]`
+
+### Page 2: Product Analysis
+Visuals:
+- Matrix:
+  - Rows: `dim_product[category]` > `dim_product[subcategory]` > `dim_product[product_name]`
+  - Values:
+    - `Sales Amount`
+    - `Order Quantity`
+    - `Discount Amount`
+- Bar chart:
+  - Axis: `dim_product[product_name]`
+  - Values: `Sales Amount`
+  - Visual filter: Top N products by `Sales Amount`
+- Scatter chart:
+  - X-axis: `dim_product[list_price]`
+  - Y-axis: `Sales Amount`
+  - Details: `dim_product[product_name]`
+  - Optional size: `Order Quantity`
+- Detail table:
+  - `dim_product[product_name]`
+  - `dim_product[product_number]`
+  - `dim_product[product_model_name]`
+  - `dim_product[product_description]`
+  - `dim_product[color]`
+  - `dim_product[size]`
+  - `dim_product[weight]`
+  - `dim_product[list_price]`
+  - `dim_product[standard_cost]`
+  - `dim_product[is_discontinued]`
+  - `dim_product[is_sellable_currently]`
+  - `Sales Amount`
+  - `Order Quantity`
+
+Slicers:
+- `dim_product[category]`
+- `dim_product[subcategory]`
+- `dim_product[is_discontinued]`
+- `dim_product[is_sellable_currently]`
+
+### Page 3: Customer Analysis
+Visuals:
+- Bar chart:
+  - Axis: `dim_customer[customer_name_preferred]`
+  - Values: `Sales Amount`
+  - Visual filter: Top N customers by `Sales Amount`
+- Table:
+  - `dim_customer[customer_name_preferred]`
+  - `dim_customer[full_name]`
+  - `dim_customer[company_name]`
+  - `dim_customer[email_address]`
+  - `dim_customer[phone]`
+  - `dim_customer[customer_address_type]`
+  - `dim_customer[customer_address_line1]`
+  - `dim_customer[customer_address_line2]`
+  - `dim_customer[customer_city]`
+  - `dim_customer[customer_state_province]`
+  - `dim_customer[customer_country_region]`
+  - `dim_customer[customer_postal_code]`
+  - `Order Count`
+  - `Sales Amount`
+- Map or filled map:
+  - Location: use available fields from `dim_customer`, preferring:
+    - `customer_country_region`
+    - `customer_state_province`
+    - `customer_city`
+  - Values: `Sales Amount`
+- Column chart:
+  - Axis: `dim_customer[customer_country_region]` or `dim_customer[customer_city]`
+  - Values: `Sales Amount`
+
+Slicers:
+- `dim_customer[customer_name_preferred]`
+- `dim_customer[customer_country_region]`
+- `dim_customer[customer_state_province]`
+- `dim_customer[customer_city]`
+- `dim_sales[sales_person_clean]`
+
+### Page 4: Salesperson Analysis
+Visuals:
+- Bar chart:
+  - Axis: `dim_sales[sales_person_clean]`
+  - Values: `Sales Amount`
+- Column chart:
+  - Axis: `dim_sales[sales_person_clean]`
+  - Values: `Order Count`
+- Table:
+  - `dim_sales[sales_person_clean]`
+  - `Sales Amount`
+  - `Order Count`
+  - `Customer Count`
+  - `Product Count`
+- Stacked column chart:
+  - Axis: `dim_sales[sales_person_clean]`
+  - Legend: `dim_product[category]`
+  - Values: `Sales Amount`
+- Detail table:
+  - `dim_sales[sales_person_clean]`
+  - `dim_customer[customer_name_preferred]`
+  - `dim_product[product_name]`
+  - `fact_sales[order_date]`
+  - `fact_sales[order_qty]`
+  - `fact_sales[net_line_amount]`
+
+Slicers:
+- `fact_sales[order_date]`
+- `dim_product[category]`
+- `dim_product[subcategory]`
+
+### Page 5: Order Detail
+Visuals:
+- Detail table:
+  - `fact_sales[sales_order_number]`
+  - `fact_sales[sales_order_id]`
+  - `fact_sales[sales_order_detail_id]`
+  - `fact_sales[order_date]`
+  - `fact_sales[due_date]`
+  - `fact_sales[ship_date]`
+  - `dim_customer[customer_name_preferred]`
+  - `dim_product[product_name]`
+  - `dim_sales[sales_person_clean]`
+  - `fact_sales[status]`
+  - `fact_sales[order_status_desc]`
+  - `fact_sales[online_order_flag]`
+  - `fact_sales[ship_method]`
+  - `fact_sales[order_qty]`
+  - `fact_sales[unit_price]`
+  - `fact_sales[unit_price_discount]`
+  - `fact_sales[gross_line_amount]`
+  - `fact_sales[discount_amount]`
+  - `fact_sales[net_line_amount]`
+- Decomposition tree:
+  - Analyze: `Sales Amount`
+  - Explain by:
+    - `dim_product[category]`
+    - `dim_product[subcategory]`
+    - `dim_product[product_name]`
+    - `dim_customer[customer_name_preferred]`
+    - `dim_sales[sales_person_clean]`
+- Drillthrough target:
+  - Allow drillthrough by:
+    - customer
+    - product
+    - salesperson
+
+### Report authoring rules
+- Default trend visuals to `fact_sales[order_date]`.
+- Use `dim_product[category]` and `dim_product[subcategory]` for product hierarchy; do not use `product_category_id` in user-facing visuals.
+- Use only `dim_sales[sales_person_clean]` for salesperson grouping and slicers.
+- For customer geography visuals, use only the flattened address fields from `dim_customer`.
+- Prefer these measures in visuals:
+  - `Sales Amount`
+  - `Gross Sales Amount`
+  - `Discount Amount`
+  - `Order Quantity`
+  - `Order Count`
+
+### Header-total caution in report
+Because `fact_sales` contains header-level fields repeated at line grain:
+- avoid using `Header Sub Total`
+- avoid using `Header Tax Amount`
+- avoid using `Header Freight Amount`
+- avoid using `Header Total Due`
+
+in charts or totals across many order lines unless the report explicitly communicates that these are repeated header amounts. If they are shown at all, restrict them to order-detail contexts or clearly labeled exploratory pages.
+
+## Data Agent
+Create an AISkill grounded only on the semantic model built from:
+- `dim_customer`
+- `dim_product`
+- `dim_sales`
+- `fact_sales`
+
+### Role
+Sales analytics assistant for order-line sales, customer attributes, product hierarchy, and cleaned salesperson analysis based on the curated Gold model.
+
+### Grounding hints
+- The core business process is sales at order-line grain in `fact_sales`.
+- The salesperson dimension is `dim_sales`, built from cleaned values derived from sales order header.
+- Cleaned salesperson logic removes:
+  - the leading `adventureworks/` prefix, case-insensitively
+  - trailing digits at the end of the name
+- Customer analysis uses `dim_customer`, which contains one row per `customer_id` and only one flattened address per customer based on the Gold ranking rule.
+- Product analysis uses `dim_product`, where:
+  - `subcategory` is the child product category directly tied to the product
+  - `category` is the parent product category
+- Date analysis should default to `fact_sales[order_date]` unless the user explicitly asks for due date or ship date.
+
+### Preferred business terms
+Map user phrasing to model fields as follows:
+- customer / company -> `dim_customer[customer_name_preferred]`, `dim_customer[company_name]`, `dim_customer[full_name]`
+- salesperson / sales rep -> `dim_sales[sales_person_clean]`
+- category -> `dim_product[category]`
+- subcategory -> `dim_product[subcategory]`
+- product -> `dim_product[product_name]`
+- sales / revenue -> `Sales Amount`
+- discount -> `Discount Amount`
+- quantity / units -> `Order Quantity`
+- orders -> `Order Count`
+
+### Starter questions
+- What are total sales and order count by month?
+- Which salespersons have the highest sales amount?
+- Which categories and subcategories generate the most sales?
+- Which products have the highest sales amount and order quantity?
+- Which customers contribute the most sales?
+- Which customer cities, states, or countries generate the most sales?
+- How do online and non-online orders compare by sales amount?
+- What discounts were given by category, subcategory, product, or salesperson?
+- Which order lines have the highest net line amount?
+- How do sales trends differ by cleaned salesperson over time?
+
+### Guardrails
+- Answer only from the grounded semantic model and exposed measures/fields.
+- Use `dim_sales[sales_person_clean]` as the authoritative salesperson attribute.
+- Do not confuse `dim_customer[sales_person]` with the cleaned salesperson dimension used for sales analysis.
+- Do not invent unsupported concepts such as margin, profit, cost-to-serve, returns, commissions, quotas, inventory, or forecasts unless explicitly modeled.
+- Do not use technical IDs in narrative answers unless the user asks for them.
+- Do not use hidden or non-business fields unless needed for precise drillthrough-style answers.
+- When answering geography questions, rely only on:
+  - `dim_customer[customer_city]`
+  - `dim_customer[customer_state_province]`
+  - `dim_customer[customer_country_region]`
+  - `dim_customer[customer_postal_code]`
+- When the user asks for category analysis, use `category` and `subcategory`, not raw category IDs.
+
+### Numerical reasoning guidance
+Prefer these measures for most answers:
+- `Sales Amount`
+- `Gross Sales Amount`
+- `Discount Amount`
+- `Order Quantity`
+- `Order Count`
+- `Customer Count`
+- `Product Count`
+- `Salesperson Count`
+
+Use caution with these header-repeated fields/measures:
+- `sub_total`
+- `tax_amt`
+- `freight`
+- `total_due`
+- `Header Sub Total`
+- `Header Tax Amount`
+- `Header Freight Amount`
+- `Header Total Due`
+
+If asked about those values, warn that they are stored on line-grain rows in `fact_sales` and may be repeated across multiple lines for the same order.
+
+### Response style rules
+- Default to concise business answers with the key number, grouping, and timeframe.
+- If the user asks for trends, use `order_date`.
+- If the user asks for top performers, rank by `Sales Amount` unless they specify another metric.
+- If the user asks for location-based analysis, aggregate by customer geography from `dim_customer`.
+- If the user asks for salesperson performance, group by cleaned salesperson only.
+- If a question is ambiguous between customer sales person and order-header salesperson, assume the user means the cleaned salesperson from `dim_sales` and state that assumption briefly if needed.
