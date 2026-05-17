@@ -16,6 +16,13 @@
   - Sharpened `## Gold` with exact required Silver column names, explicit intermediate join paths, deterministic row-reduction rules, and a prohibition on using any non-specified columns in `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
   - Added explicit fallback behavior for missing optional descriptive columns so the build omits them rather than guessing alternate names or failing the session.
 
+### Iteration 3 — 2026-05-17 18:47:02Z — failed layer: silver (run: 20260517-182339-0da9f8)
+- **Root cause (1-line summary)**: Silver build likely submitted multiple dependent statements in one Spark session, so one table failure cancelled the entire session without enough table-specific shape validation.
+- **What was changed**:
+  - Tightened `## Generic guidance` to require isolated Silver builds with one table per validation/transform/write sequence and no chained SQL scripts or shared temp-view dependency chains across Silver tables.
+  - Sharpened `## Silver` with mandatory exact snake_case column mappings for all base tables used downstream and explicit instructions to fail fast per table when required columns are missing.
+  - Added Silver output-shape constraints for `customer`, `customer_address`, `product`, `product_category`, `product_description`, `product_model`, `product_model_product_description`, `sales_order_header`, and `sales_order_detail` so downstream Gold-required columns are guaranteed.
+
 ## Inputs
 - Workspace: `842742ca-c3dd-46d6-b034-f4d7cddc8d5c`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -64,6 +71,9 @@ Cross-cutting code rules:
 - For each Gold table, create a narrow intermediate dataframe immediately after each join path and keep only the explicitly required columns for the next step. Do not carry unused columns forward.
 - If an optional output column is not available from the exact specified Silver source column, omit that output column from the Gold table rather than inferring a substitute column name.
 - Before writing any Gold table, assert both conditions: expected output columns exist and the dataframe grain matches the spec's key uniqueness rule.
+- Silver notebooks must build each Silver table in an isolated step: one source-read validation step, one rename/type/cleaning step, one dedup step, one write step. Do not execute a single multi-statement SQL script or a long dependency chain across Silver tables in one session.
+- For Silver, fail fast per table with a clear error if any required source column for that table is missing after Bronze read; do not continue to subsequent Silver tables after a required-column failure in the current table.
+- For Silver base tables that feed Gold, do not guess column names from views or alternates. Use the exact Bronze source columns defined in the Silver table specification below and emit the exact snake_case output column names defined there.
 
 Notebook authoring rule for every generated notebook:
 - EACH code cell must start with a short markdown comment block using Python comments.
@@ -172,102 +182,279 @@ Standard Silver objectives:
   - `ingest_run_id`
 - Standardize null handling, trim strings, normalize booleans, and derive lightweight helper columns.
 - Run `OPTIMIZE` after load for larger tables; focus on `silver.sales_order_header`, `silver.sales_order_detail`, and `silver.product`.
+- Build and write each Silver table independently; no shared temp-view chain across multiple Silver outputs.
+- For each Silver table below, first validate the exact Bronze source columns named in the mapping/spec. If any required source column is missing, fail that table immediately with a clear error that names the missing column(s) and table.
 
 Silver table specifications:
 
 ### `silver.address`
-- Rename examples:
-  - `AddressID` -> `address_id`
-  - `AddressLine1` -> `address_line1`
-  - `StateProvince` -> `state_province`
-  - `CountryRegion` -> `country_region`
-  - `ModifiedDate` -> `modified_date`
-- Dedup key: `address_id`
-- Dedup rule: keep latest `modified_date`, tie-break on `_ingest_ts`
-- Cleaning:
-  - trim all string columns
-  - standardize empty strings to null for `address_line2`
-  - uppercase or title-case location fields only if business approves; default is preserve original values
+Required Bronze source: `bronze.address`
+
+Required source-to-target mappings:
+- `AddressID` -> `address_id`
+- `AddressLine1` -> `address_line1`
+- `AddressLine2` -> `address_line2`
+- `City` -> `city`
+- `StateProvince` -> `state_province`
+- `CountryRegion` -> `country_region`
+- `PostalCode` -> `postal_code`
+- `ModifiedDate` -> `modified_date`
+
+Optional passthrough mappings if present:
+- `rowguid` -> `rowguid`
+
+Required output columns:
+- `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`, `modified_date`
+- plus standard Silver audit columns
+
+Dedup key: `address_id`
+Dedup rule: keep latest `modified_date`, tie-break on `_ingest_ts`
+Cleaning:
+- trim all string columns
+- standardize empty strings to null for `address_line2`
+- uppercase or title-case location fields only if business approves; default is preserve original values
 
 ### `silver.customer`
-- Dedup key: `customer_id`
-- Dedup rule: keep latest `modified_date`
-- Cleaning:
-  - derive `full_name` from available title/first/middle/last/suffix without overwriting source components
-  - trim `email_address`, lower-case email for matching helper column `email_address_normalized`
-  - keep `password_hash` and `password_salt` in Silver only if strictly needed downstream; default recommendation is to retain in Silver restricted zone but exclude from Gold
-- Sensitive data note:
-  - Gold should not expose `password_hash`, `password_salt`, possibly not even raw email/phone unless required
+Required Bronze source: `bronze.customer`
+
+Required source-to-target mappings:
+- `CustomerID` -> `customer_id`
+- `NameStyle` -> `name_style`
+- `Title` -> `title`
+- `FirstName` -> `first_name`
+- `MiddleName` -> `middle_name`
+- `LastName` -> `last_name`
+- `Suffix` -> `suffix`
+- `CompanyName` -> `company_name`
+- `EmailAddress` -> `email_address`
+- `Phone` -> `phone`
+- `PasswordHash` -> `password_hash`
+- `PasswordSalt` -> `password_salt`
+- `ModifiedDate` -> `modified_date`
+
+Optional passthrough mappings if present:
+- `SalesPerson` -> `sales_person`
+- `rowguid` -> `rowguid`
+
+Required output columns:
+- `customer_id`, `name_style`, `title`, `first_name`, `middle_name`, `last_name`, `suffix`, `company_name`, `modified_date`
+- derived `full_name`
+- plus standard Silver audit columns
+
+Optional output columns if exact sources exist:
+- `email_address`, `phone`, `password_hash`, `password_salt`, `sales_person`
+
+Dedup key: `customer_id`
+Dedup rule: keep latest `modified_date`
+Cleaning:
+- derive `full_name` from available title/first/middle/last/suffix without overwriting source components
+- trim `email_address`, lower-case email for matching helper column `email_address_normalized`
+- keep `password_hash` and `password_salt` in Silver only if strictly needed downstream; default recommendation is to retain in Silver restricted zone but exclude from Gold
+Sensitive data note:
+- Gold should not expose `password_hash`, `password_salt`, possibly not even raw email/phone unless required
 
 ### `silver.customer_address`
-- Dedup key: (`customer_id`, `address_id`, `address_type`)
-- Alternative if duplicate address types appear unexpectedly: dedup on (`customer_id`, `address_id`) and keep latest `modified_date`
-- Cleaning:
-  - trim `address_type`
-  - validate foreign keys against `silver.customer.customer_id` and `silver.address.address_id`
+Required Bronze source: `bronze.customer_address`
+
+Required source-to-target mappings:
+- `CustomerID` -> `customer_id`
+- `AddressID` -> `address_id`
+- `AddressType` -> `address_type`
+- `ModifiedDate` -> `modified_date`
+
+Required output columns:
+- `customer_id`, `address_id`, `address_type`, `modified_date`
+- plus standard Silver audit columns
+
+Dedup key: (`customer_id`, `address_id`, `address_type`)
+Alternative if duplicate address types appear unexpectedly: dedup on (`customer_id`, `address_id`) and keep latest `modified_date`
+Cleaning:
+- trim `address_type`
+- validate foreign keys against `silver.customer.customer_id` and `silver.address.address_id`
 
 ### `silver.product`
-- Dedup key: `product_id`
-- Dedup rule: keep latest `modified_date`
-- Cleaning:
-  - standardize text attributes: `name`, `product_number`, `color`, `size`, `thumbnail_photo_file_name`
-  - derive flags:
-    - `is_discontinued` from `discontinued_date is not null`
-    - `is_currently_sellable` from sell start/end/discontinued dates
-  - keep `thumbnail_photo` in Silver but exclude from Gold and semantic model
-- FK expectations:
-  - `product_category_id` -> `silver.product_category.product_category_id`
-  - `product_model_id` -> `silver.product_model.product_model_id`
+Required Bronze source: `bronze.product`
+
+Required source-to-target mappings:
+- `ProductID` -> `product_id`
+- `Name` -> `name`
+- `ProductNumber` -> `product_number`
+- `Color` -> `color`
+- `Size` -> `size`
+- `StandardCost` -> `standard_cost`
+- `ListPrice` -> `list_price`
+- `ProductCategoryID` -> `product_category_id`
+- `ProductModelID` -> `product_model_id`
+- `SellStartDate` -> `sell_start_date`
+- `SellEndDate` -> `sell_end_date`
+- `DiscontinuedDate` -> `discontinued_date`
+- `ThumbNailPhoto` -> `thumbnail_photo`
+- `ThumbnailPhotoFileName` -> `thumbnail_photo_file_name`
+- `ModifiedDate` -> `modified_date`
+
+Required output columns:
+- `product_id`, `name`, `product_number`, `standard_cost`, `list_price`, `product_category_id`, `product_model_id`, `sell_start_date`, `sell_end_date`, `discontinued_date`, `modified_date`
+- derived `is_discontinued`, `is_currently_sellable`
+- plus standard Silver audit columns
+
+Optional output columns if exact sources exist:
+- `color`, `size`, `thumbnail_photo`, `thumbnail_photo_file_name`
+
+Dedup key: `product_id`
+Dedup rule: keep latest `modified_date`
+Cleaning:
+- standardize text attributes: `name`, `product_number`, `color`, `size`, `thumbnail_photo_file_name`
+- derive flags:
+  - `is_discontinued` from `discontinued_date is not null`
+  - `is_currently_sellable` from sell start/end/discontinued dates
+- keep `thumbnail_photo` in Silver but exclude from Gold and semantic model
+FK expectations:
+- `product_category_id` -> `silver.product_category.product_category_id`
+- `product_model_id` -> `silver.product_model.product_model_id`
 
 ### `silver.product_category`
-- Dedup key: `product_category_id`
-- Dedup rule: keep latest `modified_date`
-- Cleaning:
-  - preserve `parent_product_category_id` for hierarchy
-  - derive hierarchy helper later in Gold
+Required Bronze source: `bronze.product_category`
+
+Required source-to-target mappings:
+- `ProductCategoryID` -> `product_category_id`
+- `ParentProductCategoryID` -> `parent_product_category_id`
+- `Name` -> `name`
+- `ModifiedDate` -> `modified_date`
+
+Required output columns:
+- `product_category_id`, `parent_product_category_id`, `name`, `modified_date`
+- plus standard Silver audit columns
+
+Dedup key: `product_category_id`
+Dedup rule: keep latest `modified_date`
+Cleaning:
+- preserve `parent_product_category_id` for hierarchy
+- derive hierarchy helper later in Gold
 
 ### `silver.product_description`
-- Dedup key: `product_description_id`
-- Dedup rule: keep latest `modified_date`
-- Cleaning:
-  - trim `description`
+Required Bronze source: `bronze.product_description`
+
+Required source-to-target mappings:
+- `ProductDescriptionID` -> `product_description_id`
+- `Description` -> `description`
+- `ModifiedDate` -> `modified_date`
+
+Required output columns:
+- `product_description_id`, `description`, `modified_date`
+- plus standard Silver audit columns
+
+Dedup key: `product_description_id`
+Dedup rule: keep latest `modified_date`
+Cleaning:
+- trim `description`
 
 ### `silver.product_model`
-- Dedup key: `product_model_id`
-- Dedup rule: keep latest `modified_date`
-- Cleaning:
-  - retain `catalog_description` as large text
-  - trim `name`
+Required Bronze source: `bronze.product_model`
+
+Required source-to-target mappings:
+- `ProductModelID` -> `product_model_id`
+- `Name` -> `name`
+- `CatalogDescription` -> `catalog_description`
+- `ModifiedDate` -> `modified_date`
+
+Required output columns:
+- `product_model_id`, `name`, `modified_date`
+- plus standard Silver audit columns
+
+Optional output columns if exact source exists:
+- `catalog_description`
+
+Dedup key: `product_model_id`
+Dedup rule: keep latest `modified_date`
+Cleaning:
+- retain `catalog_description` as large text
+- trim `name`
 
 ### `silver.product_model_product_description`
-- Dedup key: (`product_model_id`, `product_description_id`, `culture`)
-- Dedup rule: keep latest `modified_date`
-- Cleaning:
-  - normalize `culture` to lower-case
-  - validate FKs to `product_model` and `product_description`
+Required Bronze source: `bronze.product_model_product_description`
+
+Required source-to-target mappings:
+- `ProductModelID` -> `product_model_id`
+- `ProductDescriptionID` -> `product_description_id`
+- `Culture` -> `culture`
+- `ModifiedDate` -> `modified_date`
+
+Required output columns:
+- `product_model_id`, `product_description_id`, `culture`, `modified_date`
+- plus standard Silver audit columns
+
+Dedup key: (`product_model_id`, `product_description_id`, `culture`)
+Dedup rule: keep latest `modified_date`
+Cleaning:
+- normalize `culture` to lower-case
+- validate FKs to `product_model` and `product_description`
 
 ### `silver.sales_order_header`
-- Dedup key: `sales_order_id`
-- Dedup rule: keep latest `modified_date`
-- Cleaning:
-  - derive `order_date_key`, `due_date_key`, `ship_date_key` as `yyyyMMdd` integers
-  - derive `order_year`, `order_month`
-  - normalize `online_order_flag`
-  - trim `sales_order_number`, `purchase_order_number`, `account_number`, `ship_method`
-- FK expectations:
-  - `customer_id` -> `silver.customer.customer_id`
-  - `ship_to_address_id` -> `silver.address.address_id`
-  - `bill_to_address_id` -> `silver.address.address_id`
+Required Bronze source: `bronze.sales_order_header`
+
+Required source-to-target mappings:
+- `SalesOrderID` -> `sales_order_id`
+- `SalesOrderNumber` -> `sales_order_number`
+- `PurchaseOrderNumber` -> `purchase_order_number`
+- `AccountNumber` -> `account_number`
+- `CustomerID` -> `customer_id`
+- `SalesPerson` -> `sales_person`
+- `OrderDate` -> `order_date`
+- `DueDate` -> `due_date`
+- `ShipDate` -> `ship_date`
+- `ShipMethod` -> `ship_method`
+- `BillToAddressID` -> `bill_to_address_id`
+- `ShipToAddressID` -> `ship_to_address_id`
+- `OnlineOrderFlag` -> `online_order_flag`
+- `SubTotal` -> `sub_total`
+- `TaxAmt` -> `tax_amt`
+- `Freight` -> `freight`
+- `TotalDue` -> `total_due`
+- `ModifiedDate` -> `modified_date`
+
+Required output columns:
+- `sales_order_id`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `sales_person`, `order_date`, `due_date`, `ship_date`, `ship_method`, `bill_to_address_id`, `ship_to_address_id`, `online_order_flag`, `sub_total`, `tax_amt`, `freight`, `total_due`, `modified_date`
+- derived `order_date_key`, `due_date_key`, `ship_date_key`, `order_year`, `order_month`
+- plus standard Silver audit columns
+
+Dedup key: `sales_order_id`
+Dedup rule: keep latest `modified_date`
+Cleaning:
+- derive `order_date_key`, `due_date_key`, `ship_date_key` as `yyyyMMdd` integers
+- derive `order_year`, `order_month`
+- normalize `online_order_flag`
+- trim `sales_order_number`, `purchase_order_number`, `account_number`, `ship_method`
+FK expectations:
+- `customer_id` -> `silver.customer.customer_id`
+- `ship_to_address_id` -> `silver.address.address_id`
+- `bill_to_address_id` -> `silver.address.address_id`
 
 ### `silver.sales_order_detail`
-- Dedup key: (`sales_order_id`, `sales_order_detail_id`)
-- Dedup rule: keep latest `modified_date`
-- Cleaning:
-  - cast numeric fields explicitly
-  - derive `net_unit_price = unit_price - unit_price_discount`
-  - validate FKs:
-    - `sales_order_id` -> `silver.sales_order_header.sales_order_id`
-    - `product_id` -> `silver.product.product_id`
+Required Bronze source: `bronze.sales_order_detail`
+
+Required source-to-target mappings:
+- `SalesOrderID` -> `sales_order_id`
+- `SalesOrderDetailID` -> `sales_order_detail_id`
+- `ProductID` -> `product_id`
+- `OrderQty` -> `order_qty`
+- `UnitPrice` -> `unit_price`
+- `UnitPriceDiscount` -> `unit_price_discount`
+- `LineTotal` -> `line_total`
+- `ModifiedDate` -> `modified_date`
+
+Required output columns:
+- `sales_order_id`, `sales_order_detail_id`, `product_id`, `order_qty`, `unit_price`, `unit_price_discount`, `line_total`, `modified_date`
+- derived `net_unit_price`
+- plus standard Silver audit columns
+
+Dedup key: (`sales_order_id`, `sales_order_detail_id`)
+Dedup rule: keep latest `modified_date`
+Cleaning:
+- cast numeric fields explicitly
+- derive `net_unit_price = unit_price - unit_price_discount`
+- validate FKs:
+  - `sales_order_id` -> `silver.sales_order_header.sales_order_id`
+  - `product_id` -> `silver.product.product_id`
 
 ### `silver.v_get_all_categories`
 - Dedup key: `product_category_id`
