@@ -1,5 +1,14 @@
 # Run Spec 20260517-170731-a2063c
 
+## Updated specs
+
+### Iteration 1 — 2026-05-17 17:26:31Z — failed layer: gold (run: 20260517-171759-e350b8)
+- **Root cause (1-line summary)**: Gold build likely failed due to unresolved/incorrect join columns and ambiguous self-join logic in `dim_product` and `dim_customer`, especially around category self-join, English description filtering, and `Main Office` address selection.
+- **What was changed**:
+  - Tightened **Generic guidance** to require schema assertions and alias-qualified joins for all Gold builds, especially self-joins and bridge-table joins.
+  - Added an explicit **Gold** section defining required source tables, exact join paths, join keys, culture/address filters, self-join aliases, and output columns for `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
+  - Clarified salesperson cleaning and customer address fallback behavior to avoid duplicate rows and missing-column assumptions.
+
 ## Inputs
 - Workspace: `581484c6-28a0-48c9-8931-644c455e9376`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -27,7 +36,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules:
 - Use defensive column references in every transformation: assert required columns exist before select, rename, join, filter, aggregate, or write.
@@ -42,6 +51,10 @@ Cross-cutting code rules:
 - Enforce snake_case naming in Silver and Gold.
 - Never silently drop unexpected duplicates; quarantine or log them where business keys should be unique.
 - Treat binary/image columns carefully; keep in Bronze, and only propagate to Silver/Gold if there is a clear reporting use case.
+- In Gold, do not infer join keys from similar names; use only explicitly validated columns present in Silver.
+- For every Gold join, assert the exact required columns before execution and use fully aliased DataFrames (`c`, `ca`, `a`, `p`, `pc_child`, `pc_parent`, `pm`, `pmpd`, `pd`, `soh`, `sod`).
+- For self-joins, bridge tables, and filtered helper joins, never use `select("*")`; project only named output columns from the correct alias after the join.
+- If a requested business filter yields no rows for some entities, preserve the base grain with a left join unless the spec explicitly requires row exclusion.
 
 Notebook cell comment requirement:
 - EACH code cell must start with a short markdown-style comment block using Python comments.
@@ -306,6 +319,160 @@ Dim_Customer -> join customer, customeraddress, address (notice there are multip
 Dim_Product -> join product, productcategory, productdescription, productmodel, productmodelproductdescription. Please notice that in productcategory there is a self join. So in the end I have the category (which is the parent category) and a subcategory. Also notice that in productmodelproductdescription there is a culture field, filter this on en
 Dim_Sales --> Use the salesperson field from salesorderheader, but remove the adventureworks/ in front of the name and remove the last number at the end off the name
 Fact_Sales --> join salesorderdetail and salesorderheader and keep all relevant fields
+
+## Gold
+Build business-facing Gold tables in `gold` schema using only explicitly validated Silver columns.
+
+### Common Gold rules
+- Gold naming must be snake_case table and column names.
+- All Gold joins must use aliased DataFrames and explicit join predicates; no natural joins and no unqualified column references.
+- Before building each Gold table, assert the required input columns exist exactly as named in Silver.
+- After each join, select only the final target columns listed below; do not carry duplicate source columns forward.
+- Preserve the requested base grain for each dimension/fact and prevent accidental row multiplication from bridge tables.
+- Write Gold tables in overwrite mode for this initial full build.
+
+### gold.dim_customer
+- Base grain: one row per `customer_id`.
+- Required inputs:
+  - `silver.customer`: `customer_id`, `full_name`, `company_name`, `sales_person`, `email_address`, `phone`
+  - `silver.customer_address`: `customer_id`, `address_id`, `address_type`
+  - `silver.address`: `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`
+- Join path:
+  - start from `silver.customer` as `c`
+  - left join filtered `silver.customer_address` as `ca` on `c.customer_id = ca.customer_id`
+  - left join `silver.address` as `a` on `ca.address_id = a.address_id`
+- Address filter rule:
+  - filter `silver.customer_address` to `address_type = 'Main Office'` after trimming
+  - comparison should be exact on the cleaned value `Main Office`
+- Duplicate prevention rule:
+  - if more than one `Main Office` row exists for the same `customer_id`, keep exactly one deterministic row using:
+    1. lowest `address_id`
+    2. then latest `modified_date` if needed
+  - quarantine any additional `Main Office` duplicates
+- Missing address rule:
+  - keep all customers even when no `Main Office` address exists; address fields may be null
+- Output columns:
+  - `customer_id`
+  - `full_name`
+  - `company_name`
+  - `sales_person`
+  - `email_address`
+  - `phone`
+  - `address_type`
+  - `address_id`
+  - `address_line1`
+  - `address_line2`
+  - `city`
+  - `state_province`
+  - `country_region`
+  - `postal_code`
+
+### gold.dim_product
+- Base grain: one row per `product_id`.
+- Required inputs:
+  - `silver.product`: `product_id`, `name`, `product_number`, `color`, `size`, `weight`, `standard_cost`, `list_price`, `product_category_id`, `product_model_id`, `sell_start_date`, `sell_end_date`, `discontinued_date`
+  - `silver.product_category`: `product_category_id`, `parent_product_category_id`, `name`
+  - `silver.product_model`: `product_model_id`, `name`
+  - `silver.product_model_product_description`: `product_model_id`, `product_description_id`, `culture`
+  - `silver.product_description`: `product_description_id`, `description`
+- Authoritative lineage rule:
+  - build `dim_product` from base tables only; do not substitute `silver.v_get_all_categories` or `silver.v_product_and_description` for the core join path
+- Join path:
+  - start from `silver.product` as `p`
+  - left join `silver.product_category` as `pc_child` on `p.product_category_id = pc_child.product_category_id`
+  - left join `silver.product_category` as `pc_parent` on `pc_child.parent_product_category_id = pc_parent.product_category_id`
+  - left join `silver.product_model` as `pm` on `p.product_model_id = pm.product_model_id`
+  - left join filtered `silver.product_model_product_description` as `pmpd` on `p.product_model_id = pmpd.product_model_id`
+  - left join `silver.product_description` as `pd` on `pmpd.product_description_id = pd.product_description_id`
+- Self-join rule for category:
+  - `pc_child.name` is the product subcategory
+  - `pc_parent.name` is the parent category
+  - do not reference unqualified `name` after either category join
+- Culture filter rule:
+  - filter `pmpd` to English only using normalized `culture = 'EN'`
+  - expose output `culture` as lowercase `'en'`
+- Duplicate prevention rule:
+  - if multiple English description rows exist for the same `product_model_id`, keep exactly one deterministic row using lowest `product_description_id`
+  - preserve the product row with null description if no English mapping exists
+- Output columns:
+  - `product_id`
+  - `name`
+  - `product_number`
+  - `color`
+  - `size`
+  - `weight`
+  - `standard_cost`
+  - `list_price`
+  - `product_model_id`
+  - `product_model_name` from `pm.name`
+  - `product_category_id`
+  - `category` from `pc_parent.name`
+  - `subcategory` from `pc_child.name`
+  - `culture`
+  - `description`
+  - `sell_start_date`
+  - `sell_end_date`
+  - `discontinued_date`
+
+### gold.dim_sales
+- Base grain: one row per cleaned `sales_person`.
+- Required inputs:
+  - `silver.sales_order_header`: `sales_order_id`, `customer_id`, `sales_order_number`, `order_date`, `sales_person`
+- Source rule:
+  - use salesperson from `silver.sales_order_header`, not from `silver.customer`
+- Cleaning rule for salesperson:
+  - start from `sales_person`
+  - remove leading prefix `adventure-works\` if present
+  - also remove leading prefix `adventureworks/` if present
+  - remove trailing digits at the end of the string
+  - trim the final value
+- Null/blank handling:
+  - exclude rows where cleaned `sales_person` is null or blank from `dim_sales`
+- Output columns:
+  - `sales_person`
+
+### gold.fact_sales
+- Base grain: one row per sales order line, keyed by (`sales_order_id`, `sales_order_detail_id`).
+- Required inputs:
+  - `silver.sales_order_detail`: `sales_order_id`, `sales_order_detail_id`, `order_qty`, `product_id`, `unit_price`, `unit_price_discount`, `line_total`, `gross_line_amount`, `discount_amount`
+  - `silver.sales_order_header`: `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `sub_total`, `tax_amt`, `freight`, `total_due`, `comment`, `order_date_key`, `due_date_key`, `ship_date_key`, `sales_person`
+- Join path:
+  - start from `silver.sales_order_detail` as `sod`
+  - inner join `silver.sales_order_header` as `soh` on `sod.sales_order_id = soh.sales_order_id`
+- Salesperson rule:
+  - create `sales_person` in `fact_sales` from cleaned `soh.sales_person` using the exact same logic as `gold.dim_sales`
+- Output columns:
+  - `sales_order_id`
+  - `sales_order_detail_id`
+  - `sales_order_number`
+  - `revision_number`
+  - `order_date`
+  - `due_date`
+  - `ship_date`
+  - `order_date_key`
+  - `due_date_key`
+  - `ship_date_key`
+  - `status`
+  - `online_order_flag`
+  - `customer_id`
+  - `product_id`
+  - `sales_person`
+  - `purchase_order_number`
+  - `account_number`
+  - `ship_method`
+  - `ship_to_address_id`
+  - `bill_to_address_id`
+  - `comment`
+  - `order_qty`
+  - `unit_price`
+  - `unit_price_discount`
+  - `gross_line_amount`
+  - `discount_amount`
+  - `line_total`
+  - `sub_total`
+  - `tax_amt`
+  - `freight`
+  - `total_due`
 
 ## Semantic model
 Create a Direct Lake semantic model over the Gold tables produced from the requested design:
