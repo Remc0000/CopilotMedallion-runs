@@ -9,6 +9,13 @@
   - Added an explicit **Gold** section defining required source tables, exact join paths, join keys, culture/address filters, self-join aliases, and output columns for `dim_customer`, `dim_product`, `dim_sales`, and `fact_sales`.
   - Clarified salesperson cleaning and customer address fallback behavior to avoid duplicate rows and missing-column assumptions.
 
+### Iteration 2 — 2026-05-17 17:35:14Z — failed layer: gold (run: 20260517-171759-e350b8)
+- **Root cause (1-line summary)**: Gold build still failed because the spec did not constrain the implementation to the actual SalesLT header column names and likely referenced a non-existent `sales_person` column in `silver.sales_order_header`.
+- **What was changed**:
+  - Tightened **Generic guidance** to require exact-source-name validation before Silver renames and to forbid inventing columns not present in upstream schemas.
+  - Updated **Silver** to explicitly derive `sales_person` from source column `SalesPerson` if present, otherwise from `Salesperson`, and to fail fast if neither exists.
+  - Updated **Gold** to require `dim_sales` and `fact_sales` to use only the validated `silver.sales_order_header.sales_person` column and to prohibit fallback to `customer.sales_person`.
+
 ## Inputs
 - Workspace: `581484c6-28a0-48c9-8931-644c455e9376`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -55,6 +62,8 @@ Cross-cutting code rules:
 - For every Gold join, assert the exact required columns before execution and use fully aliased DataFrames (`c`, `ca`, `a`, `p`, `pc_child`, `pc_parent`, `pm`, `pmpd`, `pd`, `soh`, `sod`).
 - For self-joins, bridge tables, and filtered helper joins, never use `select("*")`; project only named output columns from the correct alias after the join.
 - If a requested business filter yields no rows for some entities, preserve the base grain with a left join unless the spec explicitly requires row exclusion.
+- Before any Silver rename step, inspect the actual Bronze schema and map source columns by exact observed names; do not assume camel-case, PascalCase, or alternate spellings without validation.
+- Do not invent derived canonical columns in Silver unless the exact source-to-target mapping is stated in the spec. If a required source column is absent, fail fast with a clear schema assertion instead of guessing.
 
 Notebook cell comment requirement:
 - EACH code cell must start with a short markdown-style comment block using Python comments.
@@ -261,12 +270,17 @@ Common Silver rules:
 - Source: `bronze.sales_order_header`
 - Dedup key: `sales_order_id`
 - Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Exact source-column rule:
+  - inspect `bronze.sales_order_header` and map the salesperson source column by exact observed name
+  - if source column `SalesPerson` exists, rename it to `sales_person`
+  - else if source column `Salesperson` exists, rename it to `sales_person`
+  - else fail fast with a schema assertion; do not fabricate `sales_person`
 - Cleansing:
   - trim string fields
   - retain order milestone timestamps and shipping/billing/customer keys
   - derive `order_date_key`, `due_date_key`, `ship_date_key` as `yyyyMMdd` integers for Gold/date joins
 - Audit/output columns:
-  - `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `credit_card_approval_code`, `sub_total`, `tax_amt`, `freight`, `total_due`, `comment`, `rowguid`, `modified_date`, `order_date_key`, `due_date_key`, `ship_date_key`, audit columns
+  - `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `credit_card_approval_code`, `sales_person`, `sub_total`, `tax_amt`, `freight`, `total_due`, `comment`, `rowguid`, `modified_date`, `order_date_key`, `due_date_key`, `ship_date_key`, audit columns
 
 ### silver.sales_order_detail
 - Source: `bronze.sales_order_detail`
@@ -330,6 +344,8 @@ Build business-facing Gold tables in `gold` schema using only explicitly validat
 - After each join, select only the final target columns listed below; do not carry duplicate source columns forward.
 - Preserve the requested base grain for each dimension/fact and prevent accidental row multiplication from bridge tables.
 - Write Gold tables in overwrite mode for this initial full build.
+- For Gold tables that depend on salesperson, use only `silver.sales_order_header.sales_person` after Silver validation. Do not read salesperson from `silver.customer` for `dim_sales` or `fact_sales`.
+- If `silver.sales_order_header.sales_person` is absent, fail the Gold build immediately with a schema assertion naming that exact missing column.
 
 ### gold.dim_customer
 - Base grain: one row per `customer_id`.
@@ -420,6 +436,7 @@ Build business-facing Gold tables in `gold` schema using only explicitly validat
   - `silver.sales_order_header`: `sales_order_id`, `customer_id`, `sales_order_number`, `order_date`, `sales_person`
 - Source rule:
   - use salesperson from `silver.sales_order_header`, not from `silver.customer`
+  - the only allowed upstream column name in Gold is `sales_person`
 - Cleaning rule for salesperson:
   - start from `sales_person`
   - remove leading prefix `adventure-works\` if present
@@ -441,6 +458,7 @@ Build business-facing Gold tables in `gold` schema using only explicitly validat
   - inner join `silver.sales_order_header` as `soh` on `sod.sales_order_id = soh.sales_order_id`
 - Salesperson rule:
   - create `sales_person` in `fact_sales` from cleaned `soh.sales_person` using the exact same logic as `gold.dim_sales`
+  - do not reference any alternative column spelling such as `salesperson` in Gold
 - Output columns:
   - `sales_order_id`
   - `sales_order_detail_id`
