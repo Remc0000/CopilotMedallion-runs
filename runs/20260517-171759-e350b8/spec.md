@@ -16,6 +16,13 @@
   - Updated **Silver** to explicitly derive `sales_person` from source column `SalesPerson` if present, otherwise from `Salesperson`, and to fail fast if neither exists.
   - Updated **Gold** to require `dim_sales` and `fact_sales` to use only the validated `silver.sales_order_header.sales_person` column and to prohibit fallback to `customer.sales_person`.
 
+### Iteration 3 — 2026-05-17 17:42:39Z — failed layer: silver (run: 20260517-171759-e350b8)
+- **Root cause (1-line summary)**: Silver build likely failed from assuming `modified_date`/`rowguid` exist on every Bronze table, especially bridge/view objects such as `customer_address` and `product_model_product_description`.
+- **What was changed**:
+  - Tightened **Generic guidance** to require per-table Bronze schema inspection before Silver dedup/order/output logic and to forbid referencing optional source columns unless their presence is explicitly validated.
+  - Updated **Silver common rules** to use source-specific tie-breakers when `modified_date` is absent and to make `rowguid`/`modified_date` optional passthrough columns rather than mandatory on every Silver table.
+  - Updated the affected **Silver** table specs to name the exact expected columns for bridge/view tables and to require fail-fast schema assertions for the true business keys only.
+
 ## Inputs
 - Workspace: `581484c6-28a0-48c9-8931-644c455e9376`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -64,6 +71,10 @@ Cross-cutting code rules:
 - If a requested business filter yields no rows for some entities, preserve the base grain with a left join unless the spec explicitly requires row exclusion.
 - Before any Silver rename step, inspect the actual Bronze schema and map source columns by exact observed names; do not assume camel-case, PascalCase, or alternate spellings without validation.
 - Do not invent derived canonical columns in Silver unless the exact source-to-target mapping is stated in the spec. If a required source column is absent, fail fast with a clear schema assertion instead of guessing.
+- In Silver, treat source-system columns such as `ModifiedDate` and `rowguid` as optional unless the spec for that exact source object requires them and the Bronze schema confirms they exist.
+- For every Silver table, first inspect and log the Bronze schema, then build a per-table required-column set. Deduplication and ordering must only use columns actually present in that source object.
+- If a Bronze source object lacks `ModifiedDate`, use `bronze_ingest_ts` as the deterministic latest-row tie-breaker. Do not reference `modified_date` in window specs, selects, or output projections unless it exists in the source and has been renamed into Silver.
+- If a Bronze source object lacks `rowguid`, omit `rowguid` from the Silver output schema for that table rather than fabricating or referencing it.
 
 Notebook cell comment requirement:
 - EACH code cell must start with a short markdown-style comment block using Python comments.
@@ -178,47 +189,60 @@ Common Silver rules:
   - `is_current` = true for current-state full load outputs
   - `record_hash` over business content columns for change detection readiness
 - Preserve source business keys as integer/string columns.
-- Deduplicate using the latest `modified_date` where available; if ties remain, keep the latest `bronze_ingest_ts`.
+- Deduplicate using the latest available business timestamp for that specific source object; prefer `modified_date` only when the Bronze schema actually contains `ModifiedDate`. If no business timestamp exists, use highest `bronze_ingest_ts`.
 - Quarantine duplicates that violate expected PK uniqueness.
 - Remove or mask sensitive fields not needed analytically.
+- `rowguid` and `modified_date` are optional passthrough columns in Silver. Include them only for tables where the Bronze schema contains `rowguid` and `ModifiedDate` respectively after snake_case renaming.
+- For bridge tables and helper views, do not assume system columns exist; required Silver outputs are limited to the explicitly named business columns plus audit columns, unless schema validation confirms extra passthrough columns.
 
 ### silver.address
 - Source: `bronze.address`
+- Required Bronze columns before rename: `AddressID`, `AddressLine1`, `AddressLine2`, `City`, `StateProvince`, `CountryRegion`, `PostalCode`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: `address_id`
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - trim text fields
   - standardize empty strings to null for `address_line2`
   - retain `city`, `state_province`, `country_region`, `postal_code`
 - Audit/output columns:
-  - `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`, `rowguid`, `modified_date`, audit columns
+  - required: `address_id`, `address_line1`, `address_line2`, `city`, `state_province`, `country_region`, `postal_code`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.customer
 - Source: `bronze.customer`
+- Required Bronze columns before rename: `CustomerID`, `NameStyle`, `Title`, `FirstName`, `MiddleName`, `LastName`, `Suffix`, `CompanyName`, `SalesPerson`, `EmailAddress`, `Phone`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: `customer_id`
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - trim name/contact fields
   - create `full_name` from available title/first/middle/last/suffix for convenience
   - retain `company_name`, `sales_person`, `email_address`, `phone`
   - drop `password_hash` and `password_salt` from Silver for security
 - Audit/output columns:
-  - `customer_id`, `name_style`, `title`, `first_name`, `middle_name`, `last_name`, `suffix`, `full_name`, `company_name`, `sales_person`, `email_address`, `phone`, `rowguid`, `modified_date`, audit columns
+  - required: `customer_id`, `name_style`, `title`, `first_name`, `middle_name`, `last_name`, `suffix`, `full_name`, `company_name`, `sales_person`, `email_address`, `phone`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.customer_address
 - Source: `bronze.customer_address`
+- Required Bronze columns before rename: `CustomerID`, `AddressID`, `AddressType`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: (`customer_id`, `address_id`, `address_type`)
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - trim `address_type`
   - keep as bridge table
 - Audit/output columns:
-  - `customer_id`, `address_id`, `address_type`, `rowguid`, `modified_date`, audit columns
+  - required: `customer_id`, `address_id`, `address_type`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.product
 - Source: `bronze.product`
+- Required Bronze columns before rename: `ProductID`, `Name`, `ProductNumber`, `Color`, `StandardCost`, `ListPrice`, `Size`, `Weight`, `ProductCategoryID`, `ProductModelID`, `SellStartDate`, `SellEndDate`, `DiscontinuedDate`, `ThumbNailPhotoFileName`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: `product_id`
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - trim descriptive fields
   - retain measures: `standard_cost`, `list_price`, `weight`
@@ -226,50 +250,66 @@ Common Silver rules:
   - drop `thumbnail_photo` from Silver unless image reporting is explicitly required
   - retain `thumbnail_photo_file_name`
 - Audit/output columns:
-  - `product_id`, `name`, `product_number`, `color`, `standard_cost`, `list_price`, `size`, `weight`, `product_category_id`, `product_model_id`, `sell_start_date`, `sell_end_date`, `discontinued_date`, `thumbnail_photo_file_name`, `rowguid`, `modified_date`, audit columns
+  - required: `product_id`, `name`, `product_number`, `color`, `standard_cost`, `list_price`, `size`, `weight`, `product_category_id`, `product_model_id`, `sell_start_date`, `sell_end_date`, `discontinued_date`, `thumbnail_photo_file_name`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.product_category
 - Source: `bronze.product_category`
+- Required Bronze columns before rename: `ProductCategoryID`, `ParentProductCategoryID`, `Name`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: `product_category_id`
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - trim `name`
   - preserve hierarchy via `parent_product_category_id`
 - Audit/output columns:
-  - `product_category_id`, `parent_product_category_id`, `name`, `rowguid`, `modified_date`, audit columns
+  - required: `product_category_id`, `parent_product_category_id`, `name`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.product_description
 - Source: `bronze.product_description`
+- Required Bronze columns before rename: `ProductDescriptionID`, `Description`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: `product_description_id`
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - trim `description`
 - Audit/output columns:
-  - `product_description_id`, `description`, `rowguid`, `modified_date`, audit columns
+  - required: `product_description_id`, `description`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.product_model
 - Source: `bronze.product_model`
+- Required Bronze columns before rename: `ProductModelID`, `Name`, `CatalogDescription`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: `product_model_id`
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - trim `name`
   - keep `catalog_description` as long text
 - Audit/output columns:
-  - `product_model_id`, `name`, `catalog_description`, `rowguid`, `modified_date`, audit columns
+  - required: `product_model_id`, `name`, `catalog_description`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.product_model_product_description
 - Source: `bronze.product_model_product_description`
+- Required Bronze columns before rename: `ProductModelID`, `ProductDescriptionID`, `Culture`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: (`product_model_id`, `product_description_id`, `culture`)
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - uppercase/normalize `culture`
 - Audit/output columns:
-  - `product_model_id`, `product_description_id`, `culture`, `rowguid`, `modified_date`, audit columns
+  - required: `product_model_id`, `product_description_id`, `culture`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.sales_order_header
 - Source: `bronze.sales_order_header`
+- Required Bronze columns before rename:
+  - `SalesOrderID`, `RevisionNumber`, `OrderDate`, `DueDate`, `ShipDate`, `Status`, `OnlineOrderFlag`, `SalesOrderNumber`, `PurchaseOrderNumber`, `AccountNumber`, `CustomerID`, `ShipToAddressID`, `BillToAddressID`, `ShipMethod`, `CreditCardApprovalCode`, `SubTotal`, `TaxAmt`, `Freight`, `TotalDue`, `Comment`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: `sales_order_id`
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Exact source-column rule:
   - inspect `bronze.sales_order_header` and map the salesperson source column by exact observed name
   - if source column `SalesPerson` exists, rename it to `sales_person`
@@ -280,43 +320,61 @@ Common Silver rules:
   - retain order milestone timestamps and shipping/billing/customer keys
   - derive `order_date_key`, `due_date_key`, `ship_date_key` as `yyyyMMdd` integers for Gold/date joins
 - Audit/output columns:
-  - `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `credit_card_approval_code`, `sales_person`, `sub_total`, `tax_amt`, `freight`, `total_due`, `comment`, `rowguid`, `modified_date`, `order_date_key`, `due_date_key`, `ship_date_key`, audit columns
+  - required: `sales_order_id`, `revision_number`, `order_date`, `due_date`, `ship_date`, `status`, `online_order_flag`, `sales_order_number`, `purchase_order_number`, `account_number`, `customer_id`, `ship_to_address_id`, `bill_to_address_id`, `ship_method`, `credit_card_approval_code`, `sales_person`, `sub_total`, `tax_amt`, `freight`, `total_due`, `comment`, `order_date_key`, `due_date_key`, `ship_date_key`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.sales_order_detail
 - Source: `bronze.sales_order_detail`
+- Required Bronze columns before rename: `SalesOrderID`, `SalesOrderDetailID`, `OrderQty`, `ProductID`, `UnitPrice`, `UnitPriceDiscount`, `LineTotal`
+- Optional Bronze passthrough columns: `rowguid`, `ModifiedDate`
 - Dedup key: (`sales_order_id`, `sales_order_detail_id`)
-- Latest-row rule: highest `modified_date`, then highest `bronze_ingest_ts`
+- Latest-row rule: highest `modified_date` when present, else highest `bronze_ingest_ts`
 - Cleansing:
   - retain quantity and price metrics
   - derive `gross_line_amount` = `order_qty * unit_price`
   - derive `discount_amount` = `order_qty * unit_price * unit_price_discount`
 - Audit/output columns:
-  - `sales_order_id`, `sales_order_detail_id`, `order_qty`, `product_id`, `unit_price`, `unit_price_discount`, `line_total`, `gross_line_amount`, `discount_amount`, `rowguid`, `modified_date`, audit columns
+  - required: `sales_order_id`, `sales_order_detail_id`, `order_qty`, `product_id`, `unit_price`, `unit_price_discount`, `line_total`, `gross_line_amount`, `discount_amount`, audit columns
+  - optional when present in source: `rowguid`, `modified_date`
 
 ### silver.v_get_all_categories
 - Source: `bronze.v_get_all_categories`
+- Required Bronze columns before rename: `ProductCategoryID`
+- Optional Bronze passthrough columns: none assumed; only include additional columns if schema inspection confirms them
 - Dedup key: `product_category_id`
+- Latest-row rule: highest `bronze_ingest_ts`
 - Use case:
   - optional helper table for flattened category reporting
   - not authoritative over `product_category`; use base table lineage for core dimensions
 - Output columns:
-  - `parent_product_category_name`, `product_category_name`, `product_category_id`, audit columns
+  - required when present after exact schema inspection: `product_category_id`
+  - include `parent_product_category_name` and `product_category_name` only if those exact source columns exist in the view
+  - always include audit columns
 
 ### silver.v_product_and_description
 - Source: `bronze.v_product_and_description`
+- Required Bronze columns before rename: `ProductID`, `Culture`
+- Optional Bronze passthrough columns: none assumed; only include additional columns if schema inspection confirms them
 - Dedup key: (`product_id`, `culture`)
+- Latest-row rule: highest `bronze_ingest_ts`
 - Use case:
   - optional helper enrichment for product descriptions by culture
 - Output columns:
-  - `product_id`, `name`, `product_model`, `culture`, `description`, audit columns
+  - required: `product_id`, `culture`, audit columns
+  - include `name`, `product_model`, `description` only if those exact source columns exist in the view
 
 ### silver.v_product_model_catalog_description
 - Source: `bronze.v_product_model_catalog_description`
+- Required Bronze columns before rename: `ProductModelID`
+- Optional Bronze passthrough columns: none assumed; only include additional columns if schema inspection confirms them
 - Dedup key: `product_model_id`
+- Latest-row rule: highest `bronze_ingest_ts`
 - Use case:
   - optional helper enrichment for product model attributes
 - Output columns:
-  - `product_model_id`, `name`, `summary`, `manufacturer`, `copyright`, `product_url`, `warranty_period`, `warranty_description`, `no_of_years`, `maintenance_description`, `wheel`, `saddle`, `pedal`, `bike_frame`, `crankset`, `picture_angle`, `picture_size`, `product_photo_id`, `material`, `color`, `product_line`, `style`, `rider_experience`, `rowguid`, `modified_date`, audit columns
+  - required: `product_model_id`, audit columns
+  - include `name`, `summary`, `manufacturer`, `copyright`, `product_url`, `warranty_period`, `warranty_description`, `no_of_years`, `maintenance_description`, `wheel`, `saddle`, `pedal`, `bike_frame`, `crankset`, `picture_angle`, `picture_size`, `product_photo_id`, `material`, `color`, `product_line`, `style`, `rider_experience` only if those exact source columns exist in the view
+  - include `rowguid`, `modified_date` only if confirmed present in the Bronze schema
 
 ### Silver optimization
 - Run `OPTIMIZE` on:
