@@ -29,6 +29,15 @@
   - Tightened **Bronze** to require exact source-to-target table names, exact schema-qualified registration as `bronze.<table_name>`, exact physical folder expectation `Tables/bronze/<table_name>`, and explicit verification using catalog/listing plus read-back of each table.
   - Added a mandatory end-of-layer assertion that the discoverable Bronze set count must equal 13 exactly before Bronze is considered successful.
 
+### Iteration 4 — 2026-05-18 05:35:37Z — failed layer: bronze (run: 20260518-052228-89379b)
+- **Root cause (1-line summary)**: Bronze session was cancelled after one or more statements failed, with no layer-level guardrail forcing per-table fail-fast diagnostics and isolated validation before continuing the loop.
+- **Cross-table audit**: `SalesLT/Address`: yes — any read/write/count failure inside the Bronze loop could cancel the session if not trapped and surfaced immediately; `SalesLT/Customer`: yes — same; `SalesLT/CustomerAddress`: yes — same; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — same; `SalesLT/vProductAndDescription`: yes — same; `SalesLT/vProductModelCatalogDescription`: yes — same.
+- **Fix approach**: GENERALIZE — the failure mode is systemic across all Bronze source objects because any unguarded failed statement in the orchestration loop can abort the whole Spark session regardless of table.
+- **What was changed**:
+  - Tightened **Generic guidance** to require statement-level fail-fast checks, explicit source read validation, and immediate abort on first Bronze object failure with the exact source object and target table named.
+  - Tightened **Bronze** to require a deterministic per-table processing sequence (read, validate, enrich, write, read-back verify) with no continuation after a failed table.
+  - Added explicit Bronze diagnostics requirements so the notebook surfaces the failing statement/table clearly before session cancellation, rather than masking the root cause behind a generic cancelled-session error.
+
 ## Inputs
 - Workspace: `2127a578-6ec2-447e-b8a9-94868408b064`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -77,6 +86,9 @@ Cross-cutting code rules:
 - Notebook generation contract rule: every layer notebook MUST contain executable code cells. Do not return an empty notebook, a markdown-only notebook, or a placeholder plan with no Python/Spark cells.
 - Minimum executable notebook rule: if the generator is uncertain, it must still emit a runnable scaffold with parameter initialization, helper functions, source table list, a loop over the required objects for the failed layer, write logic, and final validation. Runtime validation may fail loudly, but notebook generation itself must not yield zero cells.
 - Cell-count safety rule: every generated notebook must contain multiple cells, including at least one executable setup cell and at least one executable transform/write cell. For Bronze specifically, the notebook must include enough executable cells to read source objects, write target tables, and verify discoverability.
+- Statement-failure containment rule: for loop-driven Bronze ingestion, wrap EACH source object in its own `try/except` block and abort the notebook on the first failed object after logging the exact `source_object`, `target_table`, and failed phase (`read`, `metadata_enrichment`, `write`, `read_back_validation`, or `count_validation`). Do not continue to later tables after one object fails.
+- Pre-action validation rule: before any expensive write or count action, validate that the DataFrame variable exists, is not `None`, and contains the columns required for the immediate next step; if not, raise a targeted error before issuing the Spark action.
+- Bronze diagnostic rule: emit progress logs before and after each major statement in the form `START <phase> <source_object> -> <target_table>` and `SUCCESS <phase> <source_object> -> <target_table>` so a cancelled session can be traced back to the last attempted statement.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -174,6 +186,10 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
   - `SalesLT/vProductAndDescription` -> schema `bronze`, table `v_product_and_description`, expected object `bronze.v_product_and_description`, expected managed folder `Tables/bronze/v_product_and_description`
   - `SalesLT/vProductModelCatalogDescription` -> schema `bronze`, table `v_product_model_catalog_description`, expected object `bronze.v_product_model_catalog_description`, expected managed folder `Tables/bronze/v_product_model_catalog_description`
 - The Bronze code MUST explicitly iterate over the full required object list above; do not omit any object due to uncertainty.
+- The Bronze loop MUST process each source object in this exact per-table order: (1) log START read, (2) read source object, (3) assert DataFrame is non-null and schema is non-empty, (4) add Bronze technical columns, (5) write managed target table, (6) read back `bronze.<table_name>`, (7) run `SELECT COUNT(1)` validation, (8) confirm schema listing contains the table, (9) log SUCCESS for the table.
+- If any one of the nine per-table steps above fails for a source object, Bronze MUST stop immediately and raise an error that includes all of: `source_object_name`, `target_schema`, `target_table`, `phase`, and the underlying Spark exception text. Do not swallow the exception and do not continue with later tables.
+- For Bronze, do not issue extra exploratory actions such as repeated `count()`, `display()`, wide `collect()`, or schema inference loops on every table beyond the single required post-write validation count; keep actions minimal to reduce statement-failure cascades and session cancellation risk.
+- Source-read validation is mandatory before enrichment: each source object must be read explicitly from the source Lakehouse and validated as queryable before any target write begins. If the read fails, raise `Bronze source read failed for <source_object>` immediately rather than attempting downstream statements.
 - The Bronze load MUST treat successful completion as dependent on all 13 required tables being discoverable. A partial success with fewer than 13 registered Bronze tables is a failure, not a warning.
 - If generation logic would otherwise return no notebook cells, it MUST instead emit the required Bronze scaffold above and implement the full table loop with fail-fast runtime checks. Returning zero cells is not allowed.
 - After writing each Bronze table, immediately verify all of the following before moving on:
