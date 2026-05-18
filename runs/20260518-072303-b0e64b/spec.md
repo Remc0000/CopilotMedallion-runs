@@ -20,6 +20,15 @@
   - Tightened **Bronze** with a required per-table publish sequence: overwrite target managed Delta table, verify `spark.read.table('bronze.<name>')` succeeds, and verify the table name appears in schema `bronze` listing before moving to the next table.
   - Added an explicit final Bronze gate listing the exact 13 required table names; Bronze must raise an error naming any missing tables and stop the run.
 
+### Iteration 3 — 2026-05-18 07:34:34Z — failed layer: bronze (run: 20260518-072303-b0e64b)
+- **Root cause (1-line summary)**: Bronze likely hit one or more statement-level failures that cancelled the Spark session; the current spec is too vague on per-table isolation, source existence/read validation, and fail-fast diagnostics to identify which table caused the cancellation.
+- **Cross-table audit**: `SalesLT/Address`: yes — source read/publish/verify can fail and cancel the session; `SalesLT/Customer`: yes — same; `SalesLT/CustomerAddress`: yes — same; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — same; `SalesLT/vProductAndDescription`: yes — same; `SalesLT/vProductModelCatalogDescription`: yes — same. The root cause is plausibly systemic because any Bronze source read, metadata-column addition, partition write, or publish verification failure can abort the session before downstream detection.
+- **Fix approach**: **GENERALIZE** — every Bronze source needs the same defensive read → validate → write → verify sequence and per-table diagnostics, because the traceback does not isolate a single business table/column and the same session-cancellation pattern could occur for any listed source.
+- **What was changed**:
+  - Tightened **Generic guidance** to require a per-table execution log/checkpoint pattern so the failing source table is explicitly identified before Spark session cancellation bubbles up.
+  - Tightened **Bronze** with an ordered per-table contract: assert source readability first, normalize metadata-column creation safely, write exactly one table at a time, and verify each published table before starting the next.
+  - Added explicit Bronze guards for optional partitioning and source/object existence so non-partitionable or unreadable sources fail with table-specific diagnostics instead of causing opaque session-level cancellation.
+
 ## Inputs
 - Workspace: `16119d4a-a872-4e9f-b622-0b14f8fb05b7`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -65,6 +74,9 @@ Cross-cutting code rules:
 - If a layer expects a fixed set of outputs from the prior layer, compute that expected set explicitly and fail immediately in the producing layer if any are missing, rather than allowing the next layer to infer from spec-only context.
 - Treat temp views, cached DataFrames, notebook-local variables, and raw `/Files` or unregistered `/Tables` paths as non-published artifacts. None of these satisfy the handoff contract to the next medallion layer.
 - For every published table, the success check must include BOTH of the following against the final schema-qualified name: (1) a catalog/listing check that the table name appears in the target schema, and (2) a direct `spark.read.table('<schema>.<table_name>')` read-back. If either fails, the layer has not published successfully.
+- For any notebook that loops over multiple tables, process exactly one table at a time in a deterministic order and emit a table-scoped progress log before and after each major step (`source_check`, `read`, `transform`, `write`, `publish_verify`). If Spark later cancels the session, the notebook output must still reveal the last table and step attempted.
+- Before performing a write for any source table, explicitly validate that the source object is readable by its exact schema-qualified source name and fail immediately with that exact name if the read fails. Do not continue to the next table after a source-read failure.
+- Any optional behavior that depends on a source column existing (for example, deriving a partition column from `OrderDate`) must first assert the column exists on that source DataFrame; if absent, skip that optional behavior or fail with a table-specific message. Never let an optional optimization be the first point of failure.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -134,17 +146,34 @@ Landing approach for all selected tables:
   - `source_record_hash` over non-binary business columns where practical
 - Use overwrite for this run to keep notebooks idempotent.
 - Partition large transactional bronze tables by a derived date where present:
-  - `bronze.sales_order_header`: partition by `order_date_date` derived from `OrderDate`
+  - `bronze.sales_order_header`: partition by `order_date_date` derived from source column `OrderDate` if and only if `OrderDate` exists on the DataFrame being written
   - `bronze.sales_order_detail`: no natural date on detail, so do not partition independently unless joined staging is explicitly created
 - Do not partition small/master tables such as address, customer, product, category, model, description, and bridge tables.
+- Mandatory per-table execution order for Bronze:
+  1. Resolve the exact source object name from the mapping below.
+  2. Assert the source object is readable by that exact name before any transform/write logic.
+  3. Read the source into a DataFrame and capture the original source column list for later verification.
+  4. Add Bronze metadata columns only; do not rename or reshape business columns in Bronze.
+  5. Apply table-specific optional partitioning only after asserting the required source column exists.
+  6. Write/publish exactly one target managed Delta table.
+  7. Immediately verify the published target table before starting the next source table.
 - Mandatory per-table publish contract for Bronze:
   - Create schema `bronze` before any writes if it does not already exist.
   - For each source table, publish exactly one managed Delta table with the exact schema-qualified target name listed below.
   - After writing each table, immediately verify all three conditions before moving to the next source:
     - `bronze.<table_name>` appears in the target lakehouse schema listing for `bronze`
     - `spark.read.table('bronze.<table_name>')` succeeds
-    - the read-back DataFrame has at least the source business columns plus the required Bronze metadata columns
-  - If any one table fails publication or verification, stop Bronze immediately; do not continue to remaining tables and do not allow the notebook to report success.
+    - the read-back DataFrame contains all original source business columns plus the required Bronze metadata columns
+  - If any one table fails source validation, write, publication, or verification, stop Bronze immediately; do not continue to remaining tables and do not allow the notebook to report success.
+- Mandatory diagnostics for Bronze:
+  - Emit a start/end log line for each source table using the exact source name and exact target name.
+  - Emit a start/end log line for each sub-step: `source_check`, `read`, `metadata_add`, `write`, `publish_verify`.
+  - Any raised error message must include both the source object name (for example `SalesLT/SalesOrderHeader`) and the target table name (for example `bronze.sales_order_header`) where applicable.
+  - If a table-specific step fails, fail Bronze at that table immediately instead of attempting the remaining tables; this is required to avoid opaque session-cancelled outcomes with no actionable culprit table.
+- Mandatory source/metadata guards for Bronze:
+  - For `source_record_hash`, hash only non-binary business columns actually present on the DataFrame; explicitly exclude binary/image-like columns such as `ThumbNailPhoto` and any other binary-typed columns from the hash input.
+  - If a table has zero rows, it must still be published as an empty Bronze table with the correct schema and required metadata columns; zero-row sources are not considered missing tables.
+  - Views (`vGetAllCategories`, `vProductAndDescription`, `vProductModelCatalogDescription`) must be treated with the same readability and publication checks as base tables.
 - Mandatory post-write verification for Bronze: after all writes complete, assert that the full expected table set below is discoverable in schema `bronze`. If any table is missing, Bronze must fail loudly and must not report success.
 - Bronze success must be determined from the published catalog state only. File existence by itself is insufficient.
 
@@ -408,10 +437,10 @@ Star schema tables to create:
   - `discount_amount`
   - `line_total` as net sales
   - optional allocated header amounts if needed later:
-    - header_subtotal
-    - header_tax_amt
-    - header_freight
-    - header_total_due
+    - `header_subtotal`
+    - `header_tax_amt`
+    - `header_freight`
+    - `header_total_due`
 - Modeling guidance:
   - Prefer `line_total` as the primary net sales measure because it exists at detail grain.
   - Do not sum header totals blindly at line grain without either allocation or distinct-order measures; if included, label them clearly as header-level repeated values.
