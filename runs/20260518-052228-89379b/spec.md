@@ -11,6 +11,15 @@
   - Tightened **Bronze** to require creation of the `bronze` schema, exact table names, exact physical layout under `Tables/bronze/<table_name>`, and post-write verification that all expected Bronze tables are discoverable before the layer is considered successful.
   - Added an explicit Bronze failure rule: if any expected Bronze table is missing after write/registration, raise and fail Bronze rather than allowing Silver to start.
 
+### Iteration 2 — 2026-05-18 05:27:12Z — failed layer: bronze (run: 20260518-052228-89379b)
+- **Root cause (1-line summary)**: Bronze notebook generation failed because the LLM returned zero notebook cells, so no executable content existed for the layer.
+- **Cross-table audit**: `SalesLT/Address`: yes — would be skipped entirely if no cells are produced; `SalesLT/Customer`: yes — same reason; `SalesLT/CustomerAddress`: yes — same reason; `SalesLT/Product`: yes — same reason; `SalesLT/ProductCategory`: yes — same reason; `SalesLT/ProductDescription`: yes — same reason; `SalesLT/ProductModel`: yes — same reason; `SalesLT/ProductModelProductDescription`: yes — same reason; `SalesLT/SalesOrderDetail`: yes — same reason; `SalesLT/SalesOrderHeader`: yes — same reason; `SalesLT/vGetAllCategories`: yes — same reason; `SalesLT/vProductAndDescription`: yes — same reason; `SalesLT/vProductModelCatalogDescription`: yes — same reason.
+- **Fix approach**: GENERALIZE — this is a notebook-generation contract failure that can affect every Bronze source object uniformly, so the spec now forces a minimum executable notebook structure for the entire Bronze layer.
+- **What was changed**:
+  - Tightened **Generic guidance** to require that every generated notebook contain executable code cells and forbids markdown-only or empty notebook output.
+  - Tightened **Bronze** with a mandatory minimum cell plan, requiring at least one executable Bronze orchestration notebook that reads all listed inputs, writes all expected outputs, and performs verification.
+  - Added an explicit no-empty-notebook rule: if notebook generation would otherwise return zero cells, the generator must still emit the required Bronze scaffold and fail only at runtime with a clear error if a source read/write check fails.
+
 ## Inputs
 - Workspace: `2127a578-6ec2-447e-b8a9-94868408b064`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -55,6 +64,9 @@ Cross-cutting code rules:
 - Bronze/Silver discoverability rule: a layer is only considered successful if its outputs are both physically written and discoverable by Spark catalog/listing in the target Lakehouse using the expected schema-qualified names. For Bronze specifically, Silver must be able to discover the outputs as `bronze.<table_name>` objects; if discovery fails for any expected table, raise in Bronze and stop the run.
 - Catalog/path parity rule: when writing managed Lakehouse tables, ensure the registered table name and the physical folder layout align with the schema/table convention expected by downstream layers. Do not write orphaned Delta paths without a discoverable table object, and do not register a table under a different schema/name than the medallion spec.
 - Post-write verification rule: after each table write, immediately verify the table exists in the target schema and is queryable; after the full Bronze loop, verify the complete expected Bronze set is present before allowing downstream generation.
+- Notebook generation contract rule: every layer notebook MUST contain executable code cells. Do not return an empty notebook, a markdown-only notebook, or a placeholder plan with no Python/Spark cells.
+- Minimum executable notebook rule: if the generator is uncertain, it must still emit a runnable scaffold with parameter initialization, helper functions, source table list, a loop over the required objects for the failed layer, write logic, and final validation. Runtime validation may fail loudly, but notebook generation itself must not yield zero cells.
+- Cell-count safety rule: every generated notebook must contain multiple cells, including at least one executable setup cell and at least one executable transform/write cell. For Bronze specifically, the notebook must include enough executable cells to read source objects, write target tables, and verify discoverability.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -127,9 +139,31 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
   - `bronze.v_get_all_categories`
   - `bronze.v_product_and_description`
   - `bronze.v_product_model_catalog_description`
+- The Bronze notebook MUST be emitted as an executable notebook, not a narrative plan. It must contain Python/Spark cells that can run end-to-end in Fabric.
+- Minimum Bronze notebook structure is REQUIRED and must contain at least these executable units:
+  - parameter/setup cell
+  - imports + helper functions cell
+  - schema/table mapping cell for all 13 source objects
+  - source read + bronze write loop cell
+  - post-write verification/completeness assertion cell
 - The Bronze notebook MUST create/ensure the `bronze` schema exists in the target Lakehouse before writing any table.
 - For each source object above, the write outcome MUST be a discoverable schema-qualified table with the exact name listed above; do not write only to an unmanaged/orphan path and assume downstream discovery will infer it.
 - Physical organization MUST align with the Lakehouse table convention expected by downstream discovery: each Bronze output must land under the target Lakehouse managed tables area for schema `bronze` and table `<table_name>` so that listing/querying `bronze.<table_name>` succeeds immediately after the write.
+- The Bronze code MUST explicitly iterate over the full required object list below; do not omit any object due to uncertainty:
+  - `SalesLT/Address` -> `bronze.address`
+  - `SalesLT/Customer` -> `bronze.customer`
+  - `SalesLT/CustomerAddress` -> `bronze.customer_address`
+  - `SalesLT/Product` -> `bronze.product`
+  - `SalesLT/ProductCategory` -> `bronze.product_category`
+  - `SalesLT/ProductDescription` -> `bronze.product_description`
+  - `SalesLT/ProductModel` -> `bronze.product_model`
+  - `SalesLT/ProductModelProductDescription` -> `bronze.product_model_product_description`
+  - `SalesLT/SalesOrderDetail` -> `bronze.sales_order_detail`
+  - `SalesLT/SalesOrderHeader` -> `bronze.sales_order_header`
+  - `SalesLT/vGetAllCategories` -> `bronze.v_get_all_categories`
+  - `SalesLT/vProductAndDescription` -> `bronze.v_product_and_description`
+  - `SalesLT/vProductModelCatalogDescription` -> `bronze.v_product_model_catalog_description`
+- If generation logic would otherwise return no notebook cells, it MUST instead emit the required Bronze scaffold above and implement the full table loop with fail-fast runtime checks. Returning zero cells is not allowed.
 - After writing each Bronze table, immediately verify all of the following before moving on:
   - the table is discoverable as `bronze.<table_name>`
   - it is queryable by Spark
