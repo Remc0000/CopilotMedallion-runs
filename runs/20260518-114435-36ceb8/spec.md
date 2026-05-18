@@ -1,5 +1,16 @@
 # Run Spec 20260518-114225-f7c474
 
+## Updated specs
+
+### Iteration 1 — 2026-05-18 11:46:37Z — failed layer: bronze (run: 20260518-114435-36ceb8)
+- **Root cause (1-line summary)**: Bronze completed without producing discoverable Delta outputs under `Tables/bronze/`, so Silver refused to start.
+- **Cross-table audit**: Address: yes — Bronze discoverability failure is table-agnostic and can affect any source if path naming/writes are wrong; Customer: yes — same write-path/discoverability risk; CustomerAddress: yes — same risk; Product: yes — same risk; ProductCategory: yes — same risk; ProductDescription: yes — same risk; ProductModel: yes — same risk; ProductModelProductDescription: yes — same risk; SalesOrderDetail: yes — same risk; SalesOrderHeader: yes — same risk; vGetAllCategories: yes — same risk; vProductAndDescription: yes — same risk; vProductModelCatalogDescription: yes — same risk.
+- **Fix approach**: GENERALIZE — the failure is systemic across all Bronze source objects because discoverability depends on a uniform write-path and successful per-table Delta save, not on one table’s business schema.
+- **What was changed**:
+  - Tightened **Generic guidance** with an explicit discoverability contract: Bronze must write to physical lakehouse paths under `Tables/bronze/<flat_table_name>` and verify `_delta_log` exists after each save.
+  - Tightened **Bronze** with exact flat-name mapping, exact target path pattern, required derivation of `_ingested_date`, and mandatory post-write verification plus final non-zero output assertion.
+  - Clarified that Bronze must not rely on metastore/table registration for downstream discovery; path-based Delta outputs are the source of truth.
+
 ## Inputs
 - Workspace: `e47657b4-6180-42ac-8c4c-779c0e480cc3`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -118,6 +129,13 @@ Rule K — Resilience to partial output: Bronze MUST write Delta tables that the
   - Raise (not just log) if zero tables were written by the end of the notebook.
 - Same rule applies recursively to Silver (`Tables/silver/<table>`) and Gold (`Tables/gold/<table>` + `Tables/test/test_results`).
 
+Rule L — Discoverability requires physical Delta path verification, not just successful write calls.
+- A successful `.save(...)` call is not sufficient evidence that downstream layer discovery will work. After each Bronze write, immediately verify the target directory exists under the target lakehouse path and contains a `_delta_log` child.
+- Record a table as "written" in the summary dict ONLY after both conditions are true:
+  - the target path is exactly `.../Tables/bronze/<flat_table_name>`
+  - `_delta_log` exists beneath that path
+- Do not rely on temp views, catalog registration, display(), or row-count-only logging as proof of Bronze success. Downstream discovery is path-based.
+
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
 # ---
@@ -128,23 +146,49 @@ df = spark.read.table(...)
 Keep the comments human-readable, not the code repeated in prose. The goal: someone scrolling through the notebook in Fabric can understand each block at a glance.
 
 ## Bronze
-- Ingest every listed source object into `Tables/bronze/<flat_table_name>` using lowercased final path segments:
-  - `address`, `customer`, `customeraddress`, `product`, `productcategory`, `productdescription`, `productmodel`, `productmodelproductdescription`, `salesorderdetail`, `salesorderheader`, `vgetallcategories`, `vproductanddescription`, `vproductmodelcatalogdescription`.
+- Ingest every listed source object into `Tables/bronze/<flat_table_name>` using lowercased final path segments and this exact mapping:
+  - `SalesLT/Address` -> `Tables/bronze/address`
+  - `SalesLT/Customer` -> `Tables/bronze/customer`
+  - `SalesLT/CustomerAddress` -> `Tables/bronze/customeraddress`
+  - `SalesLT/Product` -> `Tables/bronze/product`
+  - `SalesLT/ProductCategory` -> `Tables/bronze/productcategory`
+  - `SalesLT/ProductDescription` -> `Tables/bronze/productdescription`
+  - `SalesLT/ProductModel` -> `Tables/bronze/productmodel`
+  - `SalesLT/ProductModelProductDescription` -> `Tables/bronze/productmodelproductdescription`
+  - `SalesLT/SalesOrderDetail` -> `Tables/bronze/salesorderdetail`
+  - `SalesLT/SalesOrderHeader` -> `Tables/bronze/salesorderheader`
+  - `SalesLT/vGetAllCategories` -> `Tables/bronze/vgetallcategories`
+  - `SalesLT/vProductAndDescription` -> `Tables/bronze/vproductanddescription`
+  - `SalesLT/vProductModelCatalogDescription` -> `Tables/bronze/vproductmodelcatalogdescription`
 - Read each source table independently in a per-table loop; do not combine source reads in Bronze.
 - Preserve source schema as-is in Bronze, but add standard metadata columns:
   - `_run_id`
   - `_ingested_at`
   - `_source_table`
   - `_bronze_loaded_at`
+  - `_ingested_date` derived from `_ingested_at` as a plain date column; this column must be physically present before any partitioned write
 - For source objects that already include `ModifiedDate`, keep it untouched; do not overwrite business audit columns.
 - Partitioning intent:
-  - For large transactional tables `salesorderheader` and `salesorderdetail`, partition Bronze by a lightweight derived ingest date column such as `_ingested_date`.
-  - For small/master/view tables, no business partitioning is required; write unpartitioned unless a standard `_ingested_date` partition is enforced uniformly by the notebook generator.
+  - For large transactional tables `salesorderheader` and `salesorderdetail`, partition Bronze by `_ingested_date`.
+  - For small/master/view tables, write unpartitioned unless the notebook generator enforces `_ingested_date` partitioning uniformly across all Bronze tables.
 - Write mode:
   - Full overwrite per run, `format('delta').mode('overwrite').option('overwriteSchema','true')`.
+- Bronze path contract:
+  - Build the write target from the target lakehouse base path plus the exact relative path `Tables/bronze/<flat_table_name>`.
+  - Do not write Bronze outputs anywhere else (not `Files/`, not `Tables/Bronze/`, not mixed-case names, not nested source-system folders).
+  - Do not rely on metastore registration or `saveAsTable`; downstream discovery must succeed by scanning the physical `Tables/bronze/` folder.
+- Bronze post-write verification is REQUIRED for every table:
+  - After `save(...)`, verify the directory for `Tables/bronze/<flat_table_name>` exists.
+  - Verify `Tables/bronze/<flat_table_name>/_delta_log` exists.
+  - Re-read the just-written Delta path and capture row count from that persisted path, not from a pre-write DataFrame only.
+  - Add the table to the success summary dict only after those checks pass.
+  - If any check fails, treat the table as failed and call `_save_error('bronze', e, table=<source_table>)`.
 - Bronze validation:
   - Assert the source object exists before read.
-  - After write, record row count and target path in a summary dict.
+  - Assert the target write path string is non-empty and contains `/Tables/bronze/` before calling `.save(...)`.
+  - After write, record row count and exact target path in a summary dict.
+  - Print a final JSON summary containing every successfully written Bronze table and path.
+  - Raise if zero Bronze tables were successfully verified as discoverable.
   - Raise if any required source table for downstream Gold modeling (`customer`, `customeraddress`, `address`, `product`, `productcategory`, `productmodel`, `productdescription`, `productmodelproductdescription`, `salesorderheader`, `salesorderdetail`) failed to land.
 - Notes for views:
   - `vgetallcategories`, `vproductanddescription`, and `vproductmodelcatalogdescription` are still landed to Bronze for traceability, but Gold should prefer base tables where the user explicitly requested those joins.
