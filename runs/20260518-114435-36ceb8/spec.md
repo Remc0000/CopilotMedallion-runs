@@ -20,6 +20,15 @@
   - Tightened **Bronze** to require table-level `try/except`, immediate error persistence, deferred notebook failure until after the loop, and explicit prohibition on pre-write actions (`count`, full scans, verification reads) before a successful save.
   - Added mandatory final summary semantics: attempted/succeeded/failed tables must be recorded, and the notebook must raise once at the end if any required table failed.
 
+### Iteration 3 — 2026-05-18 11:54:27Z — failed layer: bronze (run: 20260518-114435-36ceb8)
+- **Root cause (1-line summary)**: Silver again found zero discoverable Bronze outputs, which means the Bronze notebook must enforce a stricter physical target-base-path contract instead of only validating relative `Tables/bronze/...` strings.
+- **Cross-table audit**: Address: yes — if the resolved lakehouse base path is wrong, address will also be written outside discoverable Bronze storage; Customer: yes — same base-path risk; CustomerAddress: yes — same; Product: yes — same; ProductCategory: yes — same; ProductDescription: yes — same; ProductModel: yes — same; ProductModelProductDescription: yes — same; SalesOrderDetail: yes — same; SalesOrderHeader: yes — same; vGetAllCategories: yes — same; vProductAndDescription: yes — same; vProductModelCatalogDescription: yes — same.
+- **Fix approach**: GENERALIZE — this is a systemic path-resolution/discoverability issue affecting every Bronze object uniformly, so one stricter rule for all source tables is safer than table-specific fixes.
+- **What was changed**:
+  - Tightened **Generic guidance** with a mandatory resolved-path rule: every layer write must use the target lakehouse ABFSS/base path plus `Tables/<layer>/<flat_table_name>`, and the notebook must fail preflight if the resolved base path is missing, blank, or does not belong to the target lakehouse.
+  - Tightened **Bronze** to require exact computation and logging of `bronze_root_path` and per-table `target_path`, explicit prohibition on relative-only saves like `Tables/bronze/...`, and strict post-write verification against the same fully resolved path.
+  - Added a required notebook-start self-check that the target lakehouse root is writable/discoverable before processing any source table.
+
 ## Inputs
 - Workspace: `e47657b4-6180-42ac-8c4c-779c0e480cc3`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -173,6 +182,21 @@ Rule N — Bronze final error contract must be auditable.
 - If any required Bronze table failed, raise exactly one final exception AFTER printing the summary, and include the failed table names in the exception message.
 - This preserves partial-success diagnostics while still failing the run correctly.
 
+Rule O — Resolved lakehouse base path must be explicit and validated before any layer write.
+- Every write path must be built from a resolved target lakehouse base path variable such as `target_lakehouse_base_path` or `tgt_base` plus the relative Delta location. The notebook must never call `.save("Tables/bronze/...")`, `.save("/Tables/bronze/...")`, or any other relative-only path because those can land outside the discoverable lakehouse storage context.
+- Before any Bronze processing begins, resolve and validate:
+  - workspace id / lakehouse id / lakehouse name inputs are non-empty
+  - the resolved base path string is non-empty
+  - the resolved base path corresponds to the target lakehouse `demolake`
+  - the computed Bronze root is exactly `<resolved_base>/Tables/bronze`
+- Log the resolved base path and Bronze root once at notebook start so a failed run shows the exact physical target used.
+- If the notebook cannot resolve a trustworthy target lakehouse base path, fail in preflight before touching any source table.
+
+Rule P — Discoverability self-check must verify the target lakehouse root, not only per-table outputs.
+- At notebook start, perform a lightweight writeability/discoverability self-check against the resolved target lakehouse root context before entering the per-table loop. The purpose is to catch bad path resolution early.
+- Acceptable pattern: verify the resolved Bronze root parent exists or can be listed in the target lakehouse filesystem namespace; if this cannot be confirmed, fail preflight.
+- Do not substitute a temp/local filesystem path for the target lakehouse path. Only the target lakehouse physical path counts as discoverable output.
+
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
 # ---
@@ -200,6 +224,14 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 - Bronze MUST execute in two phases:
   - Phase 1: preflight validation over all configured source objects and their computed target paths
   - Phase 2: isolated per-table processing only after preflight has built the list of valid work items
+- Bronze MUST resolve a single explicit target lakehouse base path at notebook start and use it for every table write.
+  - Required variables:
+    - `target_lakehouse_base_path`: fully resolved physical base path for lakehouse `demolake`
+    - `bronze_root_path = f"{target_lakehouse_base_path}/Tables/bronze"`
+  - Every per-table target must be computed as:
+    - `target_path = f"{bronze_root_path}/{flat_table_name}"`
+  - The notebook MUST log `target_lakehouse_base_path`, `bronze_root_path`, and each `target_path`.
+  - Do NOT call `.save()` with only `Tables/bronze/<flat_table_name>` or any other relative-only string.
 - Read each source table independently in a per-table loop; do not combine source reads in Bronze.
 - Preserve source schema as-is in Bronze, but add standard metadata columns:
   - `_run_id`
@@ -214,9 +246,10 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 - Write mode:
   - Full overwrite per run, `format('delta').mode('overwrite').option('overwriteSchema','true')`.
 - Bronze path contract:
-  - Build the write target from the target lakehouse base path plus the exact relative path `Tables/bronze/<flat_table_name>`.
+  - Build the write target from the resolved target lakehouse base path plus the exact relative path `Tables/bronze/<flat_table_name>`.
   - Do not write Bronze outputs anywhere else (not `Files/`, not `Tables/Bronze/`, not mixed-case names, not nested source-system folders).
-  - Do not rely on metastore registration or `saveAsTable`; downstream discovery must succeed by scanning the physical `Tables/bronze/` folder.
+  - Do not write to relative notebook filesystem paths.
+  - Do not rely on metastore registration or `saveAsTable`; downstream discovery must succeed by scanning the physical `Tables/bronze/` folder under the target lakehouse path.
 - Bronze per-table control flow is REQUIRED:
   - Wrap each table iteration in its own `try/except`.
   - On failure, call `_save_error('bronze', e, table=<source_table>)`, record the failure in the summary structure, and CONTINUE to the next table.
@@ -224,21 +257,27 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - After the loop ends, raise once if any required source table failed.
 - Bronze preflight validation is REQUIRED before any write:
   - Assert the source object exists before read.
-  - Assert the computed target write path string is non-empty and contains `/Tables/bronze/`.
+  - Assert the resolved `target_lakehouse_base_path` string is non-empty.
+  - Assert `bronze_root_path` is non-empty and contains `/Tables/bronze`.
+  - Assert every computed per-table `target_path` starts with the resolved `bronze_root_path` and ends with the expected flat table name.
   - Build the complete list of work items first so target-path bugs are caught before writes begin.
+  - Fail preflight immediately if the target lakehouse base path cannot be resolved to `demolake`.
+- Bronze target-root self-check is REQUIRED before the ingestion loop:
+  - Verify the target lakehouse filesystem namespace for `bronze_root_path` (or its parent under the resolved lakehouse path) is listable/reachable.
+  - If that check fails, stop the notebook before reading any source table.
 - Bronze action-ordering constraints:
   - Do not call `count()` on the source DataFrame before saving it.
   - Do not call `display()` or other eager actions on the source DataFrame inside the ingestion loop.
   - The first expensive action in a table iteration should be the write to the Delta target path.
   - If row count is needed for logging, obtain it only by re-reading the persisted Delta target path after `_delta_log` verification.
 - Bronze post-write verification is REQUIRED for every table:
-  - After `save(...)`, verify the directory for `Tables/bronze/<flat_table_name>` exists.
-  - Verify `Tables/bronze/<flat_table_name>/_delta_log` exists.
-  - Re-read the just-written Delta path and capture row count from that persisted path, not from a pre-write DataFrame only.
+  - After `save(target_path)`, verify the directory for that exact fully resolved `target_path` exists.
+  - Verify `<target_path>/_delta_log` exists.
+  - Re-read the just-written Delta path from that same exact fully resolved `target_path` and capture row count from the persisted path, not from a pre-write DataFrame only.
   - Add the table to the success summary dict only after those checks pass.
   - If any check fails, treat the table as failed and call `_save_error('bronze', e, table=<source_table>)`.
 - Bronze validation:
-  - Record for every attempted table: source name, flat table name, exact target path, status, and concise error text if failed.
+  - Record for every attempted table: source name, flat table name, exact fully resolved target path, status, and concise error text if failed.
   - Print a final JSON summary containing attempted, succeeded, and failed Bronze tables and exact paths for successes.
   - Raise if zero Bronze tables were successfully verified as discoverable.
   - Raise if any required source table for downstream Gold modeling (`customer`, `customeraddress`, `address`, `product`, `productcategory`, `productmodel`, `productdescription`, `productmodelproductdescription`, `salesorderheader`, `salesorderdetail`) failed to land.
