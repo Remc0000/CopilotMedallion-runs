@@ -38,6 +38,15 @@
   - Tightened **Bronze** to require a deterministic per-table processing sequence (read, validate, enrich, write, read-back verify) with no continuation after a failed table.
   - Added explicit Bronze diagnostics requirements so the notebook surfaces the failing statement/table clearly before session cancellation, rather than masking the root cause behind a generic cancelled-session error.
 
+### Iteration 5 — 2026-05-18 05:38:52Z — failed layer: bronze (run: 20260518-052228-89379b)
+- **Root cause (1-line summary)**: Bronze still hit a generic cancelled-session error, indicating the notebook needs stricter statement minimization and a single canonical source-read/write pattern that avoids unsupported or redundant actions across all source objects.
+- **Cross-table audit**: `SalesLT/Address`: yes — can fail if read or write uses a non-canonical object reference or extra validation statements; `SalesLT/Customer`: yes — same; `SalesLT/CustomerAddress`: yes — same; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — same, especially because it may be a view-like object; `SalesLT/vProductAndDescription`: yes — same, especially because it may be a view-like object; `SalesLT/vProductModelCatalogDescription`: yes — same, especially because it may be a view-like object.
+- **Fix approach**: GENERALIZE — the available failure signal is session-wide and non-table-specific, so the safest fix is one uniform Bronze execution contract for all 13 source objects rather than speculative per-table exceptions.
+- **What was changed**:
+  - Tightened **Generic guidance** to require a single canonical read method for source objects, a single canonical managed-table write method for Bronze, and to ban non-essential Spark actions during Bronze.
+  - Tightened **Bronze** with an exact implementation contract: resolve source objects only as `SalesLT.<object_name>`, use one write/replacement pattern per table, and reduce validation to one read-back plus one count per table.
+  - Added explicit prohibitions on fallback read strategies, exploratory statements, and multiple write attempts for the same table within one run.
+
 ## Inputs
 - Workspace: `2127a578-6ec2-447e-b8a9-94868408b064`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -89,6 +98,9 @@ Cross-cutting code rules:
 - Statement-failure containment rule: for loop-driven Bronze ingestion, wrap EACH source object in its own `try/except` block and abort the notebook on the first failed object after logging the exact `source_object`, `target_table`, and failed phase (`read`, `metadata_enrichment`, `write`, `read_back_validation`, or `count_validation`). Do not continue to later tables after one object fails.
 - Pre-action validation rule: before any expensive write or count action, validate that the DataFrame variable exists, is not `None`, and contains the columns required for the immediate next step; if not, raise a targeted error before issuing the Spark action.
 - Bronze diagnostic rule: emit progress logs before and after each major statement in the form `START <phase> <source_object> -> <target_table>` and `SUCCESS <phase> <source_object> -> <target_table>` so a cancelled session can be traced back to the last attempted statement.
+- Bronze canonical I/O rule: in Bronze, use exactly one canonical source read form per object and one canonical managed-table write form per target. Do not attempt multiple alternate read syntaxes, fallback path probes, repeated overwrite attempts, or mixed write APIs for the same table within a single run.
+- Bronze action minimization rule: in Bronze, avoid any non-essential Spark actions beyond the required per-table write, one read-back queryability check, and one count validation. Do not add `display()`, `show()`, `collect()`, repeated `count()`, schema-profiling scans, or trial queries during the ingestion loop.
+- Bronze source reference rule: when reading the listed inputs, resolve each source using the exact object name implied by the input list (`SalesLT/<ObjectName>` -> Spark object `SalesLT.<ObjectName>`). Do not invent alternate schema names, snake_case source names, or path-based fallbacks for the initial source read unless the exact object read has already failed and the notebook is raising that explicit error.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -186,9 +198,25 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
   - `SalesLT/vProductAndDescription` -> schema `bronze`, table `v_product_and_description`, expected object `bronze.v_product_and_description`, expected managed folder `Tables/bronze/v_product_and_description`
   - `SalesLT/vProductModelCatalogDescription` -> schema `bronze`, table `v_product_model_catalog_description`, expected object `bronze.v_product_model_catalog_description`, expected managed folder `Tables/bronze/v_product_model_catalog_description`
 - The Bronze code MUST explicitly iterate over the full required object list above; do not omit any object due to uncertainty.
+- Source object resolution for the initial read is mandatory and exact:
+  - `SalesLT/Address` must be read as `SalesLT.Address`
+  - `SalesLT/Customer` must be read as `SalesLT.Customer`
+  - `SalesLT/CustomerAddress` must be read as `SalesLT.CustomerAddress`
+  - `SalesLT/Product` must be read as `SalesLT.Product`
+  - `SalesLT/ProductCategory` must be read as `SalesLT.ProductCategory`
+  - `SalesLT/ProductDescription` must be read as `SalesLT.ProductDescription`
+  - `SalesLT/ProductModel` must be read as `SalesLT.ProductModel`
+  - `SalesLT/ProductModelProductDescription` must be read as `SalesLT.ProductModelProductDescription`
+  - `SalesLT/SalesOrderDetail` must be read as `SalesLT.SalesOrderDetail`
+  - `SalesLT/SalesOrderHeader` must be read as `SalesLT.SalesOrderHeader`
+  - `SalesLT/vGetAllCategories` must be read as `SalesLT.vGetAllCategories`
+  - `SalesLT/vProductAndDescription` must be read as `SalesLT.vProductAndDescription`
+  - `SalesLT/vProductModelCatalogDescription` must be read as `SalesLT.vProductModelCatalogDescription`
+- Do not snake_case or otherwise rewrite the source object names for the read step. Snake_case applies only to the Bronze target table names listed above.
+- The Bronze loop MUST use exactly one read attempt per source object via Spark table resolution and exactly one overwrite write attempt per target table. Do not implement fallback reads from ad hoc file paths, `Tables/...` guesses, alternate schemas, or multiple write retries inside the same notebook pass.
 - The Bronze loop MUST process each source object in this exact per-table order: (1) log START read, (2) read source object, (3) assert DataFrame is non-null and schema is non-empty, (4) add Bronze technical columns, (5) write managed target table, (6) read back `bronze.<table_name>`, (7) run `SELECT COUNT(1)` validation, (8) confirm schema listing contains the table, (9) log SUCCESS for the table.
 - If any one of the nine per-table steps above fails for a source object, Bronze MUST stop immediately and raise an error that includes all of: `source_object_name`, `target_schema`, `target_table`, `phase`, and the underlying Spark exception text. Do not swallow the exception and do not continue with later tables.
-- For Bronze, do not issue extra exploratory actions such as repeated `count()`, `display()`, wide `collect()`, or schema inference loops on every table beyond the single required post-write validation count; keep actions minimal to reduce statement-failure cascades and session cancellation risk.
+- For Bronze, do not issue extra exploratory actions such as repeated `count()`, `display()`, wide `collect()`, `show()`, schema-profiling passes, or schema inference loops on every table beyond the single required post-write validation count; keep actions minimal to reduce statement-failure cascades and session cancellation risk.
 - Source-read validation is mandatory before enrichment: each source object must be read explicitly from the source Lakehouse and validated as queryable before any target write begins. If the read fails, raise `Bronze source read failed for <source_object>` immediately rather than attempting downstream statements.
 - The Bronze load MUST treat successful completion as dependent on all 13 required tables being discoverable. A partial success with fewer than 13 registered Bronze tables is a failure, not a warning.
 - If generation logic would otherwise return no notebook cells, it MUST instead emit the required Bronze scaffold above and implement the full table loop with fail-fast runtime checks. Returning zero cells is not allowed.
@@ -222,6 +250,7 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
   - `source_object_name`
   - `source_row_hash` for change detection / dedup support
 - Keep source column names intact in Bronze; do not snake_case until Silver.
+- `source_row_hash` must be derived only from the source business columns present in the source DataFrame for that object, and must explicitly exclude the Bronze technical columns (`ingested_at_utc`, `run_id`, `source_workspace_id`, `source_lakehouse_id`, `source_object_name`) so reruns remain deterministic.
 - Write mode: deterministic full overwrite for this run, because these are source snapshots and no CDC columns are provided.
 - Partitioning:
   - Do not over-partition the small master tables.
