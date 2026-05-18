@@ -1,5 +1,16 @@
 # Run Spec 20260518-081403-ebaded
 
+## Updated specs
+
+### Iteration 1 — 2026-05-18 08:19:13Z — failed layer: bronze (run: 20260518-081636-10ba52)
+- **Root cause (1-line summary)**: Bronze completed without producing discoverable Delta outputs under `Tables/bronze/<table>`, so Silver refused to proceed.
+- **Cross-table audit**: `SalesLT/Address`: yes — same Bronze write/discovery risk applies; `SalesLT/Customer`: yes — same Bronze write/discovery risk applies; `SalesLT/CustomerAddress`: yes — bridge table still must be written to a discoverable Bronze path; `SalesLT/Product`: yes — same Bronze write/discovery risk applies; `SalesLT/ProductCategory`: yes — same Bronze write/discovery risk applies; `SalesLT/ProductDescription`: yes — same Bronze write/discovery risk applies; `SalesLT/ProductModel`: yes — same Bronze write/discovery risk applies; `SalesLT/ProductModelProductDescription`: yes — same Bronze write/discovery risk applies; `SalesLT/SalesOrderDetail`: yes — same Bronze write/discovery risk applies; `SalesLT/SalesOrderHeader`: yes — same Bronze write/discovery risk applies; `SalesLT/vGetAllCategories`: yes — views have the same risk if not written as Delta to the required path; `SalesLT/vProductAndDescription`: yes — same Bronze write/discovery risk applies; `SalesLT/vProductModelCatalogDescription`: yes — same Bronze write/discovery risk applies.
+- **Fix approach**: GENERALIZE — the failure is systemic across all Bronze inputs because discoverability depends on a uniform write-path and validation rule, not a table-specific schema fix.
+- **What was changed**:
+  - Tightened `## Generic guidance` with an explicit Bronze discoverability contract: every listed input must be written by path to `Tables/bronze/<flat_name>` and validated as a Delta table before notebook completion.
+  - Tightened `## Bronze` with explicit source-to-target table mappings, required path naming, per-table write verification, and a hard failure if any listed source is not written discoverably.
+  - Preserved all downstream intent; no upstream/downstream business modeling changes were made beyond ensuring Bronze outputs exist for Silver discovery.
+
 ## Inputs
 - Workspace: `2242620d-b06e-48f8-a3ee-8e9ae6ffd17f`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -27,7 +38,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules:
 - Use defensive column references everywhere; never assume a column exists without checking `df.columns`.
@@ -39,6 +50,7 @@ Cross-cutting code rules:
 - Use idempotent overwrite patterns with `.format('delta').mode('overwrite').option('overwriteSchema','true')`.
 - Use error-loud `try/except` blocks that call `_save_error(layer, e)` (and `_save_error(layer, e, table=tbl)` inside per-table loops) and then re-raise per the per-table isolation pattern.
 - Every generated notebook cell must start with a short markdown-style Python comment block using a `# ---` divider and 1-3 explanatory comment lines.
+- Discoverability rule for all persisted layers, especially Bronze: a write is considered successful only if the notebook writes a Delta dataset by path under the exact lakehouse-relative folder `Tables/<layer>/<expected_table_name>` and then verifies that path exists and is readable as Delta before proceeding. Logging success without this verification is not sufficient.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -116,6 +128,23 @@ Rule K — Resilience to partial output: Bronze MUST write Delta tables that the
   - Raise (not just log) if zero tables were written by the end of the notebook.
 - Same rule applies recursively to Silver (`Tables/silver/<table>`) and Gold (`Tables/gold/<table>` + `Tables/test/test_results`).
 
+Rule L — Bronze path naming must be deterministic and exactly match the listed source objects.
+- For each input path `SalesLT/<Name>`, derive the Bronze folder name as the lowercase of the final path segment only, with no schema prefix and no extra underscores:
+  - `SalesLT/Address` → `Tables/bronze/address`
+  - `SalesLT/Customer` → `Tables/bronze/customer`
+  - `SalesLT/CustomerAddress` → `Tables/bronze/customeraddress`
+  - `SalesLT/Product` → `Tables/bronze/product`
+  - `SalesLT/ProductCategory` → `Tables/bronze/productcategory`
+  - `SalesLT/ProductDescription` → `Tables/bronze/productdescription`
+  - `SalesLT/ProductModel` → `Tables/bronze/productmodel`
+  - `SalesLT/ProductModelProductDescription` → `Tables/bronze/productmodelproductdescription`
+  - `SalesLT/SalesOrderDetail` → `Tables/bronze/salesorderdetail`
+  - `SalesLT/SalesOrderHeader` → `Tables/bronze/salesorderheader`
+  - `SalesLT/vGetAllCategories` → `Tables/bronze/vgetallcategories`
+  - `SalesLT/vProductAndDescription` → `Tables/bronze/vproductanddescription`
+  - `SalesLT/vProductModelCatalogDescription` → `Tables/bronze/vproductmodelcatalogdescription`
+- Do not write to alternate locations such as `Files/...`, `Tables/Bronze/...`, `Tables/bronze/SalesLT_<name>`, or any schema-qualified folder. Silver discovery expects the exact `Tables/bronze/<flat_name>` convention above.
+
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
 # ---
@@ -128,6 +157,20 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 ## Bronze
 - Ingest each listed source object 1:1 into `Tables/bronze/<table_name_lower>` using the lowercased last path segment:
   - `address`, `customer`, `customeraddress`, `product`, `productcategory`, `productdescription`, `productmodel`, `productmodelproductdescription`, `salesorderdetail`, `salesorderheader`, `vgetallcategories`, `vproductanddescription`, `vproductmodelcatalogdescription`.
+- Required exact source-to-target Bronze mappings:
+  - `SalesLT/Address` → `Tables/bronze/address`
+  - `SalesLT/Customer` → `Tables/bronze/customer`
+  - `SalesLT/CustomerAddress` → `Tables/bronze/customeraddress`
+  - `SalesLT/Product` → `Tables/bronze/product`
+  - `SalesLT/ProductCategory` → `Tables/bronze/productcategory`
+  - `SalesLT/ProductDescription` → `Tables/bronze/productdescription`
+  - `SalesLT/ProductModel` → `Tables/bronze/productmodel`
+  - `SalesLT/ProductModelProductDescription` → `Tables/bronze/productmodelproductdescription`
+  - `SalesLT/SalesOrderDetail` → `Tables/bronze/salesorderdetail`
+  - `SalesLT/SalesOrderHeader` → `Tables/bronze/salesorderheader`
+  - `SalesLT/vGetAllCategories` → `Tables/bronze/vgetallcategories`
+  - `SalesLT/vProductAndDescription` → `Tables/bronze/vproductanddescription`
+  - `SalesLT/vProductModelCatalogDescription` → `Tables/bronze/vproductmodelcatalogdescription`
 - For each table:
   - Read from the source lakehouse path/object exactly as provided.
   - Preserve source business columns as-is in Bronze; do not apply business joins in this layer.
@@ -141,6 +184,13 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
     - retain original names in Bronze to mirror source shape
     - optionally flatten unsupported characters if needed, but no business renaming yet
     - preserve binary column `ThumbNailPhoto` in Bronze even if excluded later
+  - Write each table as Delta by path, not as a metastore-only object, using the exact target folder listed above.
+  - Immediately after each write, verify the target path is discoverable and non-empty as a Delta dataset:
+    - confirm the folder exists under `Tables/bronze/<table_name_lower>`
+    - confirm `_delta_log` exists for that folder
+    - confirm `spark.read.format('delta').load(target_path)` succeeds
+    - capture the written row count in the results summary
+  - If a table read succeeds but its Delta write or post-write verification fails, record that table as failed and continue to the next table per per-table isolation rules.
 - Write mode and partitioning:
   - Use overwrite with schema overwrite for idempotent reruns.
   - Partition Bronze tables by `_ingest_date`; for large transaction tables also keep data skippable by date filters downstream.
@@ -150,7 +200,8 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - View objects (`vGetAllCategories`, `vProductAndDescription`, `vProductModelCatalogDescription`) must be treated as regular sources and landed exactly with the columns returned by the view.
 - Bronze completion rule:
   - Raise an error if no Bronze tables are written.
-  - Emit a JSON summary of written tables and row counts.
+  - Raise an error if any listed input table does not result in a discoverable Delta output at its exact required path.
+  - Emit a JSON summary of written tables and row counts, including the exact target path for every successful write and a failed-table list for any unsuccessful writes.
 
 ## Silver
 - Silver applies schema standardization, quality filtering, deduplication, and light enrichment, writing to `Tables/silver/<table>`.
