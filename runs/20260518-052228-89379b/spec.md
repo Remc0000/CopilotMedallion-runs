@@ -20,6 +20,15 @@
   - Tightened **Bronze** with a mandatory minimum cell plan, requiring at least one executable Bronze orchestration notebook that reads all listed inputs, writes all expected outputs, and performs verification.
   - Added an explicit no-empty-notebook rule: if notebook generation would otherwise return zero cells, the generator must still emit the required Bronze scaffold and fail only at runtime with a clear error if a source read/write check fails.
 
+### Iteration 3 — 2026-05-18 05:31:41Z — failed layer: bronze (run: 20260518-052228-89379b)
+- **Root cause (1-line summary)**: Bronze still did not create discoverable managed tables under the exact `Tables/bronze/<table_name>` convention, so the next run again had no catalog-visible Bronze inputs.
+- **Cross-table audit**: `SalesLT/Address`: yes — same managed-table/discoverability requirement applies; `SalesLT/Customer`: yes — same; `SalesLT/CustomerAddress`: yes — same; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — same; `SalesLT/vProductAndDescription`: yes — same; `SalesLT/vProductModelCatalogDescription`: yes — same.
+- **Fix approach**: GENERALIZE — the failure is systemic across all Bronze outputs, so the spec now mandates one exact managed-table write/verification contract for every Bronze object rather than per-table exceptions.
+- **What was changed**:
+  - Tightened **Generic guidance** with a stricter managed-table-only rule for Bronze and an explicit ban on path-only/orphan writes.
+  - Tightened **Bronze** to require exact source-to-target table names, exact schema-qualified registration as `bronze.<table_name>`, exact physical folder expectation `Tables/bronze/<table_name>`, and explicit verification using catalog/listing plus read-back of each table.
+  - Added a mandatory end-of-layer assertion that the discoverable Bronze set count must equal 13 exactly before Bronze is considered successful.
+
 ## Inputs
 - Workspace: `2127a578-6ec2-447e-b8a9-94868408b064`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -63,6 +72,7 @@ Cross-cutting code rules:
 - Treat the three `v*` objects as source tables/views and validate whether they add business value versus duplicating derivations already achievable from base tables.
 - Bronze/Silver discoverability rule: a layer is only considered successful if its outputs are both physically written and discoverable by Spark catalog/listing in the target Lakehouse using the expected schema-qualified names. For Bronze specifically, Silver must be able to discover the outputs as `bronze.<table_name>` objects; if discovery fails for any expected table, raise in Bronze and stop the run.
 - Catalog/path parity rule: when writing managed Lakehouse tables, ensure the registered table name and the physical folder layout align with the schema/table convention expected by downstream layers. Do not write orphaned Delta paths without a discoverable table object, and do not register a table under a different schema/name than the medallion spec.
+- Managed Bronze write rule: for Bronze, the required outcome is a managed, catalog-visible table object in schema `bronze` for every listed source. Path-only writes, temp views, in-memory DataFrames, or files written outside the managed Lakehouse `Tables/bronze/<table_name>` convention do not satisfy the spec even if Delta files exist.
 - Post-write verification rule: after each table write, immediately verify the table exists in the target schema and is queryable; after the full Bronze loop, verify the complete expected Bronze set is present before allowing downstream generation.
 - Notebook generation contract rule: every layer notebook MUST contain executable code cells. Do not return an empty notebook, a markdown-only notebook, or a placeholder plan with no Python/Spark cells.
 - Minimum executable notebook rule: if the generator is uncertain, it must still emit a runnable scaffold with parameter initialization, helper functions, source table list, a loop over the required objects for the failed layer, write logic, and final validation. Runtime validation may fail loudly, but notebook generation itself must not yield zero cells.
@@ -149,24 +159,28 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
 - The Bronze notebook MUST create/ensure the `bronze` schema exists in the target Lakehouse before writing any table.
 - For each source object above, the write outcome MUST be a discoverable schema-qualified table with the exact name listed above; do not write only to an unmanaged/orphan path and assume downstream discovery will infer it.
 - Physical organization MUST align with the Lakehouse table convention expected by downstream discovery: each Bronze output must land under the target Lakehouse managed tables area for schema `bronze` and table `<table_name>` so that listing/querying `bronze.<table_name>` succeeds immediately after the write.
-- The Bronze code MUST explicitly iterate over the full required object list below; do not omit any object due to uncertainty:
-  - `SalesLT/Address` -> `bronze.address`
-  - `SalesLT/Customer` -> `bronze.customer`
-  - `SalesLT/CustomerAddress` -> `bronze.customer_address`
-  - `SalesLT/Product` -> `bronze.product`
-  - `SalesLT/ProductCategory` -> `bronze.product_category`
-  - `SalesLT/ProductDescription` -> `bronze.product_description`
-  - `SalesLT/ProductModel` -> `bronze.product_model`
-  - `SalesLT/ProductModelProductDescription` -> `bronze.product_model_product_description`
-  - `SalesLT/SalesOrderDetail` -> `bronze.sales_order_detail`
-  - `SalesLT/SalesOrderHeader` -> `bronze.sales_order_header`
-  - `SalesLT/vGetAllCategories` -> `bronze.v_get_all_categories`
-  - `SalesLT/vProductAndDescription` -> `bronze.v_product_and_description`
-  - `SalesLT/vProductModelCatalogDescription` -> `bronze.v_product_model_catalog_description`
+- Bronze writes are REQUIRED to use one canonical target mapping only; do not derive alternative folder names or schema names:
+  - `SalesLT/Address` -> schema `bronze`, table `address`, expected object `bronze.address`, expected managed folder `Tables/bronze/address`
+  - `SalesLT/Customer` -> schema `bronze`, table `customer`, expected object `bronze.customer`, expected managed folder `Tables/bronze/customer`
+  - `SalesLT/CustomerAddress` -> schema `bronze`, table `customer_address`, expected object `bronze.customer_address`, expected managed folder `Tables/bronze/customer_address`
+  - `SalesLT/Product` -> schema `bronze`, table `product`, expected object `bronze.product`, expected managed folder `Tables/bronze/product`
+  - `SalesLT/ProductCategory` -> schema `bronze`, table `product_category`, expected object `bronze.product_category`, expected managed folder `Tables/bronze/product_category`
+  - `SalesLT/ProductDescription` -> schema `bronze`, table `product_description`, expected object `bronze.product_description`, expected managed folder `Tables/bronze/product_description`
+  - `SalesLT/ProductModel` -> schema `bronze`, table `product_model`, expected object `bronze.product_model`, expected managed folder `Tables/bronze/product_model`
+  - `SalesLT/ProductModelProductDescription` -> schema `bronze`, table `product_model_product_description`, expected object `bronze.product_model_product_description`, expected managed folder `Tables/bronze/product_model_product_description`
+  - `SalesLT/SalesOrderDetail` -> schema `bronze`, table `sales_order_detail`, expected object `bronze.sales_order_detail`, expected managed folder `Tables/bronze/sales_order_detail`
+  - `SalesLT/SalesOrderHeader` -> schema `bronze`, table `sales_order_header`, expected object `bronze.sales_order_header`, expected managed folder `Tables/bronze/sales_order_header`
+  - `SalesLT/vGetAllCategories` -> schema `bronze`, table `v_get_all_categories`, expected object `bronze.v_get_all_categories`, expected managed folder `Tables/bronze/v_get_all_categories`
+  - `SalesLT/vProductAndDescription` -> schema `bronze`, table `v_product_and_description`, expected object `bronze.v_product_and_description`, expected managed folder `Tables/bronze/v_product_and_description`
+  - `SalesLT/vProductModelCatalogDescription` -> schema `bronze`, table `v_product_model_catalog_description`, expected object `bronze.v_product_model_catalog_description`, expected managed folder `Tables/bronze/v_product_model_catalog_description`
+- The Bronze code MUST explicitly iterate over the full required object list above; do not omit any object due to uncertainty.
+- The Bronze load MUST treat successful completion as dependent on all 13 required tables being discoverable. A partial success with fewer than 13 registered Bronze tables is a failure, not a warning.
 - If generation logic would otherwise return no notebook cells, it MUST instead emit the required Bronze scaffold above and implement the full table loop with fail-fast runtime checks. Returning zero cells is not allowed.
 - After writing each Bronze table, immediately verify all of the following before moving on:
   - the table is discoverable as `bronze.<table_name>`
   - it is queryable by Spark
+  - a `SELECT COUNT(1)` against `bronze.<table_name>` succeeds
+  - listing the `bronze` schema includes `<table_name>`
   - it contains at least the source columns plus the required Bronze technical columns
 - After the full Bronze load, perform a completeness assertion that the full expected Bronze set exists and is discoverable:
   - `bronze.address`
@@ -182,6 +196,7 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
   - `bronze.v_get_all_categories`
   - `bronze.v_product_and_description`
   - `bronze.v_product_model_catalog_description`
+- The final Bronze assertion MUST also verify the discoverable Bronze table count equals exactly `13` for the required set above. If the count is not exactly 13, fail Bronze with an explicit missing/unexpected-table diagnostic and do NOT allow the run to proceed.
 - If any expected Bronze table is missing from discovery after the write loop, fail Bronze with an explicit missing-table error and do NOT allow the run to proceed to Silver.
 - Add standard technical columns to every bronze table:
   - `ingested_at_utc`
