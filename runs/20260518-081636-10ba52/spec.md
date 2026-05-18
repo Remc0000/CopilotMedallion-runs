@@ -11,6 +11,15 @@
   - Tightened `## Bronze` with explicit source-to-target table mappings, required path naming, per-table write verification, and a hard failure if any listed source is not written discoverably.
   - Preserved all downstream intent; no upstream/downstream business modeling changes were made beyond ensuring Bronze outputs exist for Silver discovery.
 
+### Iteration 2 — 2026-05-18 08:24:07Z — failed layer: bronze (run: 20260518-081636-10ba52)
+- **Root cause (1-line summary)**: Bronze still produced zero discoverable outputs because the notebook did not create physical Delta folders under the lakehouse-relative `Tables/bronze/<flat_name>` paths that the pipeline scanner inspects.
+- **Cross-table audit**: `SalesLT/Address`: yes — must physically land at `Tables/bronze/address`; `SalesLT/Customer`: yes — same physical-path requirement; `SalesLT/CustomerAddress`: yes — same physical-path requirement for bridge table; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — views are also required to land as physical Delta folders; `SalesLT/vProductAndDescription`: yes — same; `SalesLT/vProductModelCatalogDescription`: yes — same. No listed input is exempt because discoverability is path-based, not schema-based.
+- **Fix approach**: GENERALIZE — the root cause is uniformly applicable to every Bronze source object, so one strict physical-write contract is safer than table-by-table exceptions.
+- **What was changed**:
+  - Tightened `## Generic guidance` to require lakehouse-relative path writes rooted at the target lakehouse `Tables/...` folder, plus a mandatory final reconciliation that every expected Bronze folder exists and is Delta-readable.
+  - Tightened `## Bronze` with an explicit implementation contract: iterate the exact input list, derive the exact flat folder name, write each DataFrame to `Tables/bronze/<flat_name>`, verify row count and `_delta_log`, and fail if the set of actual outputs differs from the expected 13-table set.
+  - Added a strict prohibition on metastore-only writes, temp views, or alternate folder roots (`Files`, schema-prefixed names, mixed-case layer folders) for Bronze outputs.
+
 ## Inputs
 - Workspace: `2242620d-b06e-48f8-a3ee-8e9ae6ffd17f`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -51,6 +60,8 @@ Cross-cutting code rules:
 - Use error-loud `try/except` blocks that call `_save_error(layer, e)` (and `_save_error(layer, e, table=tbl)` inside per-table loops) and then re-raise per the per-table isolation pattern.
 - Every generated notebook cell must start with a short markdown-style Python comment block using a `# ---` divider and 1-3 explanatory comment lines.
 - Discoverability rule for all persisted layers, especially Bronze: a write is considered successful only if the notebook writes a Delta dataset by path under the exact lakehouse-relative folder `Tables/<layer>/<expected_table_name>` and then verifies that path exists and is readable as Delta before proceeding. Logging success without this verification is not sufficient.
+- Treat `Tables/<layer>/<name>` as a PHYSICAL lakehouse folder contract, not a logical/metastore name. The next layer scanner inspects physical Delta folders under the target lakehouse `Tables` area; therefore metastore registration alone, temp views, SQL-only objects, or writes to alternate roots will not satisfy discoverability.
+- At the end of every layer notebook, reconcile the expected output set against the actual written paths. If any expected table is missing, or if the count of discoverable outputs is zero, raise immediately with the missing table names before notebook completion.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -145,6 +156,24 @@ Rule L — Bronze path naming must be deterministic and exactly match the listed
   - `SalesLT/vProductModelCatalogDescription` → `Tables/bronze/vproductmodelcatalogdescription`
 - Do not write to alternate locations such as `Files/...`, `Tables/Bronze/...`, `Tables/bronze/SalesLT_<name>`, or any schema-qualified folder. Silver discovery expects the exact `Tables/bronze/<flat_name>` convention above.
 
+Rule M — Bronze must reconcile the exact expected output set before successful completion.
+- The expected Bronze output set for this run is EXACTLY:
+  - `address`
+  - `customer`
+  - `customeraddress`
+  - `product`
+  - `productcategory`
+  - `productdescription`
+  - `productmodel`
+  - `productmodelproductdescription`
+  - `salesorderdetail`
+  - `salesorderheader`
+  - `vgetallcategories`
+  - `vproductanddescription`
+  - `vproductmodelcatalogdescription`
+- After the per-table loop, compare the expected set above to the set of successfully verified Bronze folders. If there is any missing or extra name, raise with both sets in the error message.
+- A Bronze run is only considered complete when all 13 expected folders exist under `Tables/bronze/` and each is Delta-readable.
+
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
 # ---
@@ -171,25 +200,37 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - `SalesLT/vGetAllCategories` → `Tables/bronze/vgetallcategories`
   - `SalesLT/vProductAndDescription` → `Tables/bronze/vproductanddescription`
   - `SalesLT/vProductModelCatalogDescription` → `Tables/bronze/vproductmodelcatalogdescription`
-- For each table:
-  - Read from the source lakehouse path/object exactly as provided.
-  - Preserve source business columns as-is in Bronze; do not apply business joins in this layer.
+- Bronze implementation contract for this run:
+  - Drive ingestion from the exact `## Inputs` table list; do not hardcode a smaller subset and do not infer additional tables.
+  - For each input `SalesLT/<Name>`, derive `flat_name = lower(<Name>)` with no schema prefix and no inserted underscores.
+  - Read the source object from the source lakehouse.
   - Add standard Bronze metadata columns:
     - `_run_id`
     - `_bronze_ingested_at`
     - `_source_table`
     - `_source_lakehouse_id`
     - `_ingest_date`
+  - Preserve source business columns as-is in Bronze; do not apply business joins in this layer.
   - Normalize only minimally for operability:
     - retain original names in Bronze to mirror source shape
     - optionally flatten unsupported characters if needed, but no business renaming yet
     - preserve binary column `ThumbNailPhoto` in Bronze even if excluded later
-  - Write each table as Delta by path, not as a metastore-only object, using the exact target folder listed above.
-  - Immediately after each write, verify the target path is discoverable and non-empty as a Delta dataset:
-    - confirm the folder exists under `Tables/bronze/<table_name_lower>`
-    - confirm `_delta_log` exists for that folder
+  - Write EACH table as a physical Delta dataset by path under the target lakehouse `Tables/bronze/<flat_name>` folder only.
+  - Do not satisfy Bronze with any of the following:
+    - metastore-only table creation
+    - temp views
+    - SQL objects without a physical Delta folder
+    - writes under `Files/...`
+    - writes under `Tables/Bronze/...`
+    - writes under `Tables/bronze/SalesLT_<name>` or any schema-qualified variant
+- Mandatory per-table post-write verification:
+  - Immediately after each write, verify the exact target path `Tables/bronze/<flat_name>` is discoverable and non-empty as a Delta dataset.
+  - Verification must include ALL of:
+    - confirm the target folder exists under `Tables/bronze/<flat_name>`
+    - confirm `_delta_log` exists in that folder
     - confirm `spark.read.format('delta').load(target_path)` succeeds
-    - capture the written row count in the results summary
+    - confirm the loaded DataFrame row count is greater than or equal to 0 and capture that count
+    - record the verified path and row count in the Bronze results summary keyed by `flat_name`
   - If a table read succeeds but its Delta write or post-write verification fails, record that table as failed and continue to the next table per per-table isolation rules.
 - Write mode and partitioning:
   - Use overwrite with schema overwrite for idempotent reruns.
@@ -198,6 +239,35 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - `SalesOrderHeader` and `SalesOrderDetail` are the main transactional sources and should be landed without filtering.
   - `CustomerAddress` is still ingested even though the requested Gold customer dimension does not use it; keep it available for audit/alternate modeling.
   - View objects (`vGetAllCategories`, `vProductAndDescription`, `vProductModelCatalogDescription`) must be treated as regular sources and landed exactly with the columns returned by the view.
+- Mandatory final Bronze reconciliation:
+  - The successful verified Bronze output names must be EXACTLY this 13-item set:
+    - `address`
+    - `customer`
+    - `customeraddress`
+    - `product`
+    - `productcategory`
+    - `productdescription`
+    - `productmodel`
+    - `productmodelproductdescription`
+    - `salesorderdetail`
+    - `salesorderheader`
+    - `vgetallcategories`
+    - `vproductanddescription`
+    - `vproductmodelcatalogdescription`
+  - Before notebook completion, compare:
+    - expected Bronze names from the mapping above
+    - actual successfully verified Bronze names written in this run
+  - If any expected Bronze output is missing, raise an error naming the missing `flat_name` values.
+  - If the actual verified output set is empty, raise immediately with `zero discoverable bronze outputs`.
+  - If the actual verified output set differs from expected in any way, raise with both expected and actual sets.
+  - Emit a final JSON summary containing:
+    - `run_id`
+    - `layer = bronze`
+    - `expected_tables`
+    - `written_tables`
+    - `failed_tables`
+    - per-table `rows`
+    - per-table exact `path`
 - Bronze completion rule:
   - Raise an error if no Bronze tables are written.
   - Raise an error if any listed input table does not result in a discoverable Delta output at its exact required path.
