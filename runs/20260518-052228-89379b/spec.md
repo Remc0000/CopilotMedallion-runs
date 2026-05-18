@@ -56,6 +56,15 @@
   - Tightened **Bronze** to require one exact schema-qualified SQL write contract per table (`CREATE OR REPLACE TABLE bronze.<table_name> AS SELECT ...`) and to forbid path-only writes, temp-view-only outputs, or relying on inferred registration.
   - Added an explicit end-of-layer gate that must validate the full expected set of 13 `bronze.<table_name>` objects by exact name before Silver generation is allowed.
 
+### Iteration 7 — 2026-05-18 05:51:11Z — failed layer: bronze (run: 20260518-052228-89379b)
+- **Root cause (1-line summary)**: The next build still reported zero discoverable Bronze tables, so Bronze needs an explicit target-lakehouse attachment/use step and a catalog verification that runs in the target context before the layer is considered successful.
+- **Cross-table audit**: `SalesLT/Address`: yes — if the notebook writes while attached to the wrong default lakehouse/context, `bronze.address` will not be discoverable in the target lakehouse; `SalesLT/Customer`: yes — same; `SalesLT/CustomerAddress`: yes — same; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — same; `SalesLT/vProductAndDescription`: yes — same; `SalesLT/vProductModelCatalogDescription`: yes — same.
+- **Fix approach**: GENERALIZE — the failure is systemic across all 13 Bronze objects because discoverability depends on notebook lakehouse/catalog context, not on any one table’s schema or shape.
+- **What was changed**:
+  - Tightened **Generic guidance** to require that the Bronze notebook explicitly bind to the target lakehouse/catalog context before any `CREATE OR REPLACE TABLE bronze.<table_name>` statement executes, and to fail immediately if the active context is not the target lakehouse.
+  - Tightened **Bronze** with a required pre-write context gate, a required schema creation/use sequence in the target lakehouse, and a post-write verification that the exact 13 Bronze tables are discoverable from that same target context.
+  - Added an explicit prohibition on writing Bronze tables while still attached to the source lakehouse or an implicit/default context.
+
 ## Inputs
 - Workspace: `2127a578-6ec2-447e-b8a9-94868408b064`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -103,6 +112,7 @@ Cross-cutting code rules:
 - Post-write verification rule: after each table write, immediately verify the table exists in the target schema and is queryable; after the full Bronze loop, verify the complete expected Bronze set is present before allowing downstream generation.
 - Bronze read-back gate rule: for every required Bronze output, the verification must include a successful schema-qualified read using the exact object name `spark.table("bronze.<table_name>")` (or equivalent `SELECT * FROM bronze.<table_name> LIMIT 1`). A file-path existence check, a temporary view, or a schema listing alone is insufficient.
 - Bronze managed-table creation rule: use one exact managed-table creation pattern that both writes data and registers the target object under the final schema-qualified name in a single step. Prefer `CREATE OR REPLACE TABLE bronze.<table_name> AS SELECT ...` from a prepared temp view/DataFrame projection. Do not rely on a separate later registration step to make a prior path write discoverable.
+- Bronze lakehouse-context rule: before any Bronze write or Bronze read-back validation, the notebook MUST explicitly attach/use the target lakehouse context (`CopilotMedallion_20260518_051803`) and verify that subsequent catalog operations are executing against that target, not the source lakehouse or an implicit default context. If the active context cannot be confirmed as the target lakehouse, fail Bronze before processing any table.
 - Notebook generation contract rule: every layer notebook MUST contain executable code cells. Do not return an empty notebook, a markdown-only notebook, or a placeholder plan with no Python/Spark cells.
 - Minimum executable notebook rule: if the generator is uncertain, it must still emit a runnable scaffold with parameter initialization, helper functions, source table list, a loop over the required objects for the failed layer, write logic, and final validation. Runtime validation may fail loudly, but notebook generation itself must not yield zero cells.
 - Cell-count safety rule: every generated notebook must contain multiple cells, including at least one executable setup cell and at least one executable transform/write cell. For Bronze specifically, the notebook must include enough executable cells to read source objects, write target tables, and verify discoverability.
@@ -188,10 +198,13 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
 - Minimum Bronze notebook structure is REQUIRED and must contain at least these executable units:
   - parameter/setup cell
   - imports + helper functions cell
+  - explicit target-lakehouse attachment/context-validation cell
   - schema/table mapping cell for all 13 source objects
   - source read + bronze write loop cell
   - post-write verification/completeness assertion cell
 - The Bronze notebook MUST create/ensure the `bronze` schema exists in the target Lakehouse before writing any table.
+- BEFORE creating the `bronze` schema or writing any Bronze table, the notebook MUST explicitly switch/attach to the target Lakehouse `CopilotMedallion_20260518_051803` and verify that this target lakehouse is the active context for catalog operations. Do not rely on whichever lakehouse the session happened to start with.
+- The Bronze notebook MUST fail immediately if it cannot confirm that the active write/catalog context is the target lakehouse. Writing while attached to the source lakehouse `SalesLT` or any unspecified default context does not satisfy this spec, even if SQL statements succeed.
 - For each source object above, the write outcome MUST be a discoverable schema-qualified table with the exact name listed above; do not write only to an unmanaged/orphan path and assume downstream discovery will infer it.
 - Physical organization MUST align with the Lakehouse table convention expected by downstream discovery: each Bronze output must land under the target Lakehouse managed tables area for schema `bronze` and table `<table_name>` so that listing/querying `bronze.<table_name>` succeeds immediately after the write.
 - Bronze writes are REQUIRED to use one canonical target mapping only; do not derive alternative folder names or schema names:
@@ -226,16 +239,17 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
 - Do not snake_case or otherwise rewrite the source object names for the read step. Snake_case applies only to the Bronze target table names listed above.
 - The Bronze loop MUST use exactly one read attempt per source object via Spark table resolution and exactly one managed-table create/replace attempt per target table. Do not implement fallback reads from ad hoc file paths, `Tables/...` guesses, alternate schemas, or multiple write retries inside the same notebook pass.
 - The required Bronze write contract is:
+  - confirm target lakehouse context is active
   - read `SalesLT.<ObjectName>` into a DataFrame
   - add the required Bronze technical columns
   - register that prepared DataFrame as a temp view for the current object
   - execute `CREATE OR REPLACE TABLE bronze.<table_name> AS SELECT * FROM <prepared_temp_view>`
 - Do not satisfy Bronze with `df.write.format("delta").save(...)`, `insertInto`, temp-view-only output, or any pattern that depends on a later registration step to make the table discoverable.
-- The Bronze loop MUST process each source object in this exact per-table order: (1) log START read, (2) read source object, (3) assert DataFrame is non-null and schema is non-empty, (4) add Bronze technical columns, (5) create or replace `bronze.<table_name>` using the exact SQL contract above, (6) read back `bronze.<table_name>` via schema-qualified name, (7) run `SELECT COUNT(1)` validation against `bronze.<table_name>`, (8) confirm schema listing contains the table, (9) log SUCCESS for the table.
-- If any one of the nine per-table steps above fails for a source object, Bronze MUST stop immediately and raise an error that includes all of: `source_object_name`, `target_schema`, `target_table`, `phase`, and the underlying Spark exception text. Do not swallow the exception and do not continue with later tables.
+- The Bronze loop MUST process each source object in this exact per-table order: (1) log START read, (2) read source object, (3) assert DataFrame is non-null and schema is non-empty, (4) add Bronze technical columns, (5) confirm target lakehouse/catalog context is still active immediately before write, (6) create or replace `bronze.<table_name>` using the exact SQL contract above, (7) read back `bronze.<table_name>` via schema-qualified name, (8) run `SELECT COUNT(1)` validation against `bronze.<table_name>`, (9) confirm schema listing contains the table, (10) log SUCCESS for the table.
+- If any one of the per-table steps above fails for a source object, Bronze MUST stop immediately and raise an error that includes all of: `source_object_name`, `target_schema`, `target_table`, `phase`, and the underlying Spark exception text. Do not swallow the exception and do not continue with later tables.
 - For Bronze, do not issue extra exploratory actions such as repeated `count()`, `display()`, wide `collect()`, `show()`, schema-profiling passes, or schema inference loops on every table beyond the single required post-write validation count; keep actions minimal to reduce statement-failure cascades and session cancellation risk.
 - Source-read validation is mandatory before enrichment: each source object must be read explicitly from the source Lakehouse and validated as queryable before any target write begins. If the read fails, raise `Bronze source read failed for <source_object>` immediately rather than attempting downstream statements.
-- The Bronze load MUST treat successful completion as dependent on all 13 required tables being discoverable. A partial success with fewer than 13 registered Bronze tables is a failure, not a warning.
+- The Bronze load MUST treat successful completion as dependent on all 13 required tables being discoverable in the target lakehouse context. A partial success with fewer than 13 registered Bronze tables is a failure, not a warning.
 - If generation logic would otherwise return no notebook cells, it MUST instead emit the required Bronze scaffold above and implement the full table loop with fail-fast runtime checks. Returning zero cells is not allowed.
 - After writing each Bronze table, immediately verify all of the following before moving on:
   - the table is discoverable as `bronze.<table_name>`
@@ -244,6 +258,7 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
   - a `SELECT COUNT(1)` against `bronze.<table_name>` succeeds
   - listing the `bronze` schema includes `<table_name>`
   - it contains at least the source columns plus the required Bronze technical columns
+  - the verification is being executed from the target lakehouse context, not the source context
 - After the full Bronze load, perform a completeness assertion that the full expected Bronze set exists and is discoverable:
   - `bronze.address`
   - `bronze.customer`
@@ -260,6 +275,7 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
   - `bronze.v_product_model_catalog_description`
 - The final Bronze assertion MUST also verify the discoverable Bronze table count equals exactly `13` for the required set above. If the count is not exactly 13, fail Bronze with an explicit missing/unexpected-table diagnostic and do NOT allow the run to proceed.
 - The final Bronze assertion MUST be based on exact schema-qualified object names, not only folder existence. Specifically, verify that each expected `bronze.<table_name>` can be resolved by Spark and that the set of resolved names matches the expected 13-name set exactly.
+- The final Bronze assertion MUST run after re-confirming the session is attached to the target lakehouse `CopilotMedallion_20260518_051803`; do not perform the completeness check from the source lakehouse context.
 - If any expected Bronze table is missing from discovery after the write loop, fail Bronze with an explicit missing-table error and do NOT allow the run to proceed to Silver.
 - Add standard technical columns to every bronze table:
   - `ingested_at_utc`
@@ -556,95 +572,4 @@ Create a Power BI report tailored to the revised Gold model with customer, produ
 - Bar chart:
   - Sales Amount by `dim_sales[sales_person]`
 - Matrix:
-  - `dim_product[category_name]` -> `dim_product[subcategory_name]` -> `dim_product[product_name]`
-  - Values:
-    - Sales Amount
-    - Units Sold
-    - Average Selling Price
-
-### Page 2: Customer and Geography
-- Bar chart:
-  - Top customers by Sales Amount using `dim_customer[full_name]` or `dim_customer[company_name]`
-- Map or filled map if geography quality is sufficient:
-  - Sales Amount by `dim_customer[country_region]`, `dim_customer[state_province]`, and `dim_customer[city]`
-- Table:
-  - `dim_customer[full_name]`
-  - `dim_customer[company_name]`
-  - `dim_customer[email_address]`
-  - `dim_customer[phone]`
-  - `dim_customer[address_line1]`
-  - `dim_customer[city]`
-  - `dim_customer[state_province]`
-  - Order Count
-  - Sales Amount
-- Slicer set:
-  - `fact_sales[order_date]`
-  - `dim_customer[country_region]`
-  - `dim_customer[state_province]`
-  - `dim_sales[sales_person]`
-
-### Page 3: Product Performance
-- Bar chart:
-  - Top products by Sales Amount or Units Sold using `dim_product[product_name]`
-- Scatter chart:
-  - `dim_product[list_price]` vs Sales Amount by `dim_product[product_name]`
-- Table:
-  - `dim_product[product_name]`
-  - `dim_product[product_number]`
-  - `dim_product[color]`
-  - `dim_product[size]`
-  - `dim_product[standard_cost]`
-  - `dim_product[list_price]`
-  - `dim_product[category_name]`
-  - `dim_product[subcategory_name]`
-  - Sales Amount
-  - Units Sold
-- Optional decomposition tree:
-  - Sales Amount by `category_name` > `subcategory_name` > `product_name`
-- Optional detail card or table:
-  - `dim_product[product_model_name]`
-  - `dim_product[product_description]`
-  - `dim_product[is_sellable_currently]`
-  - `dim_product[is_discontinued]`
-
-### Page 4: Salesperson Analysis
-- Bar chart:
-  - Sales Amount by `dim_sales[sales_person]`
-- Table:
-  - `dim_sales[sales_person]`
-  - Order Count
-  - Units Sold
-  - Sales Amount
-  - Average Order Value
-- Trend visual:
-  - Sales Amount by `fact_sales[order_date]` split by `dim_sales[sales_person]`
-- Slicers:
-  - `dim_sales[sales_person]`
-  - `dim_product[category_name]`
-  - `fact_sales[order_date]`
-
-### Page 5: Data quality
-- Cards:
-  - Gold `fact_sales` row count
-  - Gold `dim_customer` distinct customer count
-  - Gold `dim_product` distinct product count
-  - Gold `dim_sales` distinct salesperson count
-- Validation cards or KPI indicators:
-  - customers missing Main Office address
-  - products missing English description
-  - products missing parent category or subcategory
-  - fact rows with missing customer, product, or salesperson key
-- Table:
-  - failing test name
-  - table
-  - severity
-  - failed row count
-  - run id
-- Bar chart:
-  - failures by Gold table
-- Detail grid:
-  - sample missing `customer_id`, `product_id`, or cleaned `sales_person`
-  - sample products with null `category_name` / `subcategory_name`
-
-### Report design notes
-- Prefer `fact_sales` for all core metrics
+  - `dim_product[category_name]` -> `dim_product[subcategory_name]` -> `dim_product[product_name
