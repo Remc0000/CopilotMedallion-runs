@@ -11,6 +11,15 @@
   - Tightened **Bronze** with exact flat-name mapping, exact target path pattern, required derivation of `_ingested_date`, and mandatory post-write verification plus final non-zero output assertion.
   - Clarified that Bronze must not rely on metastore/table registration for downstream discovery; path-based Delta outputs are the source of truth.
 
+### Iteration 2 — 2026-05-18 11:49:10Z — failed layer: bronze (run: 20260518-114435-36ceb8)
+- **Root cause (1-line summary)**: Bronze notebook allowed a per-table statement failure to cancel the Spark session before other tables could be attempted or before actionable table-level diagnostics were persisted.
+- **Cross-table audit**: Address: yes — any read/write/assert failure in its iteration can cancel the shared session; Customer: yes — same loop/session risk; CustomerAddress: yes — same; Product: yes — same; ProductCategory: yes — same; ProductDescription: yes — same; ProductModel: yes — same; ProductModelProductDescription: yes — same; SalesOrderDetail: yes — same; SalesOrderHeader: yes — same; vGetAllCategories: yes — same; vProductAndDescription: yes — same; vProductModelCatalogDescription: yes — same.
+- **Fix approach**: GENERALIZE — the failure is systemic across every Bronze source object because session cancellation is caused by notebook control-flow and action placement, not by one table’s business schema.
+- **What was changed**:
+  - Tightened **Generic guidance** with a mandatory Bronze two-phase execution pattern: preflight validation for all source objects first, then isolated per-table read/write/verify processing, with no single statement spanning multiple tables.
+  - Tightened **Bronze** to require table-level `try/except`, immediate error persistence, deferred notebook failure until after the loop, and explicit prohibition on pre-write actions (`count`, full scans, verification reads) before a successful save.
+  - Added mandatory final summary semantics: attempted/succeeded/failed tables must be recorded, and the notebook must raise once at the end if any required table failed.
+
 ## Inputs
 - Workspace: `e47657b4-6180-42ac-8c4c-779c0e480cc3`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -98,7 +107,8 @@ Rule G — Optional-column helpers must return typed Column nulls, not Python No
 
 Rule H — Per-table isolation; one table's failure must not cancel the Spark session for the rest.
 - Spark cancels the entire session when one statement crashes. If your notebook builds a single chained plan that touches every source table (one big SELECT, one big DataFrame, one big SQL script), any one table's failure kills ALL tables.
-- ALWAYS process source tables in a `for tbl in source_tables:` loop where each iteration is a SELF-CONTAINED unit: read → transform → write → record-result → recover. Wrap the loop body in `try/except` that calls `_save_error(layer, e, table=tbl)` and APPENDS the failure to a results dict, then **re-raises only AFTER the loop has attempted all tables** (or, if your spec says "fail-fast-first-table", re-raise immediately — but per-table-isolated by default).
+- ALWAYS process source tables in a `for tbl in source_tables:` loop where each iteration is a SELF-CONTAINED unit: read → transform → write → record-result → recover.
+- For Bronze specifically, do NOT re-raise inside the per-table `except` block. Persist the failure with `_save_error('bronze', e, table=tbl)`, append the failure details to a results dict/list, continue to the next table, and raise ONCE after the loop finishes if any required tables failed.
 - Do NOT build a single multi-CTE Spark SQL statement that joins/transforms many source tables in one shot. Each table's transform is its own DataFrame chain with its own `.write` call.
 - Do NOT share intermediate temp views across tables. Temp views from one iteration must not be assumed to exist in the next. If you need cross-table joins (typical for Gold), do them in a SECOND loop AFTER all per-table Silver/Gold writes are complete.
 
@@ -136,6 +146,33 @@ Rule L — Discoverability requires physical Delta path verification, not just s
   - `_delta_log` exists beneath that path
 - Do not rely on temp views, catalog registration, display(), or row-count-only logging as proof of Bronze success. Downstream discovery is path-based.
 
+Rule M — Bronze execution ordering must minimize session-wide cancellation risk.
+- Bronze must use a TWO-PHASE pattern:
+  - Phase 1: lightweight preflight validation for ALL configured source objects and ALL target path strings, with no writes and no expensive actions.
+  - Phase 2: per-table isolated processing for only the validated tables.
+- In preflight, validate only:
+  - source object name/path is non-empty
+  - target path is non-empty and contains `/Tables/bronze/`
+  - source object exists in the source lakehouse namespace
+- Do NOT run `count()`, wide `display()`, schema-inference side computations, verification re-reads, or any other expensive action during preflight.
+- Inside each table iteration, the allowed sequence is:
+  - read source table/view
+  - append metadata columns
+  - save to Delta target path
+  - verify path and `_delta_log`
+  - optionally re-read persisted Delta path for row count
+  - record success
+- Do NOT perform row counts on the source DataFrame before the write; if a source object is problematic, that pre-write action can fail before any output is landed and can cancel the session without partial success.
+
+Rule N — Bronze final error contract must be auditable.
+- Maintain a results structure with, at minimum, `attempted`, `succeeded`, `failed`, `target_path`, and `error_message` by table.
+- At notebook end, print a single JSON summary that includes:
+  - all attempted source tables
+  - all successful writes with exact target paths
+  - all failures with the failing table name and concise error text
+- If any required Bronze table failed, raise exactly one final exception AFTER printing the summary, and include the failed table names in the exception message.
+- This preserves partial-success diagnostics while still failing the run correctly.
+
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
 # ---
@@ -160,6 +197,9 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - `SalesLT/vGetAllCategories` -> `Tables/bronze/vgetallcategories`
   - `SalesLT/vProductAndDescription` -> `Tables/bronze/vproductanddescription`
   - `SalesLT/vProductModelCatalogDescription` -> `Tables/bronze/vproductmodelcatalogdescription`
+- Bronze MUST execute in two phases:
+  - Phase 1: preflight validation over all configured source objects and their computed target paths
+  - Phase 2: isolated per-table processing only after preflight has built the list of valid work items
 - Read each source table independently in a per-table loop; do not combine source reads in Bronze.
 - Preserve source schema as-is in Bronze, but add standard metadata columns:
   - `_run_id`
@@ -177,6 +217,20 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - Build the write target from the target lakehouse base path plus the exact relative path `Tables/bronze/<flat_table_name>`.
   - Do not write Bronze outputs anywhere else (not `Files/`, not `Tables/Bronze/`, not mixed-case names, not nested source-system folders).
   - Do not rely on metastore registration or `saveAsTable`; downstream discovery must succeed by scanning the physical `Tables/bronze/` folder.
+- Bronze per-table control flow is REQUIRED:
+  - Wrap each table iteration in its own `try/except`.
+  - On failure, call `_save_error('bronze', e, table=<source_table>)`, record the failure in the summary structure, and CONTINUE to the next table.
+  - Do not `raise` from inside the per-table loop.
+  - After the loop ends, raise once if any required source table failed.
+- Bronze preflight validation is REQUIRED before any write:
+  - Assert the source object exists before read.
+  - Assert the computed target write path string is non-empty and contains `/Tables/bronze/`.
+  - Build the complete list of work items first so target-path bugs are caught before writes begin.
+- Bronze action-ordering constraints:
+  - Do not call `count()` on the source DataFrame before saving it.
+  - Do not call `display()` or other eager actions on the source DataFrame inside the ingestion loop.
+  - The first expensive action in a table iteration should be the write to the Delta target path.
+  - If row count is needed for logging, obtain it only by re-reading the persisted Delta target path after `_delta_log` verification.
 - Bronze post-write verification is REQUIRED for every table:
   - After `save(...)`, verify the directory for `Tables/bronze/<flat_table_name>` exists.
   - Verify `Tables/bronze/<flat_table_name>/_delta_log` exists.
@@ -184,12 +238,11 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - Add the table to the success summary dict only after those checks pass.
   - If any check fails, treat the table as failed and call `_save_error('bronze', e, table=<source_table>)`.
 - Bronze validation:
-  - Assert the source object exists before read.
-  - Assert the target write path string is non-empty and contains `/Tables/bronze/` before calling `.save(...)`.
-  - After write, record row count and exact target path in a summary dict.
-  - Print a final JSON summary containing every successfully written Bronze table and path.
+  - Record for every attempted table: source name, flat table name, exact target path, status, and concise error text if failed.
+  - Print a final JSON summary containing attempted, succeeded, and failed Bronze tables and exact paths for successes.
   - Raise if zero Bronze tables were successfully verified as discoverable.
   - Raise if any required source table for downstream Gold modeling (`customer`, `customeraddress`, `address`, `product`, `productcategory`, `productmodel`, `productdescription`, `productmodelproductdescription`, `salesorderheader`, `salesorderdetail`) failed to land.
+  - The final raised exception must name the failed required tables explicitly.
 - Notes for views:
   - `vgetallcategories`, `vproductanddescription`, and `vproductmodelcatalogdescription` are still landed to Bronze for traceability, but Gold should prefer base tables where the user explicitly requested those joins.
   - Because view schemas can omit audit fields, Bronze must not try to synthesize source-side business audit logic for them.
