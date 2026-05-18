@@ -29,6 +29,15 @@
   - Tightened **Bronze** to require exact computation and logging of `bronze_root_path` and per-table `target_path`, explicit prohibition on relative-only saves like `Tables/bronze/...`, and strict post-write verification against the same fully resolved path.
   - Added a required notebook-start self-check that the target lakehouse root is writable/discoverable before processing any source table.
 
+### Iteration 4 — 2026-05-18 11:57:14Z — failed layer: bronze (run: 20260518-114435-36ceb8)
+- **Root cause (1-line summary)**: Bronze still hit `System_Cancelled_Session_Statements_Failed`, indicating the notebook is likely issuing unsupported/explosive Bronze write patterns (especially partitioned overwrite and/or verification re-reads) that can fail per table and cancel the shared session before enough outputs land.
+- **Cross-table audit**: Address: yes — same Bronze write/verify pattern can fail on any table even if schema is simple; Customer: yes — same session-cancelling write pattern risk; CustomerAddress: yes — same, and as a small junction table should not use partitioned overwrite; Product: yes — same risk if verification re-read or partitioning is forced; ProductCategory: yes — same; ProductDescription: yes — same; ProductModel: yes — same; ProductModelProductDescription: yes — same, and bridge tables are especially sensitive to unnecessary partitioning; SalesOrderDetail: yes — same risk, though larger volume may tempt partitioning; SalesOrderHeader: yes — same; vGetAllCategories: yes — same, and views should use the simplest possible landing path; vProductAndDescription: yes — same; vProductModelCatalogDescription: yes — same.
+- **Fix approach**: GENERALIZE — the root cause is a systemic Bronze execution-pattern issue, not a single table schema issue, so one strict low-risk landing rule for all source objects is safer than table-by-table exceptions.
+- **What was changed**:
+  - Tightened **Generic guidance** with a new Bronze safety rule: use the simplest possible landing pattern, avoid partitioned writes in Bronze, avoid immediate persisted row-count re-reads, and verify discoverability only via filesystem checks.
+  - Tightened **Bronze** to require unpartitioned overwrite writes for all tables, forbid post-write count/read verification inside the ingestion loop, and require success marking based only on exact target path + `_delta_log` existence.
+  - Clarified Bronze final validation to log row counts only as optional/non-blocking and never as a prerequisite for considering a Bronze table successfully landed.
+
 ## Inputs
 - Workspace: `e47657b4-6180-42ac-8c4c-779c0e480cc3`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -56,7 +65,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules for every generated notebook:
 - Use defensive column references everywhere; never assume a column still exists after a projection, rename, drop, or join.
@@ -143,8 +152,8 @@ Rule J — Validate column existence BEFORE the expensive transform.
 Rule K — Resilience to partial output: Bronze MUST write Delta tables that the next layer can discover.
 - The build pipeline runs each layer's notebook then inspects the lakehouse for the layer's output Delta tables before generating the next layer. If Bronze runs "successfully" (Spark Completed) but writes zero discoverable tables under `Tables/bronze/`, the build hard-fails with "prior layer produced no discoverable tables".
 - To guarantee discoverability, the Bronze notebook MUST:
-  - Write via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy(...).save(f"{tgt_base}/Tables/bronze/<flat>")` for every source table, where `<flat>` is the lowercased last segment of `table_relative_path`.
-  - Print a final summary line `print(json.dumps({{"bronze_results": {{<table>: {{"rows": N, "path": ...}}, ...}}}}))` listing every table actually written. Use this as a self-check.
+  - Write via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').save(f"{tgt_base}/Tables/bronze/<flat>")` for every source table, where `<flat>` is the lowercased last segment of `table_relative_path`.
+  - Print a final summary line `print(json.dumps({{"bronze_results": {{<table>: {{"path": ...}}, ...}}}}))` listing every table actually written. Use this as a self-check.
   - Raise (not just log) if zero tables were written by the end of the notebook.
 - Same rule applies recursively to Silver (`Tables/silver/<table>`) and Gold (`Tables/gold/<table>` + `Tables/test/test_results`).
 
@@ -169,7 +178,6 @@ Rule M — Bronze execution ordering must minimize session-wide cancellation ris
   - append metadata columns
   - save to Delta target path
   - verify path and `_delta_log`
-  - optionally re-read persisted Delta path for row count
   - record success
 - Do NOT perform row counts on the source DataFrame before the write; if a source object is problematic, that pre-write action can fail before any output is landed and can cancel the session without partial success.
 
@@ -196,6 +204,16 @@ Rule P — Discoverability self-check must verify the target lakehouse root, not
 - At notebook start, perform a lightweight writeability/discoverability self-check against the resolved target lakehouse root context before entering the per-table loop. The purpose is to catch bad path resolution early.
 - Acceptable pattern: verify the resolved Bronze root parent exists or can be listed in the target lakehouse filesystem namespace; if this cannot be confirmed, fail preflight.
 - Do not substitute a temp/local filesystem path for the target lakehouse path. Only the target lakehouse physical path counts as discoverable output.
+
+Rule Q — Bronze must use the lowest-risk landing pattern; avoid partitioned overwrite and post-write data reads in the ingestion loop.
+- Bronze is a raw landing layer. To reduce Fabric Spark session cancellations, default to the simplest possible write path for EVERY Bronze source object:
+  - `format('delta').mode('overwrite').option('overwriteSchema','true').save(target_path)`
+- Do NOT partition Bronze writes by `_ingested_date` or any other column unless a future run explicitly proves the unpartitioned landing pattern is stable and insufficient. Raw Bronze discoverability is more important than early physical optimization.
+- Do NOT treat an immediate persisted Delta re-read or row count as required proof of success. In Bronze, success is defined by:
+  - the write call returning without error
+  - the exact target path existing
+  - `_delta_log` existing beneath that target path
+- If row counts are logged, they must be optional, best-effort, and non-blocking after success has already been recorded.
 
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
@@ -238,11 +256,12 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - `_ingested_at`
   - `_source_table`
   - `_bronze_loaded_at`
-  - `_ingested_date` derived from `_ingested_at` as a plain date column; this column must be physically present before any partitioned write
+  - `_ingested_date` derived from `_ingested_at` as a plain date column; this column must be physically present in the written schema even though Bronze writes are unpartitioned
 - For source objects that already include `ModifiedDate`, keep it untouched; do not overwrite business audit columns.
 - Partitioning intent:
-  - For large transactional tables `salesorderheader` and `salesorderdetail`, partition Bronze by `_ingested_date`.
-  - For small/master/view tables, write unpartitioned unless the notebook generator enforces `_ingested_date` partitioning uniformly across all Bronze tables.
+  - Bronze MUST write ALL tables unpartitioned on the next build attempt, including `salesorderheader` and `salesorderdetail`.
+  - Do not use `.partitionBy(...)` anywhere in Bronze for this run.
+  - Rationale: Bronze stability/discoverability takes precedence over early storage optimization, and partitioned overwrite is explicitly disallowed until the raw landing pattern succeeds.
 - Write mode:
   - Full overwrite per run, `format('delta').mode('overwrite').option('overwriteSchema','true')`.
 - Bronze path contract:
@@ -269,15 +288,17 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - Do not call `count()` on the source DataFrame before saving it.
   - Do not call `display()` or other eager actions on the source DataFrame inside the ingestion loop.
   - The first expensive action in a table iteration should be the write to the Delta target path.
-  - If row count is needed for logging, obtain it only by re-reading the persisted Delta target path after `_delta_log` verification.
+  - Do not re-read the just-written Delta path inside the ingestion loop merely to prove success.
+  - If row count is wanted for diagnostics, it must be a non-blocking best-effort step after success is already recorded, and any failure in that optional count must not flip the table from success to failure.
 - Bronze post-write verification is REQUIRED for every table:
   - After `save(target_path)`, verify the directory for that exact fully resolved `target_path` exists.
   - Verify `<target_path>/_delta_log` exists.
-  - Re-read the just-written Delta path from that same exact fully resolved `target_path` and capture row count from the persisted path, not from a pre-write DataFrame only.
-  - Add the table to the success summary dict only after those checks pass.
-  - If any check fails, treat the table as failed and call `_save_error('bronze', e, table=<source_table>)`.
+  - Mark the table as successfully landed immediately after those filesystem checks pass.
+  - Do NOT require an immediate `spark.read.format('delta').load(target_path).count()` or similar persisted re-read in order to consider the Bronze table successful.
+  - If the write call itself fails, or if the exact path / `_delta_log` check fails, treat the table as failed and call `_save_error('bronze', e, table=<source_table>)`.
 - Bronze validation:
   - Record for every attempted table: source name, flat table name, exact fully resolved target path, status, and concise error text if failed.
+  - `rows` in the final summary is OPTIONAL in Bronze. If omitted because no safe non-blocking count was performed, that is acceptable.
   - Print a final JSON summary containing attempted, succeeded, and failed Bronze tables and exact paths for successes.
   - Raise if zero Bronze tables were successfully verified as discoverable.
   - Raise if any required source table for downstream Gold modeling (`customer`, `customeraddress`, `address`, `product`, `productcategory`, `productmodel`, `productdescription`, `productmodelproductdescription`, `salesorderheader`, `salesorderdetail`) failed to land.
