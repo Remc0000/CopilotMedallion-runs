@@ -56,6 +56,15 @@
   - Tightened **Bronze** to require a two-phase verification sequence for every target: first confirm catalog registration and successful `spark.read.table(...)`, then inspect the returned schema and only then compare expected columns.
   - Added an explicit Bronze constraint to avoid immediate column assertions against a table object that has not yet materialized with a readable schema; the error path must report `available=[]` as an empty-schema publication defect.
 
+### Iteration 7 — 2026-05-18 08:07:06Z — failed layer: bronze (run: 20260518-072303-b0e64b)
+- **Root cause (1-line summary)**: Bronze attempted `CreateLakehouse` and failed with `Unauthorized`; the notebook must not create or recreate the target lakehouse and must use the already-provided target lakehouse `e2e` only.
+- **Cross-table audit**: `SalesLT/Address`: yes — publishing this table can trigger the same unauthorized setup path; `SalesLT/Customer`: yes — same; `SalesLT/CustomerAddress`: yes — same; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — same; `SalesLT/vProductAndDescription`: yes — same; `SalesLT/vProductModelCatalogDescription`: yes — same. The root cause is systemic because lakehouse-selection/bootstrap logic is shared across all Bronze table writes rather than tied to any one source schema.
+- **Fix approach**: **GENERALIZE** — the failure is an environment/bootstrap rule that applies uniformly to every Bronze source table, so one explicit "bind to existing lakehouse only, never create lakehouse" rule is safer than per-table exceptions.
+- **What was changed**:
+  - Tightened **Generic guidance** to explicitly forbid any notebook/API/CLI action that creates, clones, attaches, or recreates a lakehouse during this run; the build must bind to the existing target lakehouse only.
+  - Tightened **Bronze** with a preflight requirement to resolve and validate the existing target lakehouse `e2e` before any table processing, and to fail immediately if it is inaccessible instead of attempting `CreateLakehouse`.
+  - Added explicit Bronze publish constraints and diagnostics requiring all writes to occur inside the existing attached target lakehouse context and naming unauthorized lakehouse-creation attempts as spec violations.
+
 ## Inputs
 - Workspace: `16119d4a-a872-4e9f-b622-0b14f8fb05b7`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -110,6 +119,9 @@ Cross-cutting code rules:
 - Do not mix metadata contracts across templates. Names such as `ingestion_timestamp`, `source_path`, `batch_id`, and `ingestion_date` are not valid Bronze-required columns for this run and must not appear in assertions, publish checks, or completion criteria.
 - Schema verification must compare against the actual DataFrame read from the schema-qualified table name. If `spark.read.table('<schema>.<table>')` returns a DataFrame with zero columns, treat that as a publication/read-back failure immediately and report the table name plus the empty `available=[]` schema state.
 - New publication verification rule: do not perform expected-column comparison until AFTER the notebook has confirmed that `spark.read.table('<schema>.<table>')` returned a DataFrame with a non-empty schema. An empty-schema read-back is a distinct publish/materialization failure, not a normal missing-column case, and must short-circuit the verification flow before any business-column diff logic.
+- Environment/bootstrap rule for this run: use the existing workspace and the existing source/target lakehouses exactly as provided in `## Inputs`. Do not call any API, helper, notebook utility, or CLI action that creates a lakehouse, recreates a lakehouse, clones a lakehouse, or auto-provisions a missing default lakehouse.
+- Specifically forbidden for this run: any `CreateLakehouse` attempt against either the source or target workspace context. If the target lakehouse `e2e` is missing, unattached, or inaccessible, fail immediately with a clear preflight error; do not attempt self-healing by creating a new lakehouse.
+- Lakehouse context selection must be bind-only, not create-on-demand. All notebooks must attach/use the pre-existing target lakehouse `e2e` and pre-existing source lakehouse `SalesLT`; unauthorized setup operations are a hard failure condition, not a retry scenario.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -168,6 +180,13 @@ Purpose: land exact source tables into `bronze` with minimal transformation, pre
 
 Landing approach for all selected tables:
 - Read each source table/view from the source lakehouse and write to a discoverable managed Delta table in schema `bronze` using the exact target names below.
+- For this run, assume the target lakehouse already exists and is named exactly `e2e`. Bronze must attach/bind to that existing lakehouse only; it must not attempt to create, recreate, or auto-provision any lakehouse as part of setup or publish.
+- Before processing the first source table, run a Bronze preflight that validates all of the following and stops immediately if any check fails:
+  - the workspace context matches `16119d4a-a872-4e9f-b622-0b14f8fb05b7`
+  - the source lakehouse resolves to existing lakehouse `SalesLT`
+  - the target lakehouse resolves to existing lakehouse `e2e`
+  - the notebook/session has permission to read from `SalesLT` and write to `e2e`
+- If any of the above preflight checks fail, raise a clear authorization/access error naming the unresolved or unauthorized object. Do not call `CreateLakehouse`, do not retry by provisioning a replacement lakehouse, and do not continue to per-table processing.
 - For each source, the Bronze notebook must both:
   - write the Delta data for the target table, and
   - publish/register it so it is discoverable as `bronze.<table_name_snake_case>` from the target lakehouse catalog and visible under `Tables/bronze/`.
@@ -183,12 +202,13 @@ Landing approach for all selected tables:
   - `bronze.sales_order_detail`: no natural date on detail, so do not partition independently unless joined staging is explicitly created
 - Do not partition small/master tables such as address, customer, product, category, model, description, and bridge tables.
 - Mandatory per-table execution order for Bronze:
+  0. Complete the lakehouse-access preflight above and confirm the notebook is operating against the existing target lakehouse `e2e`.
   1. Resolve the exact source object name from the mapping below.
   2. Assert the source object is readable by that exact name before any transform/write logic.
   3. Read the source into a DataFrame and capture the original source column list for later verification.
   4. Add Bronze metadata columns only; do not rename or reshape business columns in Bronze.
   5. Apply table-specific optional partitioning only after asserting the required source column exists.
-  6. Publish exactly one target managed Delta lakehouse table using a Fabric-supported catalog creation/overwrite pattern that results in a real object at `bronze.<table_name>` under `Tables/bronze/<table_name>`.
+  6. Publish exactly one target managed Delta lakehouse table using a Fabric-supported catalog creation/overwrite pattern that results in a real object at `bronze.<table_name>` under `Tables/bronze/<table_name>` inside the existing target lakehouse `e2e`.
   7. Immediately verify the published target table before starting the next source table.
 - Mandatory Bronze publication implementation constraints:
   - The final Bronze artifact must be a catalog-discoverable lakehouse table, not just Delta files written to a folder.
@@ -196,6 +216,8 @@ Landing approach for all selected tables:
   - The publish step must be completed as a single table-materialization action for the final identifier `bronze.<table_name>`; do not verify against an intermediate object, temp view, staged path, or partially registered table.
   - After publication, `bronze.<table_name>` must be readable through `spark.read.table(...)` and also materially present in the target lakehouse `Tables/bronze/` namespace with the same final table name.
   - Do not treat temp views, SQL views, or notebook-local DataFrames as a successful Bronze publish.
+  - Do not use any publish helper that implicitly creates a missing lakehouse. If the helper attempts workspace/lakehouse creation behind the scenes, it is not allowed for this run.
+  - Schema creation is allowed only within the existing target lakehouse catalog context (for example creating schema `bronze` inside `e2e` if absent). Lakehouse creation itself is not allowed.
 - Mandatory Bronze schema contract:
   - Business columns in Bronze must remain exactly as read from the source object, preserving original casing and names such as `AddressID`, `AddressLine1`, `City`, `rowguid`, and `ModifiedDate`.
   - Bronze verification must assert the read-back table contains all captured original source business columns plus the required Bronze metadata columns actually defined in this spec.
@@ -224,10 +246,17 @@ Landing approach for all selected tables:
   - Verification must be performed against the schema-qualified object `bronze.<table_name>` itself. Do not verify against a path-only DataFrame, temp view, or stale variable from before publication.
   - If any one table fails source validation, write, publication, or verification, stop Bronze immediately; do not continue to remaining tables and do not allow the notebook to report success.
 - Mandatory diagnostics for Bronze:
+  - Emit a start/end log line for the lakehouse-access preflight, including the exact source lakehouse `SalesLT`, target lakehouse `e2e`, and workspace id.
   - Emit a start/end log line for each source table using the exact source name and exact target name.
   - Emit a start/end log line for each sub-step: `source_check`, `read`, `metadata_add`, `write`, `publish_verify`.
   - Emit the exact publish method used for each table and whether the final object was verified in both the catalog and `Tables/bronze/<table_name>`.
   - Any raised error message must include both the source object name (for example `SalesLT/SalesOrderHeader`) and the target table name (for example `bronze.sales_order_header`) where applicable.
+  - If the failure occurs before table processing during lakehouse setup/binding, the error must include:
+    - workspace id
+    - source lakehouse name
+    - target lakehouse name
+    - the exact unauthorized or missing operation attempted
+    - explicit confirmation that no `CreateLakehouse` fallback is allowed by spec
   - If read-back verification finds an empty schema or missing columns, the error must list:
     - exact source object name
     - exact target table name
@@ -265,6 +294,7 @@ Required Bronze target table names:
 - `SalesLT/vProductModelCatalogDescription` -> `bronze.v_product_model_catalog_description`
 
 Bronze completion criteria:
+- The existing target lakehouse `e2e` was used successfully; Bronze did not attempt any `CreateLakehouse` or equivalent lakehouse-provisioning action.
 - The schema `bronze` exists in the target lakehouse.
 - All 13 required Bronze tables above are readable by schema-qualified name.
 - A catalog/listing check over schema `bronze` returns at least those 13 names.
@@ -561,115 +591,4 @@ Standard tests to implement:
 - Every `fact_sales_order.sales_person_key` exists in `dim_sales_person`
 - Every `fact_sales_order.order_key` exists in `dim_order`
 - Every `fact_sales_order.order_date_key` exists in `dim_order_date`
-- Every non-unknown `fact_sales_order.ship_date_key` exists in `dim_ship_date`
-
-6. Business-rule sanity check tailored to this data
-- Discount percentage sanity:
-  - `discount_pct = discount_amount / gross_sales_amount`
-  - Expectation: all non-null discount percentages are between 0 and 1.
-- Also validate `line_total <= gross_sales_amount` for non-negative sales lines.
-- This directly supports the requested discount analysis.
-
-7. Regional completeness sanity check
-- For customers referenced by facts, calculate percent with non-null country/state/city in `dim_customer`.
-- Expectation: high completeness target, e.g. at least 95% populated for mappable customers; if lower, mark FAIL with count details.
-
-## Semantic model
-Create a Direct Lake semantic model over the Gold star schema.
-
-Model tables:
-- `dim_order_date`
-- `dim_ship_date`
-- `dim_customer`
-- `dim_sales_person`
-- `dim_order`
-- `dim_product`
-- `fact_sales_order`
-
-Relationships:
-- `fact_sales_order[order_date_key]` -> `dim_order_date[order_date_key]` (active)
-- `fact_sales_order[ship_date_key]` -> `dim_ship_date[ship_date_key]` (inactive if needed for alternate date analysis, or active only in ship-date views depending on tooling pattern)
-- `fact_sales_order[customer_key]` -> `dim_customer[customer_key]`
-- `fact_sales_order[sales_person_key]` -> `dim_sales_person[sales_person_key]`
-- `fact_sales_order[order_key]` -> `dim_order[order_key]`
-- `fact_sales_order[product_key]` -> `dim_product[product_key]`
-
-Hierarchies to create on all applicable dimensions:
-- `dim_order_date`: Year > Quarter > Month > Date
-- `dim_ship_date`: Year > Quarter > Month > Date
-- `dim_customer`: Country > State/Province > City > Customer
-- `dim_product`: Category > Subcategory > Product
-- `dim_sales_person`: optional display hierarchy if username/display/raw are retained
-- `dim_order`: optional order drill hierarchy by status > order number if useful
-
-Explicit measures:
-- `Sales Amount = SUM(fact_sales_order[line_total])`
-- `Gross Sales Amount = SUM(fact_sales_order[gross_sales_amount])`
-- `Discount Amount = SUM(fact_sales_order[discount_amount])`
-- `Discount % = DIVIDE([Discount Amount], [Gross Sales Amount])`
-- `Average Sales Amount = AVERAGE(fact_sales_order[line_total])`
-- `Max Sales Amount = MAX(fact_sales_order[line_total])`
-- `Order Count = DISTINCTCOUNT(fact_sales_order[sales_order_id])`
-- `Sales Order Line Count = COUNTROWS(fact_sales_order)`
-- `Average Order Quantity = AVERAGE(fact_sales_order[order_qty])`
-- `Max Order Line Value = MAX(fact_sales_order[line_total])`
-
-Recommended additional measures for user intent:
-- `Monthly Sales Amount = [Sales Amount]` used with order-date month hierarchy
-- `Average Discount % = AVERAGE(fact_sales_order[unit_price_discount])` if line-level rate analysis is desired, but prefer weighted `Discount %` for executive reporting
-- `Max Discount % = MAX(fact_sales_order[unit_price_discount])`
-- `Shipped Order Count = CALCULATE([Order Count], NOT ISBLANK(dim_ship_date[date]))` if date table design supports it
-
-Modeling notes:
-- Use `Sales Amount`, `Average Sales Amount`, and `Max Sales Amount` prominently because the user explicitly requested average and maximum sales metrics.
-- For salesperson discount analysis, rank `dim_sales_person` by `[Discount Amount]` and `[Discount %]`.
-- Hide surrogate keys and technical lineage fields from report view.
-- Exclude sensitive customer fields entirely from the semantic model.
-
-## Report
-Create a Power BI report tailored to the requested sales reporting solution.
-
-### Page 1 — Regional Performance
-Purpose: quickly identify high- and low-performing regions.
-Visuals:
-- Filled map or bubble map using `dim_customer[country/state/city]` and `[Sales Amount]`
-- Choropleth/map alternative by state/province if geography quality supports it
-- Clustered bar chart: Sales Amount by `state_province`
-- Table or matrix: Country > State > City with:
-  - Sales Amount
-  - Average Sales Amount
-  - Max Sales Amount
-  - Order Count
-  - Discount %
-- KPI cards:
-  - Sales Amount
-  - Average Sales Amount
-  - Max Sales Amount
-  - Order Count
-Slicers:
-- Order Date hierarchy
-- Ship Date hierarchy
-- Country/State
-- SalesPerson
-
-### Page 2 — Orders and Monthly Trends
-Purpose: show order activity and time trends.
-Visuals:
-- Line chart: monthly `Sales Amount` by `dim_order_date` hierarchy
-- Line and clustered column chart:
-  - columns = `Sales Amount`
-  - line = `Order Count`
-  by month
-- Matrix by `dim_order[status_label]` and `ship_method` with:
-  - Sales Amount
-  - Average Sales Amount
-  - Max Sales Amount
-  - Order Count
-- Detail table for orders:
-  - sales_order_id / order number
-  - customer
-  - ship method
-  - status
-  - Sales Amount
-  - Discount Amount
-  - Discount %
+- Every non-unknown `fact_sales_order.ship_date_key
