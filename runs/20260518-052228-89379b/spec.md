@@ -1,5 +1,16 @@
 # Run Spec 20260518-051803-a256b5
 
+## Updated specs
+
+### Iteration 1 — 2026-05-18 05:24:57Z — failed layer: bronze (run: 20260518-052228-89379b)
+- **Root cause (1-line summary)**: Bronze completed without producing discoverable Delta tables under the `bronze` schema path/name convention, so Silver could not find any upstream inputs.
+- **Cross-table audit**: `SalesLT/Address`: yes — Bronze discovery failure would block it like all other sources because this is a table-registration/path-convention issue, not a source-specific shape issue; `SalesLT/Customer`: yes — same reason; `SalesLT/CustomerAddress`: yes — same reason; `SalesLT/Product`: yes — same reason; `SalesLT/ProductCategory`: yes — same reason; `SalesLT/ProductDescription`: yes — same reason; `SalesLT/ProductModel`: yes — same reason; `SalesLT/ProductModelProductDescription`: yes — same reason; `SalesLT/SalesOrderDetail`: yes — same reason; `SalesLT/SalesOrderHeader`: yes — same reason; `SalesLT/vGetAllCategories`: yes — same reason; `SalesLT/vProductAndDescription`: yes — same reason; `SalesLT/vProductModelCatalogDescription`: yes — same reason.
+- **Fix approach**: GENERALIZE — the root cause is systemic across every Bronze source object because the next layer depends on a uniform bronze schema/table discovery pattern.
+- **What was changed**:
+  - Tightened **Generic guidance** with mandatory Bronze discoverability checks and required catalog/path parity for every written table.
+  - Tightened **Bronze** to require creation of the `bronze` schema, exact table names, exact physical layout under `Tables/bronze/<table_name>`, and post-write verification that all expected Bronze tables are discoverable before the layer is considered successful.
+  - Added an explicit Bronze failure rule: if any expected Bronze table is missing after write/registration, raise and fail Bronze rather than allowing Silver to start.
+
 ## Inputs
 - Workspace: `2127a578-6ec2-447e-b8a9-94868408b064`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -41,6 +52,9 @@ Cross-cutting code rules:
 - Never silently skip missing required inputs; if an expected table or column is absent, raise with a specific message.
 - Avoid hard-coding schema assumptions beyond the actual source columns discovered at runtime.
 - Treat the three `v*` objects as source tables/views and validate whether they add business value versus duplicating derivations already achievable from base tables.
+- Bronze/Silver discoverability rule: a layer is only considered successful if its outputs are both physically written and discoverable by Spark catalog/listing in the target Lakehouse using the expected schema-qualified names. For Bronze specifically, Silver must be able to discover the outputs as `bronze.<table_name>` objects; if discovery fails for any expected table, raise in Bronze and stop the run.
+- Catalog/path parity rule: when writing managed Lakehouse tables, ensure the registered table name and the physical folder layout align with the schema/table convention expected by downstream layers. Do not write orphaned Delta paths without a discoverable table object, and do not register a table under a different schema/name than the medallion spec.
+- Post-write verification rule: after each table write, immediately verify the table exists in the target schema and is queryable; after the full Bronze loop, verify the complete expected Bronze set is present before allowing downstream generation.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -113,6 +127,28 @@ Land each selected source object into the `bronze` schema as a raw-but-queryable
   - `bronze.v_get_all_categories`
   - `bronze.v_product_and_description`
   - `bronze.v_product_model_catalog_description`
+- The Bronze notebook MUST create/ensure the `bronze` schema exists in the target Lakehouse before writing any table.
+- For each source object above, the write outcome MUST be a discoverable schema-qualified table with the exact name listed above; do not write only to an unmanaged/orphan path and assume downstream discovery will infer it.
+- Physical organization MUST align with the Lakehouse table convention expected by downstream discovery: each Bronze output must land under the target Lakehouse managed tables area for schema `bronze` and table `<table_name>` so that listing/querying `bronze.<table_name>` succeeds immediately after the write.
+- After writing each Bronze table, immediately verify all of the following before moving on:
+  - the table is discoverable as `bronze.<table_name>`
+  - it is queryable by Spark
+  - it contains at least the source columns plus the required Bronze technical columns
+- After the full Bronze load, perform a completeness assertion that the full expected Bronze set exists and is discoverable:
+  - `bronze.address`
+  - `bronze.customer`
+  - `bronze.customer_address`
+  - `bronze.product`
+  - `bronze.product_category`
+  - `bronze.product_description`
+  - `bronze.product_model`
+  - `bronze.product_model_product_description`
+  - `bronze.sales_order_detail`
+  - `bronze.sales_order_header`
+  - `bronze.v_get_all_categories`
+  - `bronze.v_product_and_description`
+  - `bronze.v_product_model_catalog_description`
+- If any expected Bronze table is missing from discovery after the write loop, fail Bronze with an explicit missing-table error and do NOT allow the run to proceed to Silver.
 - Add standard technical columns to every bronze table:
   - `ingested_at_utc`
   - `run_id`
@@ -236,6 +272,35 @@ Dim_Customer -> join customer, customeraddress (only use the AddressType='Main O
 Dim_Product -> join product, productcategory, producdescription, productmodel, productmodelproductdescription (where culture='en'). Please notice that in productcategory there is a self join. So in the end I have the category (which is the parent category) and a subcategory.
 Dim_Sales --> Use the salesperson field from salesorderheader, but remove the adventureworks/ in front of the name and remove the last number at the end off the name
 Fact_Sales --> join salesorderdetail and salesorderheader and keep all relevant fields
+
+## Gold
+Build business-facing star-schema outputs in the `gold` schema from the conformed Silver layer.
+
+### Gold tables
+- `gold.dim_customer`
+  - Grain: one row per `customer_id`
+  - Join `silver.customer` to `silver.customer_address` on `customer_id`
+  - Filter `silver.customer_address.address_type = 'Main Office'`
+  - Join to `silver.address` on `address_id`
+  - Keep relevant customer and Main Office address attributes
+- `gold.dim_product`
+  - Grain: one row per `product_id`
+  - Join `silver.product` to `silver.product_category` using `product.product_category_id = product_category.product_category_id`
+  - Self-join `silver.product_category` to resolve parent category vs subcategory
+  - Join `silver.product` to `silver.product_model` using `product_model_id`
+  - Join through `silver.product_model_product_description` filtered to `culture = 'en'`
+  - Join to `silver.product_description` on `product_description_id`
+  - Output both parent category and child subcategory attributes
+- `gold.dim_sales`
+  - Grain: one row per cleaned salesperson
+  - Source from distinct `silver.sales_order_header.sales_person`
+  - Clean rule:
+    - remove `adventure-works\` or `adventureworks\` prefix if present
+    - remove trailing numeric suffix
+- `gold.fact_sales`
+  - Grain: one row per (`sales_order_id`, `sales_order_detail_id`)
+  - Join `silver.sales_order_detail` to `silver.sales_order_header` on `sales_order_id`
+  - Keep relevant line and header fields needed for reporting and semantic modeling
 
 ## Semantic model
 Build a Direct Lake semantic model over the Gold outputs produced from the revised star schema.
