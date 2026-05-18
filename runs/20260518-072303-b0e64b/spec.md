@@ -29,6 +29,15 @@
   - Tightened **Bronze** with an ordered per-table contract: assert source readability first, normalize metadata-column creation safely, write exactly one table at a time, and verify each published table before starting the next.
   - Added explicit Bronze guards for optional partitioning and source/object existence so non-partitionable or unreadable sources fail with table-specific diagnostics instead of causing opaque session-level cancellation.
 
+### Iteration 4 — 2026-05-18 07:46:52Z — failed layer: bronze (run: 20260518-072303-b0e64b)
+- **Root cause (1-line summary)**: Bronze publication verification expected the wrong schema shape and metadata column names (`ingestion_timestamp`, `source_path`, `batch_id`, `ingestion_date`), causing read-back validation to fail with an empty-schema result for `bronze.address`.
+- **Cross-table audit**: `SalesLT/Address`: yes — failed directly during read-back column assertion; `SalesLT/Customer`: yes — same Bronze verifier would expect the wrong metadata names; `SalesLT/CustomerAddress`: yes — same; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — same; `SalesLT/vProductAndDescription`: yes — same; `SalesLT/vProductModelCatalogDescription`: yes — same. The same verifier/schema-mismatch root cause can hit every Bronze table because the verification logic is shared and the metadata contract must be uniform across all tables.
+- **Fix approach**: **GENERALIZE** — the failure is a systemic Bronze schema-contract mismatch across all source tables, so one explicit canonical metadata contract and verification rule should apply uniformly to every Bronze publish/read-back.
+- **What was changed**:
+  - Tightened **Generic guidance** to enforce one canonical Bronze metadata column set only, and to forbid any alternate legacy metadata names in verification logic.
+  - Tightened **Bronze** so read-back verification must validate against the exact source business columns plus only the four required metadata columns: `ingested_at_utc`, `run_id`, `source_lakehouse`, `source_table`, with no renaming of business columns.
+  - Added an explicit Bronze rule that verification must inspect the schema-qualified table object `bronze.<table_name>` only and fail with a table-specific message if the read-back schema is empty or missing the original source columns.
+
 ## Inputs
 - Workspace: `16119d4a-a872-4e9f-b622-0b14f8fb05b7`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -77,6 +86,9 @@ Cross-cutting code rules:
 - For any notebook that loops over multiple tables, process exactly one table at a time in a deterministic order and emit a table-scoped progress log before and after each major step (`source_check`, `read`, `transform`, `write`, `publish_verify`). If Spark later cancels the session, the notebook output must still reveal the last table and step attempted.
 - Before performing a write for any source table, explicitly validate that the source object is readable by its exact schema-qualified source name and fail immediately with that exact name if the read fails. Do not continue to the next table after a source-read failure.
 - Any optional behavior that depends on a source column existing (for example, deriving a partition column from `OrderDate`) must first assert the column exists on that source DataFrame; if absent, skip that optional behavior or fail with a table-specific message. Never let an optional optimization be the first point of failure.
+- Canonical metadata contract rule: when a layer spec defines required metadata columns, verification logic must assert only those exact names and must not substitute legacy or inferred alternatives. For Bronze, the only allowed standard metadata columns are `ingested_at_utc`, `run_id`, `source_lakehouse`, and `source_table`.
+- Do not mix metadata contracts across templates. Names such as `ingestion_timestamp`, `source_path`, `batch_id`, and `ingestion_date` are not valid Bronze-required columns for this run and must not appear in assertions, publish checks, or completion criteria.
+- Schema verification must compare against the actual DataFrame read from the schema-qualified table name. If `spark.read.table('<schema>.<table>')` returns a DataFrame with zero columns, treat that as a publication/read-back failure immediately and report the table name plus the empty `available=[]` schema state.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -157,18 +169,40 @@ Landing approach for all selected tables:
   5. Apply table-specific optional partitioning only after asserting the required source column exists.
   6. Write/publish exactly one target managed Delta table.
   7. Immediately verify the published target table before starting the next source table.
+- Mandatory Bronze schema contract:
+  - Business columns in Bronze must remain exactly as read from the source object, preserving original casing and names such as `AddressID`, `AddressLine1`, `City`, `rowguid`, and `ModifiedDate`.
+  - Bronze verification must assert the read-back table contains all captured original source business columns plus the required Bronze metadata columns actually defined in this spec.
+  - For this run, the required Bronze verification set is exactly:
+    - all original source business columns captured at step 3, plus
+    - `ingested_at_utc`
+    - `run_id`
+    - `source_lakehouse`
+    - `source_table`
+  - `source_record_hash` is recommended where practical and may be validated when present, but it must not replace or rename any of the four required standard metadata columns above.
+  - Do not assert or generate any legacy ingestion columns not defined in this spec, including:
+    - `ingestion_timestamp`
+    - `source_path`
+    - `batch_id`
+    - `ingestion_date`
 - Mandatory per-table publish contract for Bronze:
   - Create schema `bronze` before any writes if it does not already exist.
   - For each source table, publish exactly one managed Delta table with the exact schema-qualified target name listed below.
-  - After writing each table, immediately verify all three conditions before moving to the next source:
+  - After writing each table, immediately verify all four conditions before moving to the next source:
     - `bronze.<table_name>` appears in the target lakehouse schema listing for `bronze`
     - `spark.read.table('bronze.<table_name>')` succeeds
-    - the read-back DataFrame contains all original source business columns plus the required Bronze metadata columns
+    - the read-back DataFrame has a non-empty schema (`len(read_back.columns) > 0`); `available=[]` is a hard failure
+    - the read-back DataFrame contains all original source business columns plus the required Bronze metadata columns from this spec
+  - Verification must be performed against the schema-qualified object `bronze.<table_name>` itself. Do not verify against a path-only DataFrame, temp view, or stale variable from before publication.
   - If any one table fails source validation, write, publication, or verification, stop Bronze immediately; do not continue to remaining tables and do not allow the notebook to report success.
 - Mandatory diagnostics for Bronze:
   - Emit a start/end log line for each source table using the exact source name and exact target name.
   - Emit a start/end log line for each sub-step: `source_check`, `read`, `metadata_add`, `write`, `publish_verify`.
   - Any raised error message must include both the source object name (for example `SalesLT/SalesOrderHeader`) and the target table name (for example `bronze.sales_order_header`) where applicable.
+  - If read-back verification finds an empty schema or missing columns, the error must list:
+    - exact source object name
+    - exact target table name
+    - missing column names
+    - available read-back column list
   - If a table-specific step fails, fail Bronze at that table immediately instead of attempting the remaining tables; this is required to avoid opaque session-cancelled outcomes with no actionable culprit table.
 - Mandatory source/metadata guards for Bronze:
   - For `source_record_hash`, hash only non-binary business columns actually present on the DataFrame; explicitly exclude binary/image-like columns such as `ThumbNailPhoto` and any other binary-typed columns from the hash input.
@@ -196,6 +230,11 @@ Bronze completion criteria:
 - The schema `bronze` exists in the target lakehouse.
 - All 13 required Bronze tables above are readable by schema-qualified name.
 - A catalog/listing check over schema `bronze` returns at least those 13 names.
+- Every required Bronze table read-back contains its original source business columns plus these required metadata columns:
+  - `ingested_at_utc`
+  - `run_id`
+  - `source_lakehouse`
+  - `source_table`
 - Silver must be able to enumerate Bronze from actual lakehouse tables only; if Bronze outputs exist only as files or temp views, that is a build failure.
 - The final verification step must compare the actual discovered set in schema `bronze` to this exact expected set and fail with the explicit missing table names if there is any mismatch:
   - `address`
