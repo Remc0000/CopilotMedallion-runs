@@ -47,6 +47,15 @@
   - Tightened **Bronze** to forbid path-only writes as final output and to require a post-publish verification against both the catalog and the lakehouse tables filesystem shape for every Bronze target.
   - Added an explicit Bronze implementation constraint to use managed table creation/overwrite semantics that publish the final objects as `bronze.<table_name>` in the target lakehouse before Bronze can report success.
 
+### Iteration 6 — 2026-05-18 08:03:43Z — failed layer: bronze (run: 20260518-072303-b0e64b)
+- **Root cause (1-line summary)**: Bronze verification failed on `bronze.address` because the post-write read-back returned `available=[]`; the spec allowed verification before confirming the catalog object had a non-empty schema, and it was too vague about the exact publish/read-back sequence to use.
+- **Cross-table audit**: `SalesLT/Address`: yes — failed directly with empty-schema read-back; `SalesLT/Customer`: yes — same publish/read-back race or non-materialized table risk; `SalesLT/CustomerAddress`: yes — same; `SalesLT/Product`: yes — same; `SalesLT/ProductCategory`: yes — same; `SalesLT/ProductDescription`: yes — same; `SalesLT/ProductModel`: yes — same; `SalesLT/ProductModelProductDescription`: yes — same; `SalesLT/SalesOrderDetail`: yes — same; `SalesLT/SalesOrderHeader`: yes — same; `SalesLT/vGetAllCategories`: yes — same; `SalesLT/vProductAndDescription`: yes — same; `SalesLT/vProductModelCatalogDescription`: yes — same. The root cause is systemic because the same publish-then-read-back contract is used for every Bronze table.
+- **Fix approach**: **GENERALIZE** — all Bronze tables need the same stricter publish materialization and schema-read-back rule, so one uniform Bronze contract is safer than table-by-table exceptions.
+- **What was changed**:
+  - Tightened **Generic guidance** with a new rule: schema assertions must only occur after a successful schema-qualified read-back that returns a non-empty column list, and empty-schema results must be treated as publication failures rather than normal missing-column checks.
+  - Tightened **Bronze** to require a two-phase verification sequence for every target: first confirm catalog registration and successful `spark.read.table(...)`, then inspect the returned schema and only then compare expected columns.
+  - Added an explicit Bronze constraint to avoid immediate column assertions against a table object that has not yet materialized with a readable schema; the error path must report `available=[]` as an empty-schema publication defect.
+
 ## Inputs
 - Workspace: `16119d4a-a872-4e9f-b622-0b14f8fb05b7`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -100,6 +109,7 @@ Cross-cutting code rules:
 - Canonical metadata contract rule: when a layer spec defines required metadata columns, verification logic must assert only those exact names and must not substitute legacy or inferred alternatives. For Bronze, the only allowed standard metadata columns are `ingested_at_utc`, `run_id`, `source_lakehouse`, and `source_table`.
 - Do not mix metadata contracts across templates. Names such as `ingestion_timestamp`, `source_path`, `batch_id`, and `ingestion_date` are not valid Bronze-required columns for this run and must not appear in assertions, publish checks, or completion criteria.
 - Schema verification must compare against the actual DataFrame read from the schema-qualified table name. If `spark.read.table('<schema>.<table>')` returns a DataFrame with zero columns, treat that as a publication/read-back failure immediately and report the table name plus the empty `available=[]` schema state.
+- New publication verification rule: do not perform expected-column comparison until AFTER the notebook has confirmed that `spark.read.table('<schema>.<table>')` returned a DataFrame with a non-empty schema. An empty-schema read-back is a distinct publish/materialization failure, not a normal missing-column case, and must short-circuit the verification flow before any business-column diff logic.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -183,6 +193,7 @@ Landing approach for all selected tables:
 - Mandatory Bronze publication implementation constraints:
   - The final Bronze artifact must be a catalog-discoverable lakehouse table, not just Delta files written to a folder.
   - Writing directly to a filesystem path is allowed only as an internal staging step; it is not the completion step. The completion step must create/replace the schema-qualified lakehouse table object `bronze.<table_name>`.
+  - The publish step must be completed as a single table-materialization action for the final identifier `bronze.<table_name>`; do not verify against an intermediate object, temp view, staged path, or partially registered table.
   - After publication, `bronze.<table_name>` must be readable through `spark.read.table(...)` and also materially present in the target lakehouse `Tables/bronze/` namespace with the same final table name.
   - Do not treat temp views, SQL views, or notebook-local DataFrames as a successful Bronze publish.
 - Mandatory Bronze schema contract:
@@ -203,12 +214,13 @@ Landing approach for all selected tables:
 - Mandatory per-table publish contract for Bronze:
   - Create schema `bronze` before any writes if it does not already exist.
   - For each source table, publish exactly one managed Delta table with the exact schema-qualified target name listed below.
-  - After writing each table, immediately verify all five conditions before moving to the next source:
+  - After writing each table, immediately verify all six conditions in this exact order before moving to the next source:
     - `bronze.<table_name>` appears in the target lakehouse schema listing for `bronze`
     - `spark.read.table('bronze.<table_name>')` succeeds
-    - the read-back DataFrame has a non-empty schema (`len(read_back.columns) > 0`); `available=[]` is a hard failure
-    - the read-back DataFrame contains all original source business columns plus the required Bronze metadata columns from this spec
+    - the read-back DataFrame has a non-empty schema (`len(read_back.columns) > 0`); `available=[]` is a hard publication/materialization failure and must stop verification immediately
+    - only after the non-empty-schema check passes, assert the read-back DataFrame contains all original source business columns plus the required Bronze metadata columns from this spec
     - the published table exists in the lakehouse tables namespace under `Tables/bronze/<table_name>`
+    - the table verified is the exact final object `bronze.<table_name>`, not a path-only or pre-publish DataFrame
   - Verification must be performed against the schema-qualified object `bronze.<table_name>` itself. Do not verify against a path-only DataFrame, temp view, or stale variable from before publication.
   - If any one table fails source validation, write, publication, or verification, stop Bronze immediately; do not continue to remaining tables and do not allow the notebook to report success.
 - Mandatory diagnostics for Bronze:
@@ -219,7 +231,9 @@ Landing approach for all selected tables:
   - If read-back verification finds an empty schema or missing columns, the error must list:
     - exact source object name
     - exact target table name
-    - missing column names
+    - whether catalog listing succeeded
+    - whether `spark.read.table(...)` succeeded
+    - missing column names only if the schema was non-empty
     - available read-back column list
   - If namespace verification fails, the error must list:
     - exact source object name
@@ -230,7 +244,7 @@ Landing approach for all selected tables:
   - If a table-specific step fails, fail Bronze at that table immediately instead of attempting the remaining tables; this is required to avoid opaque session-cancelled outcomes with no actionable culprit table.
 - Mandatory source/metadata guards for Bronze:
   - For `source_record_hash`, hash only non-binary business columns actually present on the DataFrame; explicitly exclude binary/image-like columns such as `ThumbNailPhoto` and any other binary-typed columns from the hash input.
-  - If a table has zero rows, it must still be published as an empty Bronze table with the correct schema and required metadata columns; zero-row sources are not considered missing tables.
+  - If a table has zero rows, it must still be published as an empty Bronze table with the correct schema and required metadata columns; zero-row sources are not considered missing tables. Zero rows is valid, but zero columns (`available=[]`) is never valid.
   - Views (`vGetAllCategories`, `vProductAndDescription`, `vProductModelCatalogDescription`) must be treated with the same readability and publication checks as base tables.
 - Mandatory post-write verification for Bronze: after all writes complete, assert that the full expected table set below is discoverable in schema `bronze` and physically present in `Tables/bronze/`. If any table is missing, Bronze must fail loudly and must not report success.
 - Bronze success must be determined from the published catalog state and lakehouse table namespace only. File existence somewhere else is insufficient.
@@ -659,78 +673,3 @@ Visuals:
   - Sales Amount
   - Discount Amount
   - Discount %
-Slicers:
-- Online order flag
-- Status
-- Product category/subcategory
-
-### Page 3 — Discounts and Salespeople
-Purpose: identify the salespeople offering the largest discounts.
-Visuals:
-- Bar chart: `Sales Amount` by `sales_person_name`
-- Bar chart: `Discount Amount` by `sales_person_name`
-- Bar chart: `Discount %` by `sales_person_name`
-- Scatter chart:
-  - X = Sales Amount
-  - Y = Discount %
-  - Size = Order Count
-  - Details = SalesPerson
-- Matrix: SalesPerson > Customer with:
-  - Sales Amount
-  - Gross Sales Amount
-  - Discount Amount
-  - Discount %
-  - Max Sales Amount
-- Top N control or filter for highest-discount salespeople
-
-### Page 4 — Product Performance
-Purpose: understand which categories/subcategories drive sales and discounting.
-Visuals:
-- Treemap: Category > Subcategory by `Sales Amount`
-- Column chart: Sales Amount by product
-- Matrix: Category > Subcategory > Product with:
-  - Sales Amount
-  - Average Sales Amount
-  - Max Sales Amount
-  - Discount %
-- Decomposition tree for Sales Amount by geography, product hierarchy, and salesperson
-
-### Page 5 — Data Quality
-Purpose: operational trust and transparency.
-Visuals:
-- Table of `test.test_results` filtered to latest run
-- Cards for PASS/FAIL/ERROR counts
-- Bar chart of tests by status and layer
-- Table highlighting failed referential-integrity or business-rule checks
-
-## Data Agent
-Create an AISkill grounded on the semantic model.
-
-Role:
-- You are a sales performance analytics agent for the SalesLT reporting model.
-- Your job is to answer questions about regional performance, orders, monthly sales trends, products, customers, shipping patterns, and salesperson discount behavior using only the approved semantic model.
-- Be concise, numerically precise, and business-oriented. When useful, compare totals, averages, maxima, and discount percentages.
-
-Domain hints:
-- “Sales” means net sales from `fact_sales_order[line_total]` unless the user explicitly asks for gross sales.
-- “Average sales” means average line-level sales amount unless the question clearly asks for average per order; then explain the metric used.
-- “Maximum sales” means max order-line sales amount unless the user asks for max order total.
-- Regional analysis should use customer geography from the curated customer dimension.
-- Salesperson analysis is derived from the cleaned salesperson field originating from customer records.
-- Date analysis should default to Order Date unless the user explicitly asks about shipped timing.
-
-Starter questions:
-- Which regions have the highest and lowest sales?
-- Show monthly sales trends for the last 12 months in the model.
-- What is the average and maximum sales amount by country and state?
-- Which salespeople are giving the largest discounts?
-- What is the discount percentage by salesperson and by product category?
-- How many orders were placed by month?
-- Which product categories and subcategories drive the most sales?
-- Which customers contribute the most sales in each region?
-- How do shipped orders compare with ordered sales over time?
-- Are there any regions with unusually low sales but high discount percentages?
-
-Guardrails:
-- Use only the published semantic model; do not invent fields or query Bronze/Silver directly.
-- Never expose `password_hash`,
