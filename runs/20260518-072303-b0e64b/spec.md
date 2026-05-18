@@ -11,6 +11,15 @@
   - Tightened **Bronze** to require exact target table names, mandatory registration in schema `bronze`, and a post-write verification step that asserts all expected Bronze tables are discoverable.
   - Added explicit Bronze failure behavior: if any expected Bronze table is missing after write/registration, fail Bronze loudly instead of allowing Silver to start.
 
+### Iteration 2 — 2026-05-18 07:31:07Z — failed layer: bronze (run: 20260518-072303-b0e64b)
+- **Root cause (1-line summary)**: Silver again found zero discoverable tables because Bronze must not merely write data files; it must create catalog-discoverable managed tables in schema `bronze` under `Tables/bronze/` and verify them one-by-one before declaring success.
+- **Cross-table audit**: `SalesLT/Address`: yes — must publish as `bronze.address`; `SalesLT/Customer`: yes — must publish as `bronze.customer`; `SalesLT/CustomerAddress`: yes — must publish as `bronze.customer_address`; `SalesLT/Product`: yes — must publish as `bronze.product`; `SalesLT/ProductCategory`: yes — must publish as `bronze.product_category`; `SalesLT/ProductDescription`: yes — must publish as `bronze.product_description`; `SalesLT/ProductModel`: yes — must publish as `bronze.product_model`; `SalesLT/ProductModelProductDescription`: yes — must publish as `bronze.product_model_product_description`; `SalesLT/SalesOrderDetail`: yes — must publish as `bronze.sales_order_detail`; `SalesLT/SalesOrderHeader`: yes — must publish as `bronze.sales_order_header`; `SalesLT/vGetAllCategories`: yes — must publish as `bronze.v_get_all_categories`; `SalesLT/vProductAndDescription`: yes — must publish as `bronze.v_product_and_description`; `SalesLT/vProductModelCatalogDescription`: yes — must publish as `bronze.v_product_model_catalog_description`. All listed sources are affected because the root cause is publication/registration behavior, not business schema.
+- **Fix approach**: **GENERALIZE** — the same explicit managed-table publication contract and verification loop is required for every Bronze source, so one uniform rule is safer than per-table customizations.
+- **What was changed**:
+  - Tightened **Generic guidance** to forbid treating raw Delta files, temp views, or path-only writes as successful medallion outputs; success now requires schema-qualified read-back and catalog visibility.
+  - Tightened **Bronze** with a required per-table publish sequence: overwrite target managed Delta table, verify `spark.read.table('bronze.<name>')` succeeds, and verify the table name appears in schema `bronze` listing before moving to the next table.
+  - Added an explicit final Bronze gate listing the exact 13 required table names; Bronze must raise an error naming any missing tables and stop the run.
+
 ## Inputs
 - Workspace: `16119d4a-a872-4e9f-b622-0b14f8fb05b7`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -54,6 +63,8 @@ Cross-cutting code rules:
 - Publication/discoverability rule for every layer output: a write is not considered successful unless the resulting Delta table is discoverable from the target lakehouse `Tables/<schema>/` namespace by its final table name. After each table write, validate discoverability via catalog/list-tables logic or direct read-back of the exact target table identifier before proceeding.
 - Never rely on path-only outputs for medallion handoff. Downstream layers must be able to enumerate/read the produced tables by schema-qualified table name (for example `bronze.address`), so the producing layer must register/publish each output accordingly.
 - If a layer expects a fixed set of outputs from the prior layer, compute that expected set explicitly and fail immediately in the producing layer if any are missing, rather than allowing the next layer to infer from spec-only context.
+- Treat temp views, cached DataFrames, notebook-local variables, and raw `/Files` or unregistered `/Tables` paths as non-published artifacts. None of these satisfy the handoff contract to the next medallion layer.
+- For every published table, the success check must include BOTH of the following against the final schema-qualified name: (1) a catalog/listing check that the table name appears in the target schema, and (2) a direct `spark.read.table('<schema>.<table_name>')` read-back. If either fails, the layer has not published successfully.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -126,7 +137,16 @@ Landing approach for all selected tables:
   - `bronze.sales_order_header`: partition by `order_date_date` derived from `OrderDate`
   - `bronze.sales_order_detail`: no natural date on detail, so do not partition independently unless joined staging is explicitly created
 - Do not partition small/master tables such as address, customer, product, category, model, description, and bridge tables.
+- Mandatory per-table publish contract for Bronze:
+  - Create schema `bronze` before any writes if it does not already exist.
+  - For each source table, publish exactly one managed Delta table with the exact schema-qualified target name listed below.
+  - After writing each table, immediately verify all three conditions before moving to the next source:
+    - `bronze.<table_name>` appears in the target lakehouse schema listing for `bronze`
+    - `spark.read.table('bronze.<table_name>')` succeeds
+    - the read-back DataFrame has at least the source business columns plus the required Bronze metadata columns
+  - If any one table fails publication or verification, stop Bronze immediately; do not continue to remaining tables and do not allow the notebook to report success.
 - Mandatory post-write verification for Bronze: after all writes complete, assert that the full expected table set below is discoverable in schema `bronze`. If any table is missing, Bronze must fail loudly and must not report success.
+- Bronze success must be determined from the published catalog state only. File existence by itself is insufficient.
 
 Required Bronze target table names:
 - `SalesLT/Address` -> `bronze.address`
@@ -148,6 +168,20 @@ Bronze completion criteria:
 - All 13 required Bronze tables above are readable by schema-qualified name.
 - A catalog/listing check over schema `bronze` returns at least those 13 names.
 - Silver must be able to enumerate Bronze from actual lakehouse tables only; if Bronze outputs exist only as files or temp views, that is a build failure.
+- The final verification step must compare the actual discovered set in schema `bronze` to this exact expected set and fail with the explicit missing table names if there is any mismatch:
+  - `address`
+  - `customer`
+  - `customer_address`
+  - `product`
+  - `product_category`
+  - `product_description`
+  - `product_model`
+  - `product_model_product_description`
+  - `sales_order_detail`
+  - `sales_order_header`
+  - `v_get_all_categories`
+  - `v_product_and_description`
+  - `v_product_model_catalog_description`
 
 Table-specific notes:
 - `Address`: land as-is; this is a location/master table likely used for regional analytics.
