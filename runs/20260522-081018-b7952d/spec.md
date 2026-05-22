@@ -10,6 +10,14 @@
   - Tightened **Generic guidance** to require a non-empty notebook with mandatory parameter/import/helper/execution/summary cells.
   - Tightened **Bronze** with an explicit implementation skeleton, required per-table loop behavior, and a hard requirement to emit at least one code cell and one write attempt summary.
 
+### Iteration 2 — 2026-05-22 08:13:14Z — failed layer: bronze (run: 20260522-081018-b7952d)
+- **Root cause (1-line summary)**: Bronze failed again at generation time because the notebook still returned zero runnable cells; the spec needed a stricter fail-closed Bronze cell contract with concrete cell count and required literals.
+- **Cross-table audit**: Address: yes — omitted if Bronze notebook has zero emitted cells; Customer: yes — same generator-level risk; CustomerAddress: yes — same generator-level risk; Product: yes — same generator-level risk; ProductCategory: yes — same generator-level risk; ProductDescription: yes — same generator-level risk; ProductModel: yes — same generator-level risk; ProductModelProductDescription: yes — same generator-level risk; SalesOrderDetail: yes — same generator-level risk; SalesOrderHeader: yes — same generator-level risk; vGetAllCategories: yes — same generator-level risk; vProductAndDescription: yes — same generator-level risk; vProductModelCatalogDescription: yes — same generator-level risk.
+- **Fix approach**: GENERALIZE — the failure is still notebook-emission level and can affect every listed Bronze source uniformly, so one stricter generation contract is safer than table-by-table enumeration.
+- **What was changed**:
+  - Tightened **Generic guidance** with a hard minimum of 4 Bronze code cells and a prohibition on returning prose-only plans, empty placeholders, or deferred implementations.
+  - Tightened **Bronze** to require the exact explicit `source_tables` list, at least one concrete `spark.read` and one concrete `df.write.format('delta')...save(...)` statement in emitted code, plus a mandatory final assertion that cell generation produced runnable Bronze logic.
+
 ## Inputs
 - Workspace: `4d8fc3ee-8e26-4cf3-b603-e1b238bde935`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -64,6 +72,9 @@ These rules exist to prevent the generator from returning an empty notebook or z
 - If the model cannot infer some optional implementation detail, it must still emit the notebook skeleton with `RuntimeError(...)` placeholders for the unresolved detail rather than returning no cells.
 - The final emitted notebook must contain at least one concrete read path/table reference and at least one concrete write path under `Tables/<layer>/...`; a notebook made only of comments or pseudocode is invalid.
 - The final summary cell must assert that at least one output was attempted for the layer and must raise a clear error if zero outputs were written/discovered.
+- For Bronze specifically, the notebook MUST contain at least 4 runnable code cells. Fewer than 4 code cells is invalid.
+- Never return a prose-only implementation plan, TODO list, or placeholder notebook. Emit runnable Python cells first; unresolved details may only appear as explicit runtime `raise RuntimeError(...)` statements inside a code cell.
+- At least one execution cell in every layer notebook must contain a concrete DataFrame assignment and a concrete write statement, not just helper-function definitions.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -183,9 +194,29 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
     - records row count, output path, and status in a results structure.
   - Final summary cell that prints the Bronze results JSON and raises if zero tables were successfully written.
 - Use the exact explicit `source_tables` list in the notebook code; do not rely on lakehouse auto-discovery for this run.
+- The explicit list to embed in the emitted Bronze code is:
+  - `SalesLT/Address`
+  - `SalesLT/Customer`
+  - `SalesLT/CustomerAddress`
+  - `SalesLT/Product`
+  - `SalesLT/ProductCategory`
+  - `SalesLT/ProductDescription`
+  - `SalesLT/ProductModel`
+  - `SalesLT/ProductModelProductDescription`
+  - `SalesLT/SalesOrderDetail`
+  - `SalesLT/SalesOrderHeader`
+  - `SalesLT/vGetAllCategories`
+  - `SalesLT/vProductAndDescription`
+  - `SalesLT/vProductModelCatalogDescription`
 - The main Bronze loop must make one isolated write attempt per listed source object, even if some earlier object fails.
 - At least one execution cell must include a concrete write path pattern under `Tables/bronze/` for discoverability.
+- The emitted Bronze code MUST contain an actual `spark.read...` statement for one of the listed tables and an actual `df.write.format("delta").mode("overwrite").option("overwriteSchema","true").save(...)` statement under `Tables/bronze/...`; helper-only code is insufficient.
+- The generator MUST emit at least 4 runnable Bronze code cells: setup, imports/helpers, execution loop, summary/assertion. Zero-cell, one-cell, or prose-only output is invalid.
 - If the notebook generator cannot infer a non-essential implementation detail, it must still emit the full Bronze notebook and fail inside the relevant code cell with a clear runtime error; returning no cells is prohibited.
+- The final Bronze summary cell must explicitly assert both:
+  - the `results` structure contains at least one attempted table, and
+  - at least one table was successfully written under `Tables/bronze/`.
+- Do not defer Bronze implementation to later layers, helper libraries, or notebook attachments. All runnable Bronze ingestion logic for this run must appear directly in the emitted notebook cells.
 
 ## Silver
 - Standardize all Bronze tables into snake_case column names and write to `Tables/silver/<table>`.
