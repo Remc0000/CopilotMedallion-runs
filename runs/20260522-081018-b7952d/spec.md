@@ -26,6 +26,14 @@
   - Tightened **Generic guidance** with a mandatory post-write discoverability check: each layer must verify the exact physical Delta path exists immediately after write, and Bronze must raise if any purported success is not discoverable.
   - Tightened **Bronze** to require canonical output paths under `Tables/bronze/<flat_table_name>`, a concrete per-table existence check after each write, a final lakehouse-path audit of all successful writes, and a hard failure if zero discoverable Bronze tables exist.
 
+### Iteration 4 — 2026-05-22 08:24:01Z — failed layer: bronze (run: 20260522-081018-b7952d)
+- **Root cause (1-line summary)**: Bronze still left zero discoverable outputs because the success contract was not strict enough about using the target lakehouse filesystem path and verifying the exact `Tables/bronze/<flat_table_name>/_delta_log` location.
+- **Cross-table audit**: Address: yes — same physical-path/_delta_log discoverability requirement applies; Customer: yes — same; CustomerAddress: yes — same; Product: yes — same; ProductCategory: yes — same; ProductDescription: yes — same; ProductModel: yes — same; ProductModelProductDescription: yes — same; SalesOrderDetail: yes — same; SalesOrderHeader: yes — same; vGetAllCategories: yes — same; vProductAndDescription: yes — same; vProductModelCatalogDescription: yes — same.
+- **Fix approach**: GENERALIZE — every Bronze source object is written with the same pathing mechanism, so one explicit filesystem-path and `_delta_log` verification rule is safer than table-by-table exceptions.
+- **What was changed**:
+  - Tightened **Generic guidance** to define discoverability as presence of the exact Delta folder plus `_delta_log` under the target lakehouse path, not just a successful write call or a logical table reference.
+  - Tightened **Bronze** to require one canonical target base path variable, forbid relative/implicit writer destinations, require immediate verification of `Tables/bronze/<flat_table_name>/_delta_log`, and require the final self-audit to compare all 13 expected Bronze paths against the physically discoverable paths.
+
 ## Inputs
 - Workspace: `4d8fc3ee-8e26-4cf3-b603-e1b238bde935`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -170,6 +178,15 @@ Rule L — Post-write physical discoverability check is mandatory.
   - `discoverable`
   so the pipeline can fail loudly when writes were attempted but not discoverable.
 
+Rule M — Discoverability means exact target-lakehouse Delta filesystem presence.
+- For every Bronze/Silver/Gold/Test write, construct one explicit absolute target path variable (for example `target_table_path = f"{target_lakehouse_base}/Tables/bronze/{flat_table_name}"`) and write ONLY to that variable.
+- Do not rely on relative paths, implicit current lakehouse context, temp views, catalog registrations, `saveAsTable`, or any alternate logical registration to satisfy downstream discovery.
+- The mandatory physical verification for a successful Delta write is:
+  - the exact table folder exists at `target_table_path`, and
+  - the exact Delta log folder exists at `f"{target_table_path}/_delta_log"`.
+- Bronze specifically must treat a table as `discoverable=True` only when both the table folder and `_delta_log` are confirmed on the target lakehouse filesystem. If either is missing, mark the table failed even if the writer returned no exception.
+- The final summary/audit must report the explicit absolute paths checked so downstream diagnosis can distinguish "wrong path" from "write failed".
+
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
 # ---
@@ -207,6 +224,13 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - A Bronze table counts as successful only if the notebook verifies the exact canonical path `Tables/bronze/<flat_table_name>` exists after the write.
   - Row count may be zero; physical table-path existence is the required success criterion.
   - If a write succeeds but the canonical path is not discoverable, record that table as failure and do not include it in the successful Bronze outputs list.
+- Absolute-path rule for this failed build:
+  - Define exactly one target base path variable for the target lakehouse filesystem and derive all Bronze table paths from it, e.g. `<target_lakehouse_base>/Tables/bronze/<flat_table_name>`.
+  - Every write MUST use the absolute derived path variable; do not use bare `Tables/bronze/...` relative paths as the `.save(...)` destination.
+  - Every post-write verification MUST check both:
+    - `<target_lakehouse_base>/Tables/bronze/<flat_table_name>`
+    - `<target_lakehouse_base>/Tables/bronze/<flat_table_name>/_delta_log`
+  - A table is not discoverable unless `_delta_log` exists at the exact canonical Bronze location in the target lakehouse.
 
 ### Bronze notebook generation contract
 - The Bronze notebook MUST NOT be omitted or left empty. It must contain, at minimum, these runnable code cells in this order:
@@ -260,6 +284,15 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
   - Build a list of actually discoverable successful Bronze paths from the per-table results.
   - Raise if the discoverable list is empty, even if write attempts were made.
   - Include both lists in the final summary JSON so downstream failures are diagnosable.
+- Additional required Bronze path-verification fields for this failed build:
+  - `table_path_exists`
+  - `delta_log_exists`
+  - `delta_log_path`
+- Additional required execution constraints:
+  - The parameter cell MUST define a single variable for the target lakehouse base filesystem path and the execution cell MUST build `output_path = f"{target_lakehouse_base}/Tables/bronze/{flat_table_name}"`.
+  - The write call MUST use that exact `output_path` variable.
+  - Immediately after each write, the notebook MUST verify both `output_path` and `f"{output_path}/_delta_log"` and set `discoverable = bool(table_path_exists and delta_log_exists)`.
+  - The final Bronze self-audit MUST compare all 13 expected absolute output paths and all 13 expected absolute `_delta_log` paths against the physically discoverable paths, and raise if no table satisfies both checks.
 
 ## Silver
 - Standardize all Bronze tables into snake_case column names and write to `Tables/silver/<table>`.
@@ -733,6 +766,3 @@ Agent instructions:
 - Use hierarchies for drill-down suggestions, e.g., Country > State > City or Category > Subcategory > Product.
 - Encourage follow-up comparisons such as time period, region, category, and salesperson.
 - If map-style regional insight is requested, return geography-grain summaries suitable for map visuals.
-- Always mention filters applied in the answer.
-- For ambiguous questions, ask one clarifying question instead of guessing.
-- Maintain a professional, direct, insight-oriented tone: like an excellent analytics copilot that helps users find performance drivers fast.
