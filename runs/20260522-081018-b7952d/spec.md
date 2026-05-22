@@ -1,5 +1,15 @@
 # Run Spec 20260522-080700-b92e23
 
+## Updated specs
+
+### Iteration 1 — 2026-05-22 08:10:47Z — failed layer: bronze (run: 20260522-081018-b7952d)
+- **Root cause (1-line summary)**: Bronze build failed before execution because the notebook generator returned zero code cells, so the pipeline had no runnable Bronze notebook.
+- **Cross-table audit**: Address: yes — would be skipped entirely if no Bronze notebook is generated; Customer: yes — same generator-level failure; CustomerAddress: yes — same generator-level failure; Product: yes — same generator-level failure; ProductCategory: yes — same generator-level failure; ProductDescription: yes — same generator-level failure; ProductModel: yes — same generator-level failure; ProductModelProductDescription: yes — same generator-level failure; SalesOrderDetail: yes — same generator-level failure; SalesOrderHeader: yes — same generator-level failure; vGetAllCategories: yes — same generator-level failure; vProductAndDescription: yes — same generator-level failure; vProductModelCatalogDescription: yes — same generator-level failure.
+- **Fix approach**: GENERALIZE — this is a notebook-generation failure that affects all Bronze source tables uniformly, so the spec now requires a concrete minimum notebook skeleton and one explicit per-table loop that guarantees emitted cells.
+- **What was changed**:
+  - Tightened **Generic guidance** to require a non-empty notebook with mandatory parameter/import/helper/execution/summary cells.
+  - Tightened **Bronze** with an explicit implementation skeleton, required per-table loop behavior, and a hard requirement to emit at least one code cell and one write attempt summary.
+
 ## Inputs
 - Workspace: `4d8fc3ee-8e26-4cf3-b603-e1b238bde935`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -40,6 +50,20 @@ Cross-cutting code rules:
 - Use error-loud `try/except`; call `_save_error(layer, e)` (and `_save_error(layer, e, table=tbl)` in table loops) and then re-raise.
 - Each notebook must process source tables in per-table isolated loops where applicable so one table failure does not cancel all unrelated writes.
 - Each generated code cell must start with a short markdown-style Python comment block (`# ---` plus 1-3 explanatory comment lines).
+
+### Mandatory notebook-emission rules (apply to EVERY generated notebook)
+These rules exist to prevent the generator from returning an empty notebook or zero runnable cells.
+- The generator MUST emit a non-empty notebook for every requested layer. Returning zero cells is invalid even if the layer is simple.
+- Minimum required code-cell skeleton for every notebook:
+  - Cell 1: parameter/setup cell
+  - Cell 2: imports/helpers cell
+  - Cell 3+: execution cell(s) that read/transform/write data for the layer
+  - Final cell: summary/assertion cell that prints structured results and raises if the layer produced no outputs
+- Every required cell must begin with the mandated `# ---` comment block.
+- If a layer processes multiple tables, the execution logic MUST be expressed as an explicit iterable list plus a `for tbl in ...` loop in emitted code; do not leave table processing implied only in prose.
+- If the model cannot infer some optional implementation detail, it must still emit the notebook skeleton with `RuntimeError(...)` placeholders for the unresolved detail rather than returning no cells.
+- The final emitted notebook must contain at least one concrete read path/table reference and at least one concrete write path under `Tables/<layer>/...`; a notebook made only of comments or pseudocode is invalid.
+- The final summary cell must assert that at least one output was attempted for the layer and must raise a clear error if zero outputs were written/discovered.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -146,6 +170,22 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 - Views (`vGetAllCategories`, `vProductAndDescription`, `vProductModelCatalogDescription`) are ingested exactly as exposed; no assumption of hidden audit columns beyond those actually present.
 - Capture per-table row counts and output a final Bronze summary JSON.
 - If any table read fails, log per-table failure, continue other Bronze tables, then raise at end if one or more failed.
+
+### Bronze notebook generation contract
+- The Bronze notebook MUST NOT be omitted or left empty. It must contain, at minimum, these runnable code cells in this order:
+  - Parameter cell defining `run_id`, source workspace/lakehouse identifiers, target base path, and the explicit `source_tables` list containing all 13 input objects.
+  - Imports/helper cell defining shared helpers such as `_save_error(...)`, optional schema assertion helpers, and a `<source path> -> <flat table name>` mapper.
+  - Main execution cell containing one explicit `for tbl in source_tables:` loop that:
+    - reads exactly that source object from the source lakehouse,
+    - adds the Bronze metadata columns,
+    - derives `<flat_table_name>` from the last path segment lowercased,
+    - writes to `Tables/bronze/<flat_table_name>`,
+    - records row count, output path, and status in a results structure.
+  - Final summary cell that prints the Bronze results JSON and raises if zero tables were successfully written.
+- Use the exact explicit `source_tables` list in the notebook code; do not rely on lakehouse auto-discovery for this run.
+- The main Bronze loop must make one isolated write attempt per listed source object, even if some earlier object fails.
+- At least one execution cell must include a concrete write path pattern under `Tables/bronze/` for discoverability.
+- If the notebook generator cannot infer a non-essential implementation detail, it must still emit the full Bronze notebook and fail inside the relevant code cell with a clear runtime error; returning no cells is prohibited.
 
 ## Silver
 - Standardize all Bronze tables into snake_case column names and write to `Tables/silver/<table>`.
