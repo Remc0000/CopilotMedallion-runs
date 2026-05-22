@@ -18,6 +18,14 @@
   - Tightened **Generic guidance** with a hard minimum of 4 Bronze code cells and a prohibition on returning prose-only plans, empty placeholders, or deferred implementations.
   - Tightened **Bronze** to require the exact explicit `source_tables` list, at least one concrete `spark.read` and one concrete `df.write.format('delta')...save(...)` statement in emitted code, plus a mandatory final assertion that cell generation produced runnable Bronze logic.
 
+### Iteration 3 — 2026-05-22 08:18:01Z — failed layer: bronze (run: 20260522-081018-b7952d)
+- **Root cause (1-line summary)**: Bronze notebook may have run without leaving any discoverable Delta tables under `Tables/bronze/`, so Silver refused to start because prior-layer outputs were not physically present.
+- **Cross-table audit**: Address: yes — if written to the wrong physical path or not written at all, it will not be discoverable; Customer: yes — same Bronze output-path/discoverability risk; CustomerAddress: yes — same; Product: yes — same; ProductCategory: yes — same; ProductDescription: yes — same; ProductModel: yes — same; ProductModelProductDescription: yes — same; SalesOrderDetail: yes — same; SalesOrderHeader: yes — same; vGetAllCategories: yes — same; vProductAndDescription: yes — same; vProductModelCatalogDescription: yes — same.
+- **Fix approach**: GENERALIZE — the root cause is a uniform Bronze output discoverability contract affecting every listed source object, so one strict all-table path/write/verification rule is safer than table-by-table enumeration.
+- **What was changed**:
+  - Tightened **Generic guidance** with a mandatory post-write discoverability check: each layer must verify the exact physical Delta path exists immediately after write, and Bronze must raise if any purported success is not discoverable.
+  - Tightened **Bronze** to require canonical output paths under `Tables/bronze/<flat_table_name>`, a concrete per-table existence check after each write, a final lakehouse-path audit of all successful writes, and a hard failure if zero discoverable Bronze tables exist.
+
 ## Inputs
 - Workspace: `4d8fc3ee-8e26-4cf3-b603-e1b238bde935`
 - Source Lakehouse: **SalesLT** (`efe41f78-82b7-47ee-9780-2d78372bfdf3`)
@@ -152,6 +160,16 @@ Rule K — Resilience to partial output: Bronze MUST write Delta tables that the
   - Raise (not just log) if zero tables were written by the end of the notebook.
 - Same rule applies recursively to Silver (`Tables/silver/<table>`) and Gold (`Tables/gold/<table>` + `Tables/test/test_results`).
 
+Rule L — Post-write physical discoverability check is mandatory.
+- A write call completing without exception is NOT sufficient. Immediately after every `df.write...save(path)` for Bronze/Silver/Gold/Test outputs, verify the exact expected physical path exists and is non-empty from the lakehouse file system perspective.
+- For Bronze specifically, after writing `Tables/bronze/<flat_table_name>`, the same loop iteration MUST confirm that exact folder now exists at the target lakehouse path and only then record the table as `success`.
+- Never mark a table as written based only on an attempted write, a row count, or a log line. Mark success only after the physical path verification passes.
+- The final layer summary must distinguish:
+  - `attempted`
+  - `write_succeeded`
+  - `discoverable`
+  so the pipeline can fail loudly when writes were attempted but not discoverable.
+
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment. Example:
 ```
 # ---
@@ -181,6 +199,14 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 - Views (`vGetAllCategories`, `vProductAndDescription`, `vProductModelCatalogDescription`) are ingested exactly as exposed; no assumption of hidden audit columns beyond those actually present.
 - Capture per-table row counts and output a final Bronze summary JSON.
 - If any table read fails, log per-table failure, continue other Bronze tables, then raise at end if one or more failed.
+- Canonical write location rule:
+  - For source object `SalesLT/<Name>`, derive `<flat_table_name>` as the exact lowercased `<Name>` only.
+  - Write ONLY to `Tables/bronze/<flat_table_name>`.
+  - Do NOT write to any alternative folder such as `Files/...`, `Tables/Bronze/...`, `Tables/bronze/SalesLT_<Name>`, nested source-schema folders, or mixed-case variants.
+- Discoverability rule:
+  - A Bronze table counts as successful only if the notebook verifies the exact canonical path `Tables/bronze/<flat_table_name>` exists after the write.
+  - Row count may be zero; physical table-path existence is the required success criterion.
+  - If a write succeeds but the canonical path is not discoverable, record that table as failure and do not include it in the successful Bronze outputs list.
 
 ### Bronze notebook generation contract
 - The Bronze notebook MUST NOT be omitted or left empty. It must contain, at minimum, these runnable code cells in this order:
@@ -191,7 +217,8 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
     - adds the Bronze metadata columns,
     - derives `<flat_table_name>` from the last path segment lowercased,
     - writes to `Tables/bronze/<flat_table_name>`,
-    - records row count, output path, and status in a results structure.
+    - verifies the exact physical output path exists before recording success,
+    - records row count, output path, attempted/write/discoverable status, and error details in a results structure.
   - Final summary cell that prints the Bronze results JSON and raises if zero tables were successfully written.
 - Use the exact explicit `source_tables` list in the notebook code; do not rely on lakehouse auto-discovery for this run.
 - The explicit list to embed in the emitted Bronze code is:
@@ -213,10 +240,26 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 - The emitted Bronze code MUST contain an actual `spark.read...` statement for one of the listed tables and an actual `df.write.format("delta").mode("overwrite").option("overwriteSchema","true").save(...)` statement under `Tables/bronze/...`; helper-only code is insufficient.
 - The generator MUST emit at least 4 runnable Bronze code cells: setup, imports/helpers, execution loop, summary/assertion. Zero-cell, one-cell, or prose-only output is invalid.
 - If the notebook generator cannot infer a non-essential implementation detail, it must still emit the full Bronze notebook and fail inside the relevant code cell with a clear runtime error; returning no cells is prohibited.
-- The final Bronze summary cell must explicitly assert both:
-  - the `results` structure contains at least one attempted table, and
-  - at least one table was successfully written under `Tables/bronze/`.
+- The final Bronze summary cell must explicitly assert all of the following:
+  - the `results` structure contains at least one attempted table,
+  - at least one table was physically written under `Tables/bronze/`,
+  - at least one table passed the post-write discoverability check at its exact canonical path.
 - Do not defer Bronze implementation to later layers, helper libraries, or notebook attachments. All runnable Bronze ingestion logic for this run must appear directly in the emitted notebook cells.
+- Required per-table result fields in the emitted code:
+  - `table`
+  - `flat_table_name`
+  - `output_path`
+  - `attempted`
+  - `write_succeeded`
+  - `discoverable`
+  - `rows`
+  - `status`
+  - `error`
+- Required final Bronze self-audit:
+  - Build a list of expected canonical Bronze paths from the 13 input objects.
+  - Build a list of actually discoverable successful Bronze paths from the per-table results.
+  - Raise if the discoverable list is empty, even if write attempts were made.
+  - Include both lists in the final summary JSON so downstream failures are diagnosable.
 
 ## Silver
 - Standardize all Bronze tables into snake_case column names and write to `Tables/silver/<table>`.
