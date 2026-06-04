@@ -78,6 +78,44 @@
   - Added mandatory post-write enumeration of `Tables/bronze/` and validation that all ten expected table directories are present before Bronze succeeds.
   - Added a hard failure if the final discovered table count under `Tables/bronze/` is not exactly ten.
 
+### Iteration 5 — 2026-06-04 09:31:49Z — failed layer: bronze (run: 20260604-091429-24d6ec)
+- **Root cause (1-line summary)**: Server restarted mid-build; Bronze execution must resume from durable state without reprocessing already validated tables.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — restart can occur after write or validation.
+  - SalesLT/Customer: yes — restart can occur after write or validation.
+  - SalesLT/CustomerAddress: yes — restart can occur after write or validation.
+  - SalesLT/Product: yes — restart can occur after write or validation.
+  - SalesLT/ProductCategory: yes — restart can occur after write or validation.
+  - SalesLT/ProductDescription: yes — restart can occur after write or validation.
+  - SalesLT/ProductModel: yes — restart can occur after write or validation.
+  - SalesLT/ProductModelProductDescription: yes — restart can occur after write or validation.
+  - SalesLT/SalesOrderDetail: yes — restart can occur after write or validation.
+  - SalesLT/SalesOrderHeader: yes — restart can occur after write or validation.
+- **Fix approach**: GENERALIZE — restart recovery requirements are identical for all Bronze source tables.
+- **What was changed**:
+  - Required Bronze processing to be table-at-a-time with immediate durable checkpoint persistence after each successful table.
+  - Required notebook startup recovery to rebuild state from physical Delta validation and manifest records rather than in-memory variables.
+  - Added prohibition on failing the run solely because previously completed tables already exist.
+
+### Iteration 6 — 2026-06-04 09:32:24Z — failed layer: bronze (run: 20260604-091429-24d6ec)
+- **Root cause (1-line summary)**: Repeated server restarts interrupted Bronze before completion; recovery state must be stored in durable Lakehouse artifacts and flushed after every table.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — recovery metadata must survive restart.
+  - SalesLT/Customer: yes — recovery metadata must survive restart.
+  - SalesLT/CustomerAddress: yes — recovery metadata must survive restart.
+  - SalesLT/Product: yes — recovery metadata must survive restart.
+  - SalesLT/ProductCategory: yes — recovery metadata must survive restart.
+  - SalesLT/ProductDescription: yes — recovery metadata must survive restart.
+  - SalesLT/ProductModel: yes — recovery metadata must survive restart.
+  - SalesLT/ProductModelProductDescription: yes — recovery metadata must survive restart.
+  - SalesLT/SalesOrderDetail: yes — recovery metadata must survive restart.
+  - SalesLT/SalesOrderHeader: yes — recovery metadata must survive restart.
+- **Fix approach**: GENERALIZE — the same restart-resilience pattern applies to every Bronze table.
+- **What was changed**:
+  - Required a durable checkpoint/manifest stored in the target Lakehouse after every successful table write and validation.
+  - Required startup logic to enumerate all expected Bronze paths and rebuild progress solely from persisted artifacts and Delta validation.
+  - Required committing and validating one table at a time before moving to the next table.
+
 ## Inputs
 - Workspace: `44cf7adf-0561-49b1-bf73-44f3c5b38c21`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -140,6 +178,11 @@ Mandatory discoverability requirements:
 - Write each table to the target LakeSales Lakehouse physical Tables area using the exact path `Tables/bronze/<table_name>`.
 - Resolve paths against the attached target Lakehouse; do not use relative filesystem locations, local disk, temporary storage, or alternate lakehouses.
 - Do not write Bronze outputs to `Files/`, temporary folders, notebook-local storage, alternative casing, or any path other than the exact locations listed below.
+- Process exactly one source table at a time and persist its completion manifest immediately after validation succeeds.
+- Store the Bronze manifest/checkpoint in a durable Lakehouse location that survives Spark session loss and notebook restarts.
+- Flush and persist manifest updates immediately after each individual table is validated; do not defer manifest creation until notebook completion.
+- On notebook startup, enumerate all expected Bronze table paths and rebuild completion state exclusively from the durable Bronze manifest plus physical Delta validation of existing `Tables/bronze/<table_name>` locations.
+- If a target table already exists, has a `_delta_log`, is readable, and passes validation, mark it complete and continue instead of rewriting it.
 - Immediately after each write, verify:
   - the target directory exists;
   - a `_delta_log` directory exists beneath the target directory;
