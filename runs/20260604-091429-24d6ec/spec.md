@@ -21,6 +21,25 @@
   - Added post-write validation that each Bronze table is immediately discoverable and readable.
   - Added a mandatory layer-level failure if any expected Bronze table is missing after writes complete.
 
+### Iteration 2 — 2026-06-04 09:21:52Z — failed layer: bronze (run: 20260604-091429-24d6ec)
+- **Root cause (1-line summary)**: Silver again found no discoverable Bronze outputs, indicating Bronze writes were not materialized at the exact Lakehouse `Tables/bronze/<table>` locations expected by downstream discovery.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/Customer: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/CustomerAddress: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/Product: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/ProductCategory: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/ProductDescription: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/ProductModel: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/ProductModelProductDescription: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/SalesOrderDetail: yes — must exist as a physical Delta table under the exact Bronze path.
+  - SalesLT/SalesOrderHeader: yes — must exist as a physical Delta table under the exact Bronze path.
+- **Fix approach**: GENERALIZE — the same discoverability requirement applies uniformly to every Bronze table.
+- **What was changed**:
+  - Added explicit prohibition on writing Bronze outputs anywhere except the listed `Tables/bronze/<table>` locations.
+  - Added mandatory Delta-log validation and directory enumeration after each write.
+  - Added a final Bronze manifest check requiring all expected table directories to exist before the layer can succeed.
+
 ## Inputs
 - Workspace: `44cf7adf-0561-49b1-bf73-44f3c5b38c21`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -81,10 +100,17 @@ Write pattern:
 
 Mandatory discoverability requirements:
 - Write each table to a physical Delta path under `Tables/bronze/<table_name>` using the exact table names listed below.
-- Immediately after each write, read the Delta output back from the same path and verify the table is readable and contains a schema.
-- Maintain a success list of discoverable Bronze outputs.
-- At notebook completion, assert that all expected Bronze tables are present in the success list.
-- If any expected Bronze table is missing, unreadable, or written to a different path, fail Bronze with a clear error naming the missing table and expected path.
+- Do not write Bronze outputs to `Files/`, temporary folders, notebook-local storage, alternative casing, or any path other than the exact locations listed below.
+- Immediately after each write, verify:
+  - the target directory exists;
+  - a `_delta_log` directory exists beneath the target directory;
+  - a Delta read from the same path succeeds;
+  - the returned schema is non-empty;
+  - the row count is greater than or equal to zero.
+- Maintain a success list containing only tables that pass all validations above.
+- At notebook completion, enumerate the contents of `Tables/bronze/` and compare against the expected table list.
+- Assert that all expected Bronze table directories exist and are readable from their exact paths.
+- If any expected Bronze table is missing, unreadable, lacks a `_delta_log`, or is written to a different path, fail Bronze with a clear error naming the table and expected path.
 - Do not rely solely on metadata registration; physical Delta files under `Tables/bronze/<table_name>` must exist.
 
 Bronze tables:
@@ -99,7 +125,7 @@ Bronze tables:
 - bronze.salesorderdetail → `Tables/bronze/salesorderdetail`
 - bronze.salesorderheader → `Tables/bronze/salesorderheader`
 
-Capture source row counts and write summary JSON at notebook completion.
+Capture source row counts and write summary JSON at notebook completion. The summary must include the exact Bronze path, validation status, and row count for every expected table.
 
 ## Silver
 
