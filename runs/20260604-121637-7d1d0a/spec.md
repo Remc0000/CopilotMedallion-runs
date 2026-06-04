@@ -21,6 +21,25 @@
   - Added mandatory schema validation before deduplication and business-derived columns.
   - Required Silver completion tracking and prohibition of a single multi-table Silver transformation plan.
 
+### Iteration 2 — 2026-06-04 12:23:02Z — failed layer: silver (run: 20260604-121637-7d1d0a)
+- **Root cause (1-line summary)**: Silver layer again terminated with a session-wide cancellation; a table-level Spark action likely failed and propagated to the entire session.
+- **Cross-table audit**:
+  - Address: yes — schema validation, deduplication, and write operations can trigger session-ending failures.
+  - Customer: yes — derived salesperson columns and deduplication can fail.
+  - CustomerAddress: yes — composite-key handling can fail.
+  - Product: yes — date-derived business logic can fail.
+  - ProductCategory: yes — rename and deduplication path can fail.
+  - ProductDescription: yes — standard Silver transformation path can fail.
+  - ProductModel: yes — standard Silver transformation path can fail.
+  - ProductModelProductDescription: yes — junction-table composite-key processing can fail.
+  - SalesOrderDetail: yes — calculated columns can fail.
+  - SalesOrderHeader: yes — date derivations can fail.
+- **Fix approach**: GENERALIZE — the failure remains non-table-specific, so all Silver tables require execution isolation, explicit materialization, and write validation.
+- **What was changed**:
+  - Tightened Silver execution to require one notebook-level processing unit per table iteration with forced materialization before write.
+  - Added mandatory row-count validation before and after write operations.
+  - Required failures to be logged and skipped so remaining Silver tables continue processing.
+
 ## Inputs
 - Workspace: `120db309-94d0-4c4a-9183-504d81b9a3bf`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -103,6 +122,10 @@ Common Silver standards:
 - Never build a single DataFrame lineage, SQL statement, or execution plan spanning multiple Silver tables.
 - Before any rename, deduplication, window, filter, or derived-column logic, validate that all required source columns for that table exist and fail with a table-specific error message naming the missing column.
 - A failure on one Silver table must not prevent attempted processing of the remaining Silver tables; emit a per-table status summary at completion.
+- For every table, force materialization of the transformed DataFrame and validate a non-error row count before attempting the Delta write.
+- After every Silver write, immediately validate that the target Delta path exists and that the written row count is retrievable.
+- Record table name, pre-write row count, post-write row count, status, and error message (if any) in a Silver execution summary.
+- Continue processing remaining tables after a table-specific failure; only fail the Silver layer after the summary is produced.
 - Rename all columns to snake_case.
 - Add `_silver_loaded_at`.
 - Trim string columns.
