@@ -11,6 +11,15 @@
   - Added post-write validation that each expected Bronze table exists and is readable before the notebook completes.
   - Added a fail-fast rule when fewer than the expected 10 Bronze tables are discoverable.
 
+### Iteration 2 — 2026-06-04 08:30:33Z — failed layer: bronze (run: 20260604-082408-51201e)
+- **Root cause (1-line summary)**: Build interruption due to Spark/session restart mid-build, risking partial Bronze output and non-idempotent reruns.
+- **Cross-table audit**: Address: yes — restart can interrupt write; Customer: yes — restart can interrupt write; CustomerAddress: yes — restart can interrupt write; Product: yes — restart can interrupt write; ProductCategory: yes — restart can interrupt write; ProductDescription: yes — restart can interrupt write; ProductModel: yes — restart can interrupt write; ProductModelProductDescription: yes — restart can interrupt write; SalesOrderDetail: yes — restart can interrupt write; SalesOrderHeader: yes — restart can interrupt write.
+- **Fix approach**: GENERALIZE — the interruption risk applies uniformly to all Bronze tables and requires restart-safe processing rules.
+- **What was changed**:
+  - Added restart-safe Bronze processing requirements with per-table isolation and validation.
+  - Required skipping already-valid Bronze outputs on rerun using path-level validation.
+  - Added final completeness checks that verify all 10 expected Bronze Delta tables are present before success.
+
 ## Inputs
 - Workspace: `fa4681d4-fabe-41bc-b3c8-d6daa3601f10`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -102,6 +111,13 @@ Bronze completion requirements:
 - Before the Bronze notebook exits, assert that all expected Bronze table paths are discoverable under `Tables/bronze`.
 - Fail the run with a clear error if fewer than 10 Bronze tables are discoverable.
 - Silver must be able to discover Bronze inputs exclusively from the written Delta outputs, without relying on notebook state.
+
+Bronze restart-resilience requirements:
+- Treat every source table as an independent unit of work; a failure or session restart while processing one table must not prevent validation of previously written tables.
+- On rerun, first check whether each expected Delta path already exists and is readable; if it contains a valid Delta table, it may be overwritten or reused, but the notebook must not assume prior in-memory state exists.
+- Maintain a completion manifest in the notebook summary containing all successfully validated Bronze table paths.
+- Before reporting success, perform a fresh filesystem scan of `Tables/bronze` and verify that all 10 required Delta table locations exist and are readable in the current Spark session.
+- Any interruption, session restart, or partial-write condition must result in a rerunnable notebook that reconstructs state solely from lakehouse contents.
 
 Partitioning:
 - SalesOrderHeader: partition by OrderDate year/month helper columns.
