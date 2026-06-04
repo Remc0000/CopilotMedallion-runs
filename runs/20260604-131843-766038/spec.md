@@ -21,6 +21,25 @@
   - Required per-table result tracking and deferred failure reporting after all Silver tables are attempted.
   - Required Silver-table schema validation and write completion checks before advancing to the next table.
 
+### Iteration 2 — 2026-06-04 13:29:48Z — failed layer: reporting (run: 20260604-131843-766038)
+- **Root cause (1-line summary)**: Reporting stage failed with `System_Cancelled_Session_Statements_Failed`, indicating one reporting artifact build failure cancelled the Spark session and prevented remaining semantic-model/reporting tasks from completing.
+- **Cross-table audit**:
+  - Address: yes — reporting datasets may ultimately depend on dimensions sourced from Address.
+  - Customer: yes — reporting relationships and visuals depend on customer-derived dimensions.
+  - CustomerAddress: yes — customer geography reporting depends on this bridge-derived logic.
+  - Product: yes — product reporting artifacts depend on product-derived dimensions.
+  - ProductCategory: yes — category hierarchies feed reporting artifacts.
+  - ProductDescription: yes — product descriptions may be surfaced in semantic models.
+  - ProductModel: yes — model attributes participate in reporting dimensions.
+  - ProductModelProductDescription: yes — reporting joins may depend on this bridge table.
+  - SalesOrderDetail: yes — fact measures originate from detail records.
+  - SalesOrderHeader: yes — date dimensions and order attributes originate here.
+- **Fix approach**: GENERALIZE — the failure mode is reporting-stage orchestration and can affect any semantic-model, relationship, measure, hierarchy, or report artifact regardless of source table.
+- **What was changed**:
+  - Added reporting-stage isolation requirements so semantic model, relationships, measures, hierarchies, and report pages are built and validated independently.
+  - Required existence validation of all Gold tables before creating reporting artifacts.
+  - Required per-artifact status tracking and deferred failure reporting after all reporting artifacts are attempted.
+
 ## Inputs
 - Workspace: `0258bc57-3512-47aa-a7fb-6e3930af0f5d`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -419,6 +438,21 @@ Model features:
 - Format currency measures appropriately.
 
 ## Report
+
+Reporting execution requirements:
+- Treat each reporting artifact as an independent unit: semantic model creation, relationship creation, hierarchy creation, measure creation, and each report page build must run separately.
+- Before creating any reporting artifact, validate that all referenced Gold tables exist and are readable:
+  - fact_sales_order
+  - dim_customer
+  - dim_product
+  - dim_order
+  - dim_salesperson
+  - dim_order_date
+  - dim_ship_date
+- Maintain a reporting results collection containing artifact name, artifact type, status, and error details.
+- If one reporting artifact fails, log the failure, continue attempting remaining reporting artifacts, and raise a consolidated reporting failure only after all reporting artifacts have been attempted.
+- Do not build the entire semantic model and report in a single monolithic operation without intermediate validation checkpoints.
+- After creating each relationship, hierarchy, measure, or report page, validate successful creation before proceeding to the next artifact.
 
 Page 1 — Executive Sales Overview
 - KPI cards:
