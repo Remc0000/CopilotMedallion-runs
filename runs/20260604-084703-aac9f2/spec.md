@@ -21,6 +21,25 @@
   - Added post-write validation that each Bronze table path exists and contains a readable Delta table before proceeding.
   - Added explicit layer-level failure criteria if any required Bronze table is missing or if zero discoverable Bronze tables are found.
 
+### Iteration 2 — 2026-06-04 08:52:18Z — failed layer: bronze (run: 20260604-084703-aac9f2)
+- **Root cause (1-line summary)**: Silver could not discover any Bronze outputs; Bronze validation was insufficient because tables may have been written outside the Lakehouse `Tables/bronze/*` namespace or not registered as discoverable Delta tables.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — same discoverability requirement applies.
+  - SalesLT/Customer: yes — same discoverability requirement applies.
+  - SalesLT/CustomerAddress: yes — same discoverability requirement applies.
+  - SalesLT/Product: yes — same discoverability requirement applies.
+  - SalesLT/ProductCategory: yes — same discoverability requirement applies.
+  - SalesLT/ProductDescription: yes — same discoverability requirement applies.
+  - SalesLT/ProductModel: yes — same discoverability requirement applies.
+  - SalesLT/ProductModelProductDescription: yes — same discoverability requirement applies.
+  - SalesLT/SalesOrderDetail: yes — same discoverability requirement applies.
+  - SalesLT/SalesOrderHeader: yes — same discoverability requirement applies.
+- **Fix approach**: GENERALIZE — all Bronze tables use the same write path and discoverability mechanism.
+- **What was changed**:
+  - Tightened Bronze path requirements to require writes to the target Lakehouse `SalesLTAnalytics` and nowhere else.
+  - Added mandatory end-of-layer discovery validation against all expected Bronze table paths.
+  - Added explicit prohibition on writing Bronze outputs to Files, temporary locations, workspace-default storage, or alternate Lakehouses.
+
 ## Inputs
 - Workspace: `fa4681d4-fabe-41bc-b3c8-d6daa3601f10`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -60,6 +79,7 @@ Cross-cutting code rules:
 - Enforce per-table isolation and resilient execution.
 - Every code cell must start with a short comment block describing purpose and intent.
 - Validate outputs after each layer and fail if no discoverable Delta tables were produced.
+- All writes must target the explicitly specified target Lakehouse and must not use temporary paths, Files folders, workspace-default storage, or alternate Lakehouses.
 
 ## Bronze
 
@@ -87,6 +107,7 @@ Standard Bronze metadata:
 Write pattern:
 - Delta format
 - Overwrite mode with schema overwrite
+- All Bronze outputs MUST be written into the target Lakehouse `SalesLTAnalytics`.
 - Physical write location for every table MUST be exactly:
   - `Tables/bronze/address`
   - `Tables/bronze/customer`
@@ -98,10 +119,22 @@ Write pattern:
   - `Tables/bronze/product_model_product_description`
   - `Tables/bronze/sales_order_detail`
   - `Tables/bronze/sales_order_header`
+- Do NOT write Bronze outputs to:
+  - `Files/*`
+  - temporary folders
+  - local paths
+  - workspace-default storage locations
+  - any Lakehouse other than `SalesLTAnalytics`
 - After each write:
   - Verify the path exists.
   - Verify Spark can read it as Delta.
+  - Verify row count is greater than or equal to zero.
   - Record row count and write status.
+- End-of-layer validation:
+  - Enumerate and validate all ten required Bronze paths listed above.
+  - Read each path back using Spark before marking Bronze complete.
+  - Build a manifest of discovered Bronze tables and row counts.
+  - Fail Bronze immediately if fewer than ten required Bronze tables are discoverable.
 - Bronze completion criteria:
   - At least one Delta table must be discoverable under `Tables/bronze/`.
   - All required source tables listed above must have corresponding Bronze outputs.
