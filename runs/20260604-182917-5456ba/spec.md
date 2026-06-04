@@ -1,5 +1,26 @@
 # Run Spec 20260604-182734-cbfcb3
 
+## Updated specs
+
+### Iteration 1 — 2026-06-04 18:30:10Z — failed layer: bronze (run: 20260604-182917-5456ba)
+- **Root cause (1-line summary)**: Bronze ingestion failed at runtime; the most likely systemic cause is assuming every source table contains a partitioning/incremental watermark column (for example `ModifiedDate`) when some SalesLT tables may not expose the expected column shape.
+- **Cross-table audit**:
+  - Address: yes — partition and incremental logic references `ModifiedDate`.
+  - Customer: yes — partition and incremental logic references `ModifiedDate`.
+  - CustomerAddress: yes — partition and incremental logic references `ModifiedDate`.
+  - Product: yes — partition and incremental logic references `ModifiedDate`.
+  - ProductCategory: yes — partition and incremental logic references `ModifiedDate`.
+  - ProductDescription: yes — partition and incremental logic references `ModifiedDate`.
+  - ProductModel: yes — partition and incremental logic references `ModifiedDate`.
+  - ProductModelProductDescription: yes — partition and incremental logic references `ModifiedDate`.
+  - SalesOrderDetail: yes — partition logic references `ModifiedDate` as a fallback.
+  - SalesOrderHeader: yes — uses `OrderDate` instead of `ModifiedDate`; similar failure can occur if expected watermark columns are hard-coded.
+- **Fix approach**: GENERALIZE — the issue is a cross-table schema-assumption risk affecting all Bronze ingestions and should be handled uniformly.
+- **What was changed**:
+  - Added Bronze schema-discovery requirements before applying incremental filters, MERGE keys, or partition expressions.
+  - Added explicit fallback behavior when `ModifiedDate` or other expected partition columns are absent.
+  - Required ingestion to preserve available source columns without failing on missing optional columns.
+
 ## Inputs
 - Workspace: `e8b5ab1d-0b93-4b7d-bfb5-aaf3fbf712d4`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -29,6 +50,8 @@ Apply these reference skills/agents at all times:
 
 All generated notebooks must be designed to run incrementally on a daily schedule unless the spec explicitly states otherwise. Use idempotent write patterns (mode='overwrite' with overwriteSchema=true, or merge/upsert where appropriate) so that re-running the same notebook the next day produces correct, up-to-date results without duplicates or failures.
 
+Before applying any filter, partition strategy, MERGE condition, or watermark logic, inspect the actual source schema. Do not reference a column unless it exists in the source DataFrame. When an expected column is absent, use the documented fallback behavior rather than failing the notebook.
+
 ## Bronze
 
 Land each source table into the `bronze` schema as a Delta table with source-preserving structure.
@@ -41,51 +64,53 @@ Common metadata columns added to every bronze table:
 - source_file_or_object (if available)
 
 Write strategy:
-- Daily incremental load using ModifiedDate where available.
+- Daily incremental load using `ModifiedDate` only when that column exists in the source table.
+- If `ModifiedDate` does not exist, perform a full-table load or use an alternative available business timestamp for that table.
 - MERGE/UPSERT into bronze on business key(s).
 - Preserve original column names and data types.
-- Store rowguid and ModifiedDate exactly as received.
+- Store `rowguid` and `ModifiedDate` exactly as received when present.
+- Prior to write, validate the existence of all key, partition, and watermark columns referenced by the ingestion logic. Missing optional columns must not cause notebook failure.
 
 Table-specific keys and partitioning:
 - bronze.address
   - Key: AddressID
-  - Partition: year(ModifiedDate)
+  - Partition: year(ModifiedDate) when `ModifiedDate` exists; otherwise write unpartitioned.
 
 - bronze.customer
   - Key: CustomerID
-  - Partition: year(ModifiedDate)
+  - Partition: year(ModifiedDate) when `ModifiedDate` exists; otherwise write unpartitioned.
 
 - bronze.customer_address
   - Key: CustomerID + AddressID
-  - Partition: year(ModifiedDate)
+  - Partition: year(ModifiedDate) when `ModifiedDate` exists; otherwise write unpartitioned.
 
 - bronze.product
   - Key: ProductID
-  - Partition: year(ModifiedDate)
+  - Partition: year(ModifiedDate) when `ModifiedDate` exists; otherwise write unpartitioned.
 
 - bronze.product_category
   - Key: ProductCategoryID
-  - Partition: year(ModifiedDate)
+  - Partition: year(ModifiedDate) when `ModifiedDate` exists; otherwise write unpartitioned.
 
 - bronze.product_description
   - Key: ProductDescriptionID
-  - Partition: year(ModifiedDate)
+  - Partition: year(ModifiedDate) when `ModifiedDate` exists; otherwise write unpartitioned.
 
 - bronze.product_model
   - Key: ProductModelID
-  - Partition: year(ModifiedDate)
+  - Partition: year(ModifiedDate) when `ModifiedDate` exists; otherwise write unpartitioned.
 
 - bronze.product_model_product_description
   - Key: ProductModelID + ProductDescriptionID + Culture
-  - Partition: year(ModifiedDate)
+  - Partition: year(ModifiedDate) when `ModifiedDate` exists; otherwise write unpartitioned.
 
 - bronze.sales_order_header
   - Key: SalesOrderID
-  - Partition: year(OrderDate)
+  - Partition: year(OrderDate) when `OrderDate` exists; otherwise write unpartitioned.
 
 - bronze.sales_order_detail
   - Key: SalesOrderDetailID
-  - Partition: derived from associated order year when practical, otherwise year(ModifiedDate)
+  - Partition: derived from associated order year when practical; otherwise year(ModifiedDate) only if `ModifiedDate` exists; otherwise write unpartitioned.
 
 ## Silver
 
