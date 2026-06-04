@@ -20,6 +20,15 @@
   - Required skipping already-valid Bronze outputs on rerun using path-level validation.
   - Added final completeness checks that verify all 10 expected Bronze Delta tables are present before success.
 
+### Iteration 3 — 2026-06-04 08:38:10Z — failed layer: bronze (run: 20260604-082408-51201e)
+- **Root cause (1-line summary)**: Spark server restarted mid-build; Bronze processing must resume safely without reprocessing assumptions or notebook-state dependencies.
+- **Cross-table audit**: Address: yes — restart can occur before or after write validation; Customer: yes — same risk; CustomerAddress: yes — same risk; Product: yes — same risk; ProductCategory: yes — same risk; ProductDescription: yes — same risk; ProductModel: yes — same risk; ProductModelProductDescription: yes — same risk; SalesOrderDetail: yes — same risk; SalesOrderHeader: yes — same risk.
+- **Fix approach**: GENERALIZE — the restart condition is infrastructure-wide and affects every Bronze table identically.
+- **What was changed**:
+  - Added explicit resume-from-lakehouse behavior requiring reconstruction of progress from existing Delta paths after any restart.
+  - Required per-table checkpoint validation before processing and after processing.
+  - Required final Bronze success only when all 10 expected tables are validated in the current Spark session after any restart recovery.
+
 ## Inputs
 - Workspace: `fa4681d4-fabe-41bc-b3c8-d6daa3601f10`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -59,6 +68,7 @@ Cross-cutting code rules:
 - Process source tables independently per-table wherever possible.
 - Every code cell must start with a short markdown-style Python comment block describing purpose and intent.
 - After every layer write, validate the target path exists, is Delta formatted, and is readable before continuing.
+- After any Spark restart or notebook rerun, reconstruct processing state exclusively from lakehouse contents; never rely on Python variables, cached DataFrames, temp views, or prior notebook execution state.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 (Keep all existing rules A–K exactly as written in the original spec.)
@@ -118,6 +128,9 @@ Bronze restart-resilience requirements:
 - Maintain a completion manifest in the notebook summary containing all successfully validated Bronze table paths.
 - Before reporting success, perform a fresh filesystem scan of `Tables/bronze` and verify that all 10 required Delta table locations exist and are readable in the current Spark session.
 - Any interruption, session restart, or partial-write condition must result in a rerunnable notebook that reconstructs state solely from lakehouse contents.
+- At notebook startup, build the processing queue by scanning the 10 required Bronze output paths and marking each table as validated, missing, or unreadable.
+- If a restart occurs, re-read every previously completed Delta path from storage before continuing with remaining tables.
+- Do not require all 10 tables to be processed within a single Spark session; success is determined only by the final validation scan of all required Delta outputs.
 
 Partitioning:
 - SalesOrderHeader: partition by OrderDate year/month helper columns.
