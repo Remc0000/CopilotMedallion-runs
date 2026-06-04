@@ -21,6 +21,25 @@
   - Added explicit fallback behavior when ModifiedDate is absent.
   - Added rules to avoid MERGE execution when required key columns are missing.
 
+### Iteration 2 — 2026-06-04 14:49:39Z — failed layer: bronze (run: 20260604-144746-4f3acf)
+- **Root cause (1-line summary)**: Bronze Spark session was cancelled during statement execution; MERGE execution against missing/uninitialized targets or invalid source shapes remains a likely systemic failure mode.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — target creation and key validation requirements apply.
+  - SalesLT/Customer: yes — target creation and incremental logic requirements apply.
+  - SalesLT/CustomerAddress: yes — composite-key validation and target existence checks apply.
+  - SalesLT/Product: yes — target creation and ModifiedDate fallback requirements apply.
+  - SalesLT/ProductCategory: yes — target creation and key validation requirements apply.
+  - SalesLT/ProductDescription: yes — target creation and key validation requirements apply.
+  - SalesLT/ProductModel: yes — target creation and key validation requirements apply.
+  - SalesLT/ProductModelProductDescription: yes — composite-key validation and target existence checks apply.
+  - SalesLT/SalesOrderDetail: yes — target creation, key validation, and partition logic apply.
+  - SalesLT/SalesOrderHeader: yes — target creation, key validation, and partition logic apply.
+- **Fix approach**: GENERALIZE — the same Bronze write-path and validation logic is used across all source tables.
+- **What was changed**:
+  - Added mandatory source row-count and schema validation before any write operation.
+  - Added explicit first-load behavior: create/overwrite target table when it does not already exist; do not execute MERGE against a non-existent target.
+  - Added requirement to skip and log empty-source tables instead of executing MERGE statements.
+
 ## Inputs
 - Workspace: `a9df7114-70df-4a8c-a234-468ba3543444`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -66,6 +85,14 @@ Common approach:
 - Use Delta format.
 - Incremental ingestion using `ModifiedDate` where available.
 - If a source table does not contain a `ModifiedDate` column, ingest the full table and do not reference `ModifiedDate` in filters, watermarks, or MERGE predicates.
+- Before any write or MERGE, validate that:
+  - the source table exists;
+  - the source dataframe schema was successfully read;
+  - all configured key columns exist;
+  - the source dataframe contains at least one column and can be counted successfully.
+- If the source dataframe is empty, log the condition and skip processing for that table; do not execute a MERGE.
+- For first-time loads where the bronze target table does not yet exist, create the Delta table using overwrite/create semantics and do not execute a MERGE.
+- Only execute MERGE when both the source dataframe and target Delta table exist and all required key columns are present.
 - Before any MERGE, validate that all configured key columns exist in the source dataframe.
 - Only use the table-specific key columns listed below as MERGE predicates.
 - If a required key column is missing, stop processing that table with an explicit validation error and continue processing other tables where possible.
