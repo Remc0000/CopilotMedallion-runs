@@ -21,6 +21,25 @@
   - Added mandatory post-write validation that each Delta path exists and contains data.
   - Added explicit build-failure conditions if any required Bronze table is missing or if zero discoverable tables are produced.
 
+### Iteration 2 — 2026-06-04 10:22:56Z — failed layer: bronze (run: 20260604-101231-3e044a)
+- **Root cause (1-line summary)**: Build was interrupted by a server restart mid-Bronze execution, creating a risk of partially written or partially validated Bronze outputs.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — interruption could occur before or after write completion.
+  - SalesLT/Customer: yes — interruption could occur before or after write completion.
+  - SalesLT/CustomerAddress: yes — interruption could occur before or after write completion.
+  - SalesLT/Product: yes — interruption could occur before or after write completion.
+  - SalesLT/ProductCategory: yes — interruption could occur before or after write completion.
+  - SalesLT/ProductDescription: yes — interruption could occur before or after write completion.
+  - SalesLT/ProductModel: yes — interruption could occur before or after write completion.
+  - SalesLT/ProductModelProductDescription: yes — interruption could occur before or after write completion.
+  - SalesLT/SalesOrderDetail: yes — interruption could occur before or after write completion.
+  - SalesLT/SalesOrderHeader: yes — interruption could occur before or after write completion.
+- **Fix approach**: GENERALIZE — restart resilience and idempotent validation requirements apply uniformly to every Bronze table.
+- **What was changed**:
+  - Added mandatory restart-safe, idempotent Bronze write behavior.
+  - Added pre-run validation of existing Bronze outputs and selective rewrites for missing or unreadable tables.
+  - Added completion manifest requirements so resumed builds can determine which Bronze tables are already valid.
+
 ## Inputs
 - Workspace: `1779f71c-1dd7-4707-af35-94419229e9ac`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -54,6 +73,8 @@ All existing Generic guidance rules remain in force, including Rule K (Resilienc
 - After every write, immediately validate that the target Delta path exists and can be read back successfully.
 - Record the exact output path written for each table and include it in the final results summary.
 - A layer is considered successful only if all required output tables for that layer are discoverable at their expected locations.
+- All writes must be idempotent and safe to rerun after notebook interruption, cluster restart, or server restart.
+- When resuming a build, validate existing outputs before rewriting them; do not assume prior completion based solely on notebook execution history.
 
 ## Bronze
 
@@ -83,15 +104,21 @@ Mandatory output-path mapping (exact names):
 Mandatory write and validation requirements:
 - Write each source table independently in a loop.
 - Use Delta format and overwrite mode.
+- Before writing a table, check whether the target Delta path already exists and is readable.
+- If a readable Delta table exists and passes validation (schema readable and row count obtainable), it may be reused during a resumed run instead of being rewritten.
+- If a target path is missing, unreadable, or fails validation, rewrite that table from source.
 - After writing each table:
   - Read the Delta path back immediately.
   - Verify row count > 0 unless the source itself is empty.
   - Record `{table_name, rows_written, output_path}` in results.
+- Maintain a completion manifest containing one entry per successfully validated Bronze table.
 - At notebook completion:
   - Assert all 10 expected Bronze tables exist at the exact paths listed above.
-  - Print a JSON summary of all written tables and paths.
+  - Verify all 10 tables are readable as Delta tables.
+  - Print a JSON summary of all written or reused tables and paths.
   - Raise an error if any expected Bronze table is missing.
   - Raise an error if fewer than 10 discoverable Bronze tables were produced.
+  - Raise an error if the completion manifest does not contain all 10 required Bronze tables.
 
 Partition large transactional tables by year extracted from business date:
 - salesorderheader: orderdate year
