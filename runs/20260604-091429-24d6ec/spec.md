@@ -135,6 +135,25 @@
   - Required the notebook to fail immediately if `Tables/bronze/` contains fewer than ten expected directories.
   - Required the completion summary JSON to include a discovered-table count and per-table discoverability status.
 
+### Iteration 7 — 2026-06-04 09:40:44Z — failed layer: bronze (run: 20260604-091429-24d6ec)
+- **Root cause (1-line summary)**: Silver found zero discoverable Bronze tables, indicating Bronze validation was not using the same table-discovery mechanism as downstream layer startup.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/Customer: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/CustomerAddress: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/Product: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/ProductCategory: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/ProductDescription: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/ProductModel: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/ProductModelProductDescription: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/SalesOrderDetail: yes — downstream discovery requires a readable Delta table at the expected path.
+  - SalesLT/SalesOrderHeader: yes — downstream discovery requires a readable Delta table at the expected path.
+- **Fix approach**: GENERALIZE — every Bronze table must pass the exact same discovery checks used by Silver.
+- **What was changed**:
+  - Added a mandatory Bronze self-discovery phase that re-enumerates `Tables/bronze/` from a fresh read after all writes complete.
+  - Required validation against the exact ten expected table names and paths before Bronze can report success.
+  - Required Bronze to fail if self-discovery returns fewer than ten tables, regardless of manifest contents.
+
 ## Inputs
 - Workspace: `44cf7adf-0561-49b1-bf73-44f3c5b38c21`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -212,6 +231,7 @@ Mandatory discoverability requirements:
 - After a table passes validation, persist a completion record in a Bronze manifest/checkpoint artifact containing table name, path, row count, validation status, and run_id.
 - On restart or rerun, if a table already exists at the expected path and passes all validation checks, treat it as completed and do not require re-ingestion before continuing with remaining tables.
 - At notebook completion, enumerate the contents of `Tables/bronze/` and compare against the expected table list.
+- Perform a fresh self-discovery pass after all writes complete; do not rely on cached filesystem results, manifests, or in-memory success lists.
 - The discovered directories under `Tables/bronze/` must be exactly:
   - address
   - customer
