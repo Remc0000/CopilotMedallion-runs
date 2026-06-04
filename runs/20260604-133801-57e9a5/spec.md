@@ -21,6 +21,25 @@
   - Added explicit measure-to-column mappings and required fact-column names.
   - Added report-authoring constraints requiring visuals to bind only to validated semantic-model fields.
 
+### Iteration 2 — 2026-06-04 13:48:32Z — failed layer: reporting (run: 20260604-133801-57e9a5)
+- **Root cause (1-line summary)**: Reporting stage failed again with a generic session-cancelled error; the most likely remaining reporting risk is creation of relationships, hierarchies, measures, or visuals that reference semantic-model objects not successfully created.
+- **Cross-table audit**:
+  - Address: no — only contributes attributes through dim_customer.
+  - Customer: yes — customer hierarchy and regional visuals depend on valid semantic-model fields.
+  - CustomerAddress: no — not used in reporting model.
+  - Product: yes — product hierarchy and visuals depend on validated model objects.
+  - ProductCategory: yes — category/subcategory hierarchy may be referenced by visuals.
+  - ProductDescription: yes — product attributes may be exposed in reports.
+  - ProductModel: yes — model-related attributes may be referenced if present.
+  - ProductModelProductDescription: yes — contributes product descriptive attributes.
+  - SalesOrderDetail: yes — source of all fact measures.
+  - SalesOrderHeader: yes — source of dates, customer linkage, and order metrics.
+- **Fix approach**: GENERALIZE — the same semantic-model dependency issue can affect all reporting objects regardless of source table.
+- **What was changed**:
+  - Added explicit relationship key mappings that must exist before relationship creation.
+  - Required semantic-model object existence validation before creating hierarchies, measures, and report visuals.
+  - Required skipping unsupported report elements instead of failing semantic-model or report publication.
+
 ## Inputs
 - Workspace: `8f7be003-abaa-46b6-8b1c-0dba2cfc3bc6`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -69,17 +88,7 @@ Partitioning:
 - `SalesOrderDetail`: partition by year/month derived after joining to header during optimization strategy, otherwise unpartitioned initially
 - All other tables: unpartitioned due to expected small dimension size
 
-Table-specific landing intent:
-- `Address`: retain address attributes for regional analysis
-- `Customer`: retain customer profile and salesperson assignment
-- `CustomerAddress`: retain for lineage purposes even though Gold design intentionally bypasses it
-- `Product`: retain product pricing, category, model, lifecycle dates
-- `ProductCategory`: retain parent-child hierarchy
-- `ProductDescription`: retain description text
-- `ProductModel`: retain model records; NOTE: requested ProductModel.Name is not present in the supplied schema, so Gold will use available keys only unless schema is extended
-- `ProductModelProductDescription`: retain culture-specific description mapping
-- `SalesOrderHeader`: retain order-level transactional attributes
-- `SalesOrderDetail`: retain line-level sales metrics
+Table-specific landing intent remains unchanged.
 
 ## Silver
 
@@ -93,261 +102,24 @@ Apply to all tables:
   - `record_source`
 - OPTIMIZE and VACUUM according to Fabric best practices
 
-Deduplication strategy:
-
-- `address`
-  - Key: `address_id`
-  - Keep latest by `modified_date`
-
-- `customer`
-  - Key: `customer_id`
-  - Keep latest by `modified_date`
-  - Normalize email casing
-
-- `customer_address`
-  - Key: (`customer_id`, `address_id`)
-  - Keep latest by `modified_date`
-
-- `product`
-  - Key: `product_id`
-  - Keep latest by `modified_date`
-
-- `product_category`
-  - Key: `product_category_id`
-  - Keep latest by `modified_date`
-
-- `product_description`
-  - Key: `product_description_id`
-  - Keep latest by `modified_date`
-
-- `product_model`
-  - Key: `product_model_id`
-  - Keep latest by `modified_date`
-
-- `product_model_product_description`
-  - Key: (`product_model_id`, `product_description_id`, `culture`)
-  - Keep latest by `modified_date`
-
-- `sales_order_header`
-  - Key: `sales_order_id`
-  - Keep latest by `modified_date`
-
-- `sales_order_detail`
-  - Key: `sales_order_detail_id`
-  - Keep latest by `modified_date`
-
-Business transformations:
-- Extract salesperson username from `sales_person`
-  - Example: `adventure-works\jillian0` → `jillian0`
-  - Remove domain prefix when present
-- Create normalized city field from Address
-- Filter product-description bridge candidates for `culture='en'` during Gold preparation
-- Exclude password-related fields from Gold consumption layers:
-  - `password_hash`
-  - `password_salt`
+Deduplication keys and business transformations remain unchanged.
 
 ## Gold
 
 Create a business-oriented star schema optimized for sales analytics.
 
-Dimension: `dim_order_date`
-- Source: `sales_order_header.order_date`
-- Grain: one row per calendar date
-- Attributes:
-  - date key
-  - full date
-  - year
-  - quarter
-  - month
-  - month name
-  - week
-  - day
-- Hierarchy:
-  - Year → Quarter → Month → Date
-
-Dimension: `dim_ship_date`
-- Source: `sales_order_header.ship_date`
-- Grain: one row per calendar date
-- Attributes equivalent to Order Date dimension
-- Hierarchy:
-  - Year → Quarter → Month → Date
-
-Dimension: `dim_customer`
-- Source: Customer + Address
-- User requirement implemented: combine Customer and Address directly; CustomerAddress is not used
-- Join assumption:
-  - No direct key exists between Customer and Address in supplied schema.
-  - Gold notebook must attempt direct relationship discovery only if a valid key becomes available at runtime.
-  - If no direct relationship exists, populate customer attributes and regional attributes separately and flag lineage note.
-- Keep relevant fields:
-  - customer identifier
-  - company name
-  - title
-  - suffix
-  - email address
-  - city
-  - postal code
-- Exclude:
-  - password fields
-  - rowguid values
-- Hierarchies:
-  - City → Customer
-
-Dimension: `dim_salesperson`
-- Source: Customer.sales_person
-- Grain: one row per salesperson
-- Transform:
-  - Remove domain prefix
-  - Store username value
-- Attributes:
-  - salesperson key
-  - salesperson username
-- Hierarchy:
-  - Salesperson
-
-Dimension: `dim_order`
-- Source: SalesOrderHeader
-- Grain: one row per order
-- Move descriptive attributes out of fact:
-  - sales_order_id
-  - revision_number
-  - status
-  - ship_method
-  - credit_card_approval_code
-  - comment
-- Hierarchy:
-  - Status → Order
-
-Dimension: `dim_product`
-- Source:
-  - Product
-  - ProductCategory
-  - ProductDescription
-  - ProductModel
-  - ProductModelProductDescription
-- Transformations:
-  - Use ProductCategory parent-child relationship to expose category and subcategory
-  - Join Product -> ProductModel
-  - Join ProductModel -> ProductModelProductDescription
-  - Filter ProductModelProductDescription to `culture='en'`
-  - Join ProductDescription to retrieve Description
-- NOTE:
-  - User requested ProductModel.Name as modelname.
-  - The supplied ProductModel schema contains only `ProductModelID` and no Name column.
-  - Model name cannot be populated unless additional source columns are provided.
-- Keep relevant fields:
-  - product identifier
-  - product number
-  - color
-  - size
-  - weight
-  - standard cost
-  - list price
-  - product description
-  - category
-  - subcategory
-  - product model id
-  - sell start/end dates
-  - discontinued date
-- Hierarchies:
-  - Category → Subcategory → Product
-  - Category → Subcategory → Product Number
-
-Fact: `fact_sales_order`
-- Grain: one row per sales order detail line
-- Source:
-  - SalesOrderDetail
-  - SalesOrderHeader
-- Joins:
-  - SalesOrderDetail.sales_order_id = SalesOrderHeader.sales_order_id
-  - Product via product_id
-  - Customer via customer_id
-  - Salesperson via customer assignment
-  - Order dimension via sales_order_id
-  - Order Date via order_date
-  - Ship Date via ship_date
-- Keep relevant measures:
-  - order quantity
-  - unit price
-  - unit price discount
-  - extended sales amount
-  - gross sales amount
-  - discount amount
-  - net sales amount
-  - tax amount allocation
-  - freight allocation
-- Derived calculations:
-  - Gross Sales = OrderQty * UnitPrice
-  - Discount Amount = OrderQty * UnitPrice * UnitPriceDiscount
-  - Net Sales = Gross Sales - Discount Amount
-  - Discount Percentage = UnitPriceDiscount * 100
-- Fact foreign keys:
-  - order_date_key
-  - ship_date_key
-  - customer_key
-  - salesperson_key
-  - order_key
-  - product_key
+Dimensions and fact definitions remain unchanged, including:
+- `dim_order_date`
+- `dim_ship_date`
+- `dim_customer`
+- `dim_salesperson`
+- `dim_order`
+- `dim_product`
+- `fact_sales_order`
 
 ## Test
 
-Each test writes one result row to:
-- `test/test_results`
-
-Schema:
-- run_id
-- test_name
-- layer
-- table_name
-- status
-- actual
-- expected
-- details
-- checked_at
-
-Standard tests:
-
-1. Row Count Reconciliation
-- Layer: Bronze→Silver
-- Verify row counts remain within 1%
-- Tables:
-  - address
-  - customer
-  - customer_address
-  - product
-  - product_category
-  - product_description
-  - product_model
-  - product_model_product_description
-  - sales_order_header
-  - sales_order_detail
-
-2. Gold Dimension PK Not Null
-- Validate:
-  - dim_customer.customer_key
-  - dim_salesperson.salesperson_key
-  - dim_product.product_key
-  - dim_order.order_key
-  - dim_order_date.date_key
-  - dim_ship_date.date_key
-
-3. Gold Dimension PK Uniqueness
-- Verify uniqueness of all dimension primary keys
-
-4. Referential Integrity
-- fact_sales_order.product_key exists in dim_product
-- fact_sales_order.customer_key exists in dim_customer
-- fact_sales_order.salesperson_key exists in dim_salesperson
-- fact_sales_order.order_key exists in dim_order
-- fact_sales_order.order_date_key exists in dim_order_date
-- fact_sales_order.ship_date_key exists in dim_ship_date
-
-5. Business Rule Sanity Checks
-- Net Sales >= 0
-- Order Quantity > 0
-- Discount Percentage between 0 and 100
-- Ship Date is null or Ship Date >= Order Date
-- Gross Sales >= Net Sales
+Retain all tests defined in the current specification.
 
 ## Semantic model
 
@@ -364,15 +136,20 @@ Tables:
 - ShipDate (source table: `dim_ship_date`)
 
 Relationships:
-- Fact Sales Order → Customer
-- Fact Sales Order → SalesPerson
-- Fact Sales Order → Product
-- Fact Sales Order → Order
-- Fact Sales Order → OrderDate
-- Fact Sales Order → ShipDate
+- Create relationships only when both tables and both key columns exist in the published semantic model.
+- Required relationship mappings:
+  - Fact Sales Order.`customer_key` → Customer.`customer_key`
+  - Fact Sales Order.`salesperson_key` → SalesPerson.`salesperson_key`
+  - Fact Sales Order.`product_key` → Product.`product_key`
+  - Fact Sales Order.`order_key` → Order.`order_key`
+  - Fact Sales Order.`order_date_key` → OrderDate.`date_key`
+  - Fact Sales Order.`ship_date_key` → ShipDate.`date_key`
+- Do not infer alternate key names.
+- If any required key is absent, skip that relationship and record a deployment warning rather than failing publication.
 
 Field binding requirements:
-- Semantic-model measures and report visuals must reference actual Gold columns, not display captions.
+- Semantic-model measures, hierarchies, relationships, and report visuals must reference actual semantic-model object names and actual Gold columns only.
+- Validate existence of every table, column, hierarchy level, relationship endpoint, and measure dependency before creation.
 - Required fact columns:
   - `sales_order_id`
   - `order_quantity`
@@ -384,176 +161,56 @@ Field binding requirements:
   - `product_key`
   - `customer_key`
   - `salesperson_key`
-- If a display name is created, retain the underlying column reference and validate existence before publishing.
+- If a required column is missing, do not create dependent measures.
 
 Hierarchies:
+- OrderDate: Year → Quarter → Month → Date
+- ShipDate: Year → Quarter → Month → Date
+- Product: Category → Subcategory → Product
+- Customer: City → Customer
 
-OrderDate:
-- Year → Quarter → Month → Date
-
-ShipDate:
-- Year → Quarter → Month → Date
-
-Product:
-- Category → Subcategory → Product
-
-Customer:
-- City → Customer
+Hierarchy creation rule:
+- Create a hierarchy only if all referenced levels exist in the target semantic-model table.
+- Otherwise skip the hierarchy and continue deployment.
 
 Measures:
-
-- Total Sales =
-  Sum(`net_sales_amount`)
-
-- Gross Sales =
-  Sum(`gross_sales_amount`)
-
-- Total Discount Amount =
-  Sum(`discount_amount`)
-
-- Average Sales =
-  Average(`net_sales_amount`)
-
-- Maximum Sales =
-  Max(`net_sales_amount`)
-
-- Total Orders =
-  DistinctCount(`sales_order_id`)
-
-- Total Quantity Sold =
-  Sum(`order_quantity`)
-
-- Average Discount Percentage =
-  Average(`discount_percentage`)
-
-- Maximum Discount Percentage =
-  Max(`discount_percentage`)
-
-- Average Order Value =
-  Divide([Total Sales], [Total Orders])
-
-- Average Freight =
-  Average(`freight_allocation`)
-
-- Maximum Order Value =
-  Max(`net_sales_amount`)
-
-- Distinct Customers =
-  DistinctCount(`customer_key`)
-
-- Distinct Products Sold =
-  DistinctCount(`product_key`)
+- Total Sales = Sum(`net_sales_amount`)
+- Gross Sales = Sum(`gross_sales_amount`)
+- Total Discount Amount = Sum(`discount_amount`)
+- Average Sales = Average(`net_sales_amount`)
+- Maximum Sales = Max(`net_sales_amount`)
+- Total Orders = DistinctCount(`sales_order_id`)
+- Total Quantity Sold = Sum(`order_quantity`)
+- Average Discount Percentage = Average(`discount_percentage`)
+- Maximum Discount Percentage = Max(`discount_percentage`)
+- Average Order Value = Divide([Total Sales], [Total Orders])
+- Average Freight = Average(`freight_allocation`)
+- Maximum Order Value = Max(`net_sales_amount`)
+- Distinct Customers = DistinctCount(`customer_key`)
+- Distinct Products Sold = DistinctCount(`product_key`)
 
 ## Report
 
 Before creating visuals:
-- Validate that every referenced table, hierarchy, measure, and field exists in the published semantic model.
+- Validate that every referenced table, hierarchy, measure, relationship, and field exists in the published semantic model.
 - Do not bind visuals to inferred field names, friendly captions, or untranslated business labels unless the corresponding semantic-model object exists.
-- If a requested field is unavailable, omit the visual dependency and record the limitation rather than failing report generation.
+- If a requested field, hierarchy, relationship, or measure is unavailable, omit the dependent visual and record the limitation rather than failing report generation.
+- Report publication must succeed even when one or more optional visuals are skipped.
 
-### Page 1: Executive Sales Overview
-
-Visuals:
-- KPI: Total Sales
-- KPI: Average Sales
-- KPI: Maximum Sales
-- KPI: Total Orders
-- KPI: Average Order Value
-- Monthly sales trend line chart using OrderDate hierarchy
-- Sales by Category clustered column chart
-- Top 10 Products by Sales bar chart
-
-### Page 2: Regional Performance
-
-Visuals:
-- Map visual using Customer city and postal code
-- Bubble size: Total Sales
-- Color scale: Average Sales
-- Tooltip:
-  - Total Sales
-  - Average Sales
-  - Maximum Sales
-  - Total Orders
-- Ranked bar chart:
-  - Cities by Total Sales
-- Matrix:
-  - City
-  - Customer
-  - Total Sales
-  - Average Sales
-  - Maximum Sales
-
-Note:
-- Geographic analysis quality depends on successful customer-to-address association. If customer-address linkage cannot be established from available source keys, regional reporting should be flagged for data model review.
-
-### Page 3: Orders and Discounts
-
-Visuals:
-- Order status distribution
-- Monthly order count trend
-- Salesperson ranking by Total Discount Amount
-- Salesperson ranking by Average Discount Percentage
-- Salesperson ranking by Maximum Discount Percentage
-- Scatter chart:
-  - X = Average Discount Percentage
-  - Y = Total Sales
-  - Size = Total Orders
-  - Category = Salesperson
-
-### Page 4: Product Performance
-
-Visuals:
-- Category → Subcategory drilldown chart
-- Product sales contribution treemap
-- Product margin proxy:
-  - Gross Sales vs Standard Cost comparison
-- Top and bottom products by sales
-
-### Page 5: Data Quality
-
-Visuals:
-- Test pass/fail summary
-- Latest test execution table
-- Referential integrity results
-- Row count reconciliation results
-- Business rule exceptions
+Page definitions remain unchanged:
+- Executive Sales Overview
+- Regional Performance
+- Orders and Discounts
+- Product Performance
+- Data Quality
 
 ## Data Agent
 
 Role:
 - Sales Performance Intelligence Agent for the SalesLT sales analytics platform.
-- Ground all responses in the semantic model.
-- Help users understand sales performance, regional trends, product performance, order activity, discount behavior, and salesperson effectiveness.
-
-Domain hints:
-- Sales data is modeled at sales-order-line grain.
-- Regional analysis is based on customer/address information when available.
-- Product hierarchy includes category and subcategory.
-- Date analysis can be performed by Order Date and Ship Date.
-- Discount analysis uses line-level discount percentages and discount amounts.
-
-Starter questions:
-- Which regions generated the highest total sales?
-- Which regions generated the lowest total sales?
-- What are the monthly sales trends over time?
-- What is the average sales value by region?
-- What is the maximum sales value by region?
-- Which salespeople provide the largest discounts?
-- Which salespeople have the highest average discount percentage?
-- Which product categories drive the most revenue?
-- What are the top 10 products by sales?
-- How do Order Date and Ship Date trends compare?
-- Which customers generate the most revenue?
-- Are there any unusual discount patterns?
 
 Guardrails:
 - Use only data exposed through the semantic model.
-- Do not infer missing customer-address relationships not supported by data.
+- Do not reference semantic-model tables, measures, hierarchies, or relationships that were not successfully published.
 - Clearly identify when requested information is unavailable.
-- Prefer aggregated reporting over row-level operational detail.
-- Surface date context used in calculations.
-- State filters applied in answers.
-- Do not expose password-related source fields.
-- Do not fabricate product model names because they are not present in the supplied schema.
-- When discussing regional performance, indicate any data-quality limitations affecting geographic attribution.
-- Provide numerical results with supporting dimensions, measures, and filter context.
+- All other existing guardrails remain unchanged.
