@@ -29,6 +29,15 @@
   - Required per-table checkpoint validation before processing and after processing.
   - Required final Bronze success only when all 10 expected tables are validated in the current Spark session after any restart recovery.
 
+### Iteration 4 — 2026-06-04 08:41:44Z — failed layer: bronze (run: 20260604-082408-51201e)
+- **Root cause (1-line summary)**: Silver could not discover any Bronze Delta tables under `Tables/bronze`; Bronze outputs were either written outside the required physical paths or not validated as Delta tables.
+- **Cross-table audit**: Address: yes — must exist at required path; Customer: yes — must exist at required path; CustomerAddress: yes — must exist at required path; Product: yes — must exist at required path; ProductCategory: yes — must exist at required path; ProductDescription: yes — must exist at required path; ProductModel: yes — must exist at required path; ProductModelProductDescription: yes — must exist at required path; SalesOrderDetail: yes — must exist at required path; SalesOrderHeader: yes — must exist at required path.
+- **Fix approach**: GENERALIZE — discoverability is a uniform requirement across all Bronze tables.
+- **What was changed**:
+  - Tightened Bronze write requirements to prohibit writes anywhere except the 10 specified `Tables/bronze/*` paths.
+  - Added explicit Delta-log validation (`_delta_log` present and readable) for every Bronze table.
+  - Added a mandatory final inventory check that enumerates and prints all 10 discovered Bronze paths before reporting success.
+
 ## Inputs
 - Workspace: `fa4681d4-fabe-41bc-b3c8-d6daa3601f10`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -114,11 +123,18 @@ Required physical output locations:
 - `Tables/bronze/bronze_salesorderdetail`
 - `Tables/bronze/bronze_salesorderheader`
 
+Bronze discoverability requirements:
+- Write each table directly to its exact required physical path above; no alternate folders, subfolders, temporary locations, or naming variations are permitted.
+- After each write, verify the path exists, contains a readable Delta table, and contains a `_delta_log` directory.
+- Read the table back from the exact physical path and validate row count > 0 when the source table is non-empty.
+- Record the exact path and row count for each table in the completion summary.
+
 Bronze completion requirements:
 - Process all 10 source tables independently.
 - After writing each table, immediately read the Delta path back and verify row count > 0 when the source table is non-empty.
 - Record the written path for each table in the completion summary.
 - Before the Bronze notebook exits, assert that all expected Bronze table paths are discoverable under `Tables/bronze`.
+- Perform a final inventory scan and enumerate all 10 discovered paths in notebook output.
 - Fail the run with a clear error if fewer than 10 Bronze tables are discoverable.
 - Silver must be able to discover Bronze inputs exclusively from the written Delta outputs, without relying on notebook state.
 
