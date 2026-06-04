@@ -1,5 +1,26 @@
 # Run Spec 20260604-131743-8f2e67
 
+## Updated specs
+
+### Iteration 1 — 2026-06-04 13:22:16Z — failed layer: silver (run: 20260604-131843-766038)
+- **Root cause (1-line summary)**: Silver execution terminated with `System_Cancelled_Session_Statements_Failed`, indicating one Silver-table failure cancelled the Spark session and prevented completion of remaining Silver tables.
+- **Cross-table audit**:
+  - Address: yes — any unhandled Silver transformation error can cancel the shared Spark session.
+  - Customer: yes — derived-column logic increases risk of a table-specific failure stopping the run.
+  - CustomerAddress: yes — junction-table processing can fail independently and cancel the session.
+  - Product: yes — derived sellable/discontinued logic can fail independently and cancel the session.
+  - ProductCategory: yes — any schema or transformation issue can cancel the session.
+  - ProductDescription: yes — any schema or transformation issue can cancel the session.
+  - ProductModel: yes — schema-shape differences can fail independently and cancel the session.
+  - ProductModelProductDescription: yes — junction-table processing can fail independently and cancel the session.
+  - SalesOrderDetail: yes — calculated metrics can fail independently and cancel the session.
+  - SalesOrderHeader: yes — date-key derivations can fail independently and cancel the session.
+- **Fix approach**: GENERALIZE — the failure mode is session-wide and can affect every Silver table, so a single per-table-isolation requirement is safer than table-specific fixes.
+- **What was changed**:
+  - Tightened the Silver section to require independent read-transform-write execution per Silver table.
+  - Required per-table result tracking and deferred failure reporting after all Silver tables are attempted.
+  - Required Silver-table schema validation and write completion checks before advancing to the next table.
+
 ## Inputs
 - Workspace: `0258bc57-3512-47aa-a7fb-6e3930af0f5d`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -138,6 +159,11 @@ Common standards:
   - `_source_modified_date`
 - Remove obvious technical duplicates.
 - OPTIMIZE all Silver Delta tables after write.
+- REQUIRED EXECUTION PATTERN: process each Silver table independently in this order: read Bronze table → validate required columns → apply table-specific transformations → write Silver table → verify write success → record status.
+- Maintain a per-table results collection containing table name, status, row count, and error details.
+- If one Silver table fails, log the failure with `_save_error('silver', e, table=<table_name>)`, continue attempting the remaining Silver tables, and raise a consolidated failure only after all Silver tables have been attempted.
+- Do not build a single Silver job, SQL statement, or DataFrame lineage that depends on multiple source tables being transformed together.
+- After each Silver write, confirm the target Delta path `Tables/silver/<table_name>` exists and is readable before starting the next table.
 
 Silver table intent and dedup keys:
 - address
