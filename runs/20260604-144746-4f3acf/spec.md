@@ -1,5 +1,26 @@
 # Run Spec 20260604-144707-e82bff
 
+## Updated specs
+
+### Iteration 1 — 2026-06-04 14:48:39Z — failed layer: bronze (run: 20260604-144746-4f3acf)
+- **Root cause (1-line summary)**: Bronze ingestion failed with a generic Spark session cancellation, indicating the build needs stricter source-table validation and fallback handling before MERGE operations.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — MERGE depends on AddressID being present and unique enough for key-based processing.
+  - SalesLT/Customer: yes — MERGE depends on CustomerID and may contain columns referenced by incremental logic.
+  - SalesLT/CustomerAddress: yes — composite-key MERGE depends on CustomerID and AddressID existing.
+  - SalesLT/Product: yes — MERGE depends on ProductID and incremental logic may reference ModifiedDate.
+  - SalesLT/ProductCategory: yes — key-based ingestion depends on ProductCategoryID.
+  - SalesLT/ProductDescription: yes — key-based ingestion depends on ProductDescriptionID.
+  - SalesLT/ProductModel: yes — key-based ingestion depends on ProductModelID.
+  - SalesLT/ProductModelProductDescription: yes — composite-key ingestion depends on ProductModelID, ProductDescriptionID, and Culture.
+  - SalesLT/SalesOrderDetail: yes — key-based ingestion and partitioning depend on expected columns.
+  - SalesLT/SalesOrderHeader: yes — key-based ingestion and date partitioning depend on expected columns.
+- **Fix approach**: GENERALIZE — the failure signal is not tied to a specific table or column, and the same validation issue could affect any source table during Bronze ingestion.
+- **What was changed**:
+  - Tightened Bronze ingestion requirements with mandatory schema validation before MERGE.
+  - Added explicit fallback behavior when ModifiedDate is absent.
+  - Added rules to avoid MERGE execution when required key columns are missing.
+
 ## Inputs
 - Workspace: `a9df7114-70df-4a8c-a234-468ba3543444`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -29,6 +50,8 @@ Apply these reference skills/agents at all times:
 
 All generated notebooks must be designed to run incrementally on a daily schedule unless the spec explicitly states otherwise. Use idempotent write patterns (mode='overwrite' with overwriteSchema=true, or merge/upsert where appropriate) so that re-running the same notebook the next day produces correct, up-to-date results without duplicates or failures.
 
+Before processing any source table, validate that the source table exists and that all configured key columns for that table are present. Fail that table with a clear validation message rather than executing a MERGE with unresolved schema assumptions.
+
 ## Bronze
 
 Land each source table into the `bronze` schema with minimal transformation.
@@ -42,7 +65,10 @@ Common approach:
   - `bronze_load_date`
 - Use Delta format.
 - Incremental ingestion using `ModifiedDate` where available.
-- MERGE/upsert on identified business keys.
+- If a source table does not contain a `ModifiedDate` column, ingest the full table and do not reference `ModifiedDate` in filters, watermarks, or MERGE predicates.
+- Before any MERGE, validate that all configured key columns exist in the source dataframe.
+- Only use the table-specific key columns listed below as MERGE predicates.
+- If a required key column is missing, stop processing that table with an explicit validation error and continue processing other tables where possible.
 - Partition large transactional tables by load date; leave small master tables unpartitioned.
 
 Table-specific landing:
