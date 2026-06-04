@@ -59,6 +59,25 @@
   - Added restart-safe validation to reuse already validated Bronze outputs.
   - Required final manifest verification before Bronze success is declared.
 
+### Iteration 4 — 2026-06-04 09:28:26Z — failed layer: bronze (run: 20260604-091429-24d6ec)
+- **Root cause (1-line summary)**: Silver could not discover any Bronze tables because Bronze outputs were not exposed as Lakehouse Tables under the expected `Tables/bronze/<table_name>` hierarchy.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — requires discoverable Lakehouse table path.
+  - SalesLT/Customer: yes — requires discoverable Lakehouse table path.
+  - SalesLT/CustomerAddress: yes — requires discoverable Lakehouse table path.
+  - SalesLT/Product: yes — requires discoverable Lakehouse table path.
+  - SalesLT/ProductCategory: yes — requires discoverable Lakehouse table path.
+  - SalesLT/ProductDescription: yes — requires discoverable Lakehouse table path.
+  - SalesLT/ProductModel: yes — requires discoverable Lakehouse table path.
+  - SalesLT/ProductModelProductDescription: yes — requires discoverable Lakehouse table path.
+  - SalesLT/SalesOrderDetail: yes — requires discoverable Lakehouse table path.
+  - SalesLT/SalesOrderHeader: yes — requires discoverable Lakehouse table path.
+- **Fix approach**: GENERALIZE — the discoverability failure affects every Bronze table identically.
+- **What was changed**:
+  - Required writes to resolve against the target Lakehouse physical Tables area, not relative or notebook-local paths.
+  - Added mandatory post-write enumeration of `Tables/bronze/` and validation that all ten expected table directories are present before Bronze succeeds.
+  - Added a hard failure if the final discovered table count under `Tables/bronze/` is not exactly ten.
+
 ## Inputs
 - Workspace: `44cf7adf-0561-49b1-bf73-44f3c5b38c21`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -118,7 +137,8 @@ Write pattern:
 - Partition by ingestion date derived from `_ingested_at`
 
 Mandatory discoverability requirements:
-- Write each table to a physical Delta path under `Tables/bronze/<table_name>` using the exact table names listed below.
+- Write each table to the target LakeSales Lakehouse physical Tables area using the exact path `Tables/bronze/<table_name>`.
+- Resolve paths against the attached target Lakehouse; do not use relative filesystem locations, local disk, temporary storage, or alternate lakehouses.
 - Do not write Bronze outputs to `Files/`, temporary folders, notebook-local storage, alternative casing, or any path other than the exact locations listed below.
 - Immediately after each write, verify:
   - the target directory exists;
@@ -130,8 +150,20 @@ Mandatory discoverability requirements:
 - After a table passes validation, persist a completion record in a Bronze manifest/checkpoint artifact containing table name, path, row count, validation status, and run_id.
 - On restart or rerun, if a table already exists at the expected path and passes all validation checks, treat it as completed and do not require re-ingestion before continuing with remaining tables.
 - At notebook completion, enumerate the contents of `Tables/bronze/` and compare against the expected table list.
+- The discovered directories under `Tables/bronze/` must be exactly:
+  - address
+  - customer
+  - customeraddress
+  - product
+  - productcategory
+  - productdescription
+  - productmodel
+  - productmodelproductdescription
+  - salesorderdetail
+  - salesorderheader
 - Assert that all expected Bronze table directories exist and are readable from their exact paths.
 - Rebuild the final success list from physical Delta validation rather than in-memory state so a notebook restart cannot lose progress.
+- Before declaring Bronze successful, assert that the discovered table count under `Tables/bronze/` equals 10.
 - If any expected Bronze table is missing, unreadable, lacks a `_delta_log`, or is written to a different path, fail Bronze with a clear error naming the table and expected path.
 - Do not rely solely on metadata registration; physical Delta files under `Tables/bronze/<table_name>` must exist.
 
