@@ -1,5 +1,26 @@
 # Run Spec 20260604-141036-017051
 
+## Updated specs
+
+### Iteration 1 — 2026-06-04 14:17:20Z — failed layer: silver (run: 20260604-141241-d794fd)
+- **Root cause (1-line summary)**: Silver-layer Spark execution failed without a column-level traceback; likely caused by schema-assumption or join-shape issues during enrichment view creation.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — participates in customer-address enrichment joins and may contribute duplicate column names after snake_case conversion.
+  - SalesLT/Customer: yes — participates in customer-address enrichment joins and may contribute duplicate column names after snake_case conversion.
+  - SalesLT/CustomerAddress: yes — junction table used in enrichment joins and commonly introduces overlapping key columns.
+  - SalesLT/Product: yes — participates in product enrichment joins and may contribute overlapping keys.
+  - SalesLT/ProductCategory: yes — may be joined into product enrichment and introduce duplicate attribute names.
+  - SalesLT/ProductDescription: yes — participates in product enrichment joins and may introduce overlapping description columns.
+  - SalesLT/ProductModel: yes — participates in product enrichment joins and may introduce overlapping model attributes.
+  - SalesLT/ProductModelProductDescription: yes — junction table used in enrichment joins and commonly introduces overlapping keys.
+  - SalesLT/SalesOrderDetail: no — not part of the specified enrichment views in Silver.
+  - SalesLT/SalesOrderHeader: no — not part of the specified enrichment views in Silver.
+- **Fix approach**: GENERALIZE — the risk is systemic across multiple Silver enrichment joins, so a single defensive join-and-projection rule should be applied to all Silver enrichment datasets.
+- **What was changed**:
+  - Added explicit Silver join rules requiring table aliases and fully qualified join keys.
+  - Added a post-join projection requirement to eliminate duplicate column names before writing Silver outputs.
+  - Added validation that all declared business keys exist after snake_case conversion before deduplication logic runs.
+
 ## Inputs
 - Workspace: `ad938c56-0933-47f8-9f87-c862248e89e7`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -28,6 +49,13 @@ Apply these reference skills/agents at all times:
 - powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
 
 All generated notebooks must be designed to run incrementally on a daily schedule unless the spec explicitly states otherwise. Use idempotent write patterns (mode='overwrite' with overwriteSchema=true, or merge/upsert where appropriate) so that re-running the same notebook the next day produces correct, up-to-date results without duplicates or failures.
+
+For all Silver and downstream joins:
+- Use explicit DataFrame aliases.
+- Use fully qualified join references (for example, `c.customer_id = ca.customer_id`).
+- Never write a joined DataFrame containing duplicate column names.
+- Immediately after every join, project a curated column list with unique output column names.
+- After snake_case conversion and before deduplication, validate that each table's declared business key columns are present; fail fast with a descriptive error if a required key is missing.
 
 ## Bronze
 
@@ -130,10 +158,21 @@ Silver business enrichment:
   - product_model
   - product_model_product_description
   - product_description
+- Required join keys:
+  - product.product_model_id = product_model.product_model_id
+  - product_model.product_model_id = product_model_product_description.product_model_id
+  - product_model_product_description.product_description_id = product_description.product_description_id
+- Use aliases for all joined tables and project a unique output schema with no duplicate column names.
+
 - Build customer address enrichment view by joining:
   - customer
   - customer_address
   - address
+- Required join keys:
+  - customer.customer_id = customer_address.customer_id
+  - customer_address.address_id = address.address_id
+- Use aliases for all joined tables and project a unique output schema with no duplicate column names.
+
 - Derive order lifecycle attributes:
   - order_year
   - order_month
