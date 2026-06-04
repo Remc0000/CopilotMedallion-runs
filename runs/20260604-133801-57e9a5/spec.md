@@ -1,5 +1,26 @@
 # Run Spec 20260604-133728-ace6dc
 
+## Updated specs
+
+### Iteration 1 — 2026-06-04 13:47:13Z — failed layer: reporting (run: 20260604-133801-57e9a5)
+- **Root cause (1-line summary)**: Reporting-stage Spark session failed without a column-level traceback; the most likely reporting risk is unresolved semantic-model field references caused by display names not matching Gold table column names.
+- **Cross-table audit**:
+  - Address: no — source table is not directly referenced by report measures.
+  - Customer: yes — customer-related report visuals depend on semantic-model field mappings.
+  - CustomerAddress: no — intentionally bypassed in Gold and reporting.
+  - Product: yes — product visuals require consistent semantic-model field mappings.
+  - ProductCategory: yes — category hierarchy feeds product reporting.
+  - ProductDescription: yes — product description attributes may surface in reporting.
+  - ProductModel: yes — product dimension construction depends on this source.
+  - ProductModelProductDescription: yes — product dimension construction depends on this source.
+  - SalesOrderDetail: yes — all sales measures originate from fact-level fields.
+  - SalesOrderHeader: yes — order, date, customer, and freight-related reporting fields originate here.
+- **Fix approach**: GENERALIZE — the failure occurred in the reporting layer and could affect any report visual or measure that references friendly names instead of actual semantic-model fields.
+- **What was changed**:
+  - Tightened the Semantic model section with explicit table and field naming requirements.
+  - Added explicit measure-to-column mappings and required fact-column names.
+  - Added report-authoring constraints requiring visuals to bind only to validated semantic-model fields.
+
 ## Inputs
 - Workspace: `8f7be003-abaa-46b6-8b1c-0dba2cfc3bc6`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -334,13 +355,13 @@ Mode:
 - Direct Lake
 
 Tables:
-- Fact Sales Order
-- Customer
-- SalesPerson
-- Product
-- Order
-- OrderDate
-- ShipDate
+- Fact Sales Order (source table: `fact_sales_order`)
+- Customer (source table: `dim_customer`)
+- SalesPerson (source table: `dim_salesperson`)
+- Product (source table: `dim_product`)
+- Order (source table: `dim_order`)
+- OrderDate (source table: `dim_order_date`)
+- ShipDate (source table: `dim_ship_date`)
 
 Relationships:
 - Fact Sales Order → Customer
@@ -349,6 +370,21 @@ Relationships:
 - Fact Sales Order → Order
 - Fact Sales Order → OrderDate
 - Fact Sales Order → ShipDate
+
+Field binding requirements:
+- Semantic-model measures and report visuals must reference actual Gold columns, not display captions.
+- Required fact columns:
+  - `sales_order_id`
+  - `order_quantity`
+  - `gross_sales_amount`
+  - `discount_amount`
+  - `net_sales_amount`
+  - `discount_percentage`
+  - `freight_allocation`
+  - `product_key`
+  - `customer_key`
+  - `salesperson_key`
+- If a display name is created, retain the underlying column reference and validate existence before publishing.
 
 Hierarchies:
 
@@ -367,48 +403,53 @@ Customer:
 Measures:
 
 - Total Sales =
-  Sum(Net Sales)
+  Sum(`net_sales_amount`)
 
 - Gross Sales =
-  Sum(Gross Sales)
+  Sum(`gross_sales_amount`)
 
 - Total Discount Amount =
-  Sum(Discount Amount)
+  Sum(`discount_amount`)
 
 - Average Sales =
-  Average(Net Sales)
+  Average(`net_sales_amount`)
 
 - Maximum Sales =
-  Max(Net Sales)
+  Max(`net_sales_amount`)
 
 - Total Orders =
-  DistinctCount(SalesOrderID)
+  DistinctCount(`sales_order_id`)
 
 - Total Quantity Sold =
-  Sum(Order Quantity)
+  Sum(`order_quantity`)
 
 - Average Discount Percentage =
-  Average(Discount Percentage)
+  Average(`discount_percentage`)
 
 - Maximum Discount Percentage =
-  Max(Discount Percentage)
+  Max(`discount_percentage`)
 
 - Average Order Value =
-  Divide(Total Sales, Total Orders)
+  Divide([Total Sales], [Total Orders])
 
 - Average Freight =
-  Average(Freight Allocation)
+  Average(`freight_allocation`)
 
 - Maximum Order Value =
-  Max(Net Sales)
+  Max(`net_sales_amount`)
 
 - Distinct Customers =
-  DistinctCount(Customer Key)
+  DistinctCount(`customer_key`)
 
 - Distinct Products Sold =
-  DistinctCount(Product Key)
+  DistinctCount(`product_key`)
 
 ## Report
+
+Before creating visuals:
+- Validate that every referenced table, hierarchy, measure, and field exists in the published semantic model.
+- Do not bind visuals to inferred field names, friendly captions, or untranslated business labels unless the corresponding semantic-model object exists.
+- If a requested field is unavailable, omit the visual dependency and record the limitation rather than failing report generation.
 
 ### Page 1: Executive Sales Overview
 
