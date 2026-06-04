@@ -116,6 +116,25 @@
   - Required startup logic to enumerate all expected Bronze paths and rebuild progress solely from persisted artifacts and Delta validation.
   - Required committing and validating one table at a time before moving to the next table.
 
+### Iteration 6 — 2026-06-04 09:36:44Z — failed layer: bronze (run: 20260604-091429-24d6ec)
+- **Root cause (1-line summary)**: Silver detected zero discoverable Bronze tables because Bronze outputs were not visible under the exact `Tables/bronze/` hierarchy at runtime.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/Customer: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/CustomerAddress: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/Product: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/ProductCategory: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/ProductDescription: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/ProductModel: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/ProductModelProductDescription: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/SalesOrderDetail: yes — must be discoverable through directory enumeration and Delta read.
+  - SalesLT/SalesOrderHeader: yes — must be discoverable through directory enumeration and Delta read.
+- **Fix approach**: GENERALIZE — the failure affects all Bronze tables uniformly because downstream discovery scans the same `Tables/bronze/` hierarchy.
+- **What was changed**:
+  - Added a mandatory Bronze completion gate requiring successful enumeration and Delta reads of all ten expected paths before Bronze can finish.
+  - Required the notebook to fail immediately if `Tables/bronze/` contains fewer than ten expected directories.
+  - Required the completion summary JSON to include a discovered-table count and per-table discoverability status.
+
 ## Inputs
 - Workspace: `44cf7adf-0561-49b1-bf73-44f3c5b38c21`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -207,6 +226,9 @@ Mandatory discoverability requirements:
 - Assert that all expected Bronze table directories exist and are readable from their exact paths.
 - Rebuild the final success list from physical Delta validation rather than in-memory state so a notebook restart cannot lose progress.
 - Before declaring Bronze successful, assert that the discovered table count under `Tables/bronze/` equals 10.
+- Before declaring Bronze successful, perform a Delta read of every expected path and persist the results in the completion summary.
+- Fail Bronze immediately if the discovered table count is less than 10, even if manifest records indicate success.
+- The completion summary JSON must include: expected_table_count, discovered_table_count, and per-table discoverable=true/false status.
 - If any expected Bronze table is missing, unreadable, lacks a `_delta_log`, or is written to a different path, fail Bronze with a clear error naming the table and expected path.
 - Do not rely solely on metadata registration; physical Delta files under `Tables/bronze/<table_name>` must exist.
 
@@ -222,7 +244,7 @@ Bronze tables:
 - bronze.salesorderdetail → `Tables/bronze/salesorderdetail`
 - bronze.salesorderheader → `Tables/bronze/salesorderheader`
 
-Capture source row counts and write summary JSON at notebook completion. The summary must include the exact Bronze path, validation status, and row count for every expected table.
+Capture source row counts and write summary JSON at notebook completion. The summary must include the exact Bronze path, validation status, row count for every expected table, discovered-table count, and discoverability status.
 
 ## Silver
 
