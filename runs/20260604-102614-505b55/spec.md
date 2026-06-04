@@ -11,6 +11,15 @@
   - Added explicit mapping between source tables and required Bronze folder names.
   - Required Bronze to fail if fewer than 10 Bronze Delta outputs are written and discoverable.
 
+### Iteration 2 — 2026-06-04 10:39:44Z — failed layer: bronze (run: 20260604-102614-505b55)
+- **Root cause (1-line summary)**: Silver could not discover any Bronze tables because Bronze outputs were not materialized as readable Delta tables under the required Lakehouse `Tables/bronze/*` locations.
+- **Cross-table audit**: Address: yes — discoverability depends on physical Delta creation; Customer: yes — same; CustomerAddress: yes — same; Product: yes — same; ProductCategory: yes — same; ProductDescription: yes — same; ProductModel: yes — same; ProductModelProductDescription: yes — same; SalesOrderDetail: yes — same; SalesOrderHeader: yes — same.
+- **Fix approach**: GENERALIZE — the issue is location/materialization related and applies uniformly to every Bronze source table.
+- **What was changed**:
+  - Added mandatory post-write validation using Delta reads from every required Bronze path.
+  - Required Bronze completion to verify exactly 10 readable Delta outputs before reporting success.
+  - Prohibited notebook success when any source table is skipped, empty due to read failure, or missing from the final validation manifest.
+
 ## Inputs
 - Workspace: `d547615a-511c-436c-b6e0-c95f688a7ead`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -85,11 +94,14 @@ Bronze standards:
 - Persist all tables as Delta format.
 - Capture row counts in notebook summary output.
 - After each write, validate the target path exists and contains a readable Delta table.
+- Immediately after writing each table, perform `spark.read.format("delta").load(<target_path>)` and verify the read succeeds and returns the expected row count.
 - Maintain a results collection containing table name, row count, and output path for every successful write.
 - Print a final JSON summary listing all successfully written Bronze tables.
+- Build a final validation manifest containing all 10 required Bronze table names and paths.
 - Raise an error if fewer than 10 Bronze tables are successfully written and discoverable.
 - Raise an error if any required Bronze output path listed above is missing at notebook completion.
-- Bronze success is defined as: all 10 source tables written as readable Delta outputs under their required `Tables/bronze/<name>` locations.
+- Raise an error if the final validation manifest does not contain exactly these 10 table names: address, customer, customeraddress, product, productcategory, productdescription, productmodel, productmodelproductdescription, salesorderdetail, salesorderheader.
+- Bronze success is defined as: all 10 source tables written as readable Delta outputs under their required `Tables/bronze/<name>` locations and successfully re-read from those locations during notebook validation.
 
 ## Silver
 
