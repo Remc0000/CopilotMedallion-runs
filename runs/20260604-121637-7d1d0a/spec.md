@@ -59,6 +59,25 @@
   - Made `product.discontinued_date` optional and defined fallback behavior when absent.
   - Required Silver error handling to call `_save_error` using only supported positional arguments and never assume a `table=` keyword parameter exists.
 
+### Iteration 4 — 2026-06-04 12:41:50Z — failed layer: reporting (run: 20260604-121637-7d1d0a)
+- **Root cause (1-line summary)**: Reporting layer failed with a session-wide cancellation, indicating semantic-model or report generation steps were executed without validating required Gold outputs and dependencies first.
+- **Cross-table audit**:
+  - Address: no — not consumed directly by reporting; only through Gold outputs.
+  - Customer: no — not consumed directly by reporting; only through Gold outputs.
+  - CustomerAddress: no — not consumed directly by reporting; only through Gold outputs.
+  - Product: no — not consumed directly by reporting; only through Gold outputs.
+  - ProductCategory: no — not consumed directly by reporting; only through Gold outputs.
+  - ProductDescription: no — not consumed directly by reporting; only through Gold outputs.
+  - ProductModel: no — not consumed directly by reporting; only through Gold outputs.
+  - ProductModelProductDescription: no — not consumed directly by reporting; only through Gold outputs.
+  - SalesOrderDetail: no — not consumed directly by reporting; only through Gold outputs.
+  - SalesOrderHeader: no — not consumed directly by reporting; only through Gold outputs.
+- **Fix approach**: GENERALIZE — the failure is reporting-layer orchestration and dependency validation related, so the same defensive execution pattern should apply to every semantic-model table, relationship, and report artifact.
+- **What was changed**:
+  - Tightened Semantic model requirements to validate existence and row counts of all Gold tables before model creation.
+  - Required relationship creation only when both participating tables and key columns exist.
+  - Tightened Report generation to validate model objects page-by-page and continue artifact validation independently.
+
 ## Inputs
 - Workspace: `120db309-94d0-4c4a-9183-504d81b9a3bf`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -252,6 +271,19 @@ Required tests:
 Mode:
 - Direct Lake
 
+Pre-creation validation:
+- Validate that all required Gold tables exist before creating the semantic model:
+  - dim_order_date
+  - dim_ship_date
+  - dim_customer
+  - dim_salesperson
+  - dim_order
+  - dim_product
+  - fact_sales_order
+- For each table above, validate the table is readable and row count retrieval succeeds.
+- Create model tables independently; failure on one table must be logged with the table name before aborting model publication.
+- Before creating any relationship, validate both tables exist and the referenced relationship columns exist.
+
 Model tables:
 - dim_order_date
 - dim_ship_date
@@ -270,6 +302,14 @@ Relationships:
 - fact_sales_order → dim_product
 
 ## Report
+
+Reporting execution rules:
+- Validate semantic model publication succeeded before report creation.
+- Validate every referenced model table exists before adding visuals.
+- Build and validate report pages independently.
+- After each page is created, validate visual bindings before proceeding to the next page.
+- Record page-level status, validation result, and error message.
+- Do not create visuals against columns that are not present in the semantic model.
 
 Page 1 — Sales Executive Overview
 - KPI cards:
@@ -296,6 +336,7 @@ Domain Instructions:
 - Answer questions using only the semantic model.
 - Use City as the available geographic proxy for regional analysis.
 - Distinguish gross sales, discount amount, and net sales.
+- Validate semantic-model availability before agent publication.
 
 Guardrails:
 - Do not invent regions, countries, or territories not present in the model.
