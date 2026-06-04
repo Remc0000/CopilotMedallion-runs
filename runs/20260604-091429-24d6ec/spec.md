@@ -40,6 +40,25 @@
   - Added mandatory Delta-log validation and directory enumeration after each write.
   - Added a final Bronze manifest check requiring all expected table directories to exist before the layer can succeed.
 
+### Iteration 3 — 2026-06-04 09:25:11Z — failed layer: bronze (run: 20260604-091429-24d6ec)
+- **Root cause (1-line summary)**: Build interruption due to server restart during Bronze execution; partial writes must be handled safely and resumably.
+- **Cross-table audit**:
+  - SalesLT/Address: yes — interruption can occur during write or validation.
+  - SalesLT/Customer: yes — interruption can occur during write or validation.
+  - SalesLT/CustomerAddress: yes — interruption can occur during write or validation.
+  - SalesLT/Product: yes — interruption can occur during write or validation.
+  - SalesLT/ProductCategory: yes — interruption can occur during write or validation.
+  - SalesLT/ProductDescription: yes — interruption can occur during write or validation.
+  - SalesLT/ProductModel: yes — interruption can occur during write or validation.
+  - SalesLT/ProductModelProductDescription: yes — interruption can occur during write or validation.
+  - SalesLT/SalesOrderDetail: yes — interruption can occur during write or validation.
+  - SalesLT/SalesOrderHeader: yes — interruption can occur during write or validation.
+- **Fix approach**: GENERALIZE — restart resilience is required uniformly for every Bronze table.
+- **What was changed**:
+  - Added per-table checkpoint and completion-manifest requirements.
+  - Added restart-safe validation to reuse already validated Bronze outputs.
+  - Required final manifest verification before Bronze success is declared.
+
 ## Inputs
 - Workspace: `44cf7adf-0561-49b1-bf73-44f3c5b38c21`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -108,8 +127,11 @@ Mandatory discoverability requirements:
   - the returned schema is non-empty;
   - the row count is greater than or equal to zero.
 - Maintain a success list containing only tables that pass all validations above.
+- After a table passes validation, persist a completion record in a Bronze manifest/checkpoint artifact containing table name, path, row count, validation status, and run_id.
+- On restart or rerun, if a table already exists at the expected path and passes all validation checks, treat it as completed and do not require re-ingestion before continuing with remaining tables.
 - At notebook completion, enumerate the contents of `Tables/bronze/` and compare against the expected table list.
 - Assert that all expected Bronze table directories exist and are readable from their exact paths.
+- Rebuild the final success list from physical Delta validation rather than in-memory state so a notebook restart cannot lose progress.
 - If any expected Bronze table is missing, unreadable, lacks a `_delta_log`, or is written to a different path, fail Bronze with a clear error naming the table and expected path.
 - Do not rely solely on metadata registration; physical Delta files under `Tables/bronze/<table_name>` must exist.
 
