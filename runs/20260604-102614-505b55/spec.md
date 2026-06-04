@@ -20,6 +20,15 @@
   - Required Bronze completion to verify exactly 10 readable Delta outputs before reporting success.
   - Prohibited notebook success when any source table is skipped, empty due to read failure, or missing from the final validation manifest.
 
+### Iteration 3 — 2026-06-04 10:41:45Z — failed layer: bronze (run: 20260604-102614-505b55)
+- **Root cause (1-line summary)**: Build was interrupted by a server restart during Bronze execution, creating risk of partial writes and non-resumable state.
+- **Cross-table audit**: Address: yes — interruption can occur mid-write; Customer: yes — same; CustomerAddress: yes — same; Product: yes — same; ProductCategory: yes — same; ProductDescription: yes — same; ProductModel: yes — same; ProductModelProductDescription: yes — same; SalesOrderDetail: yes — same; SalesOrderHeader: yes — same.
+- **Fix approach**: GENERALIZE — restart/interruption handling must be applied consistently to every Bronze table.
+- **What was changed**:
+  - Added resumable Bronze processing rules that validate existing Delta outputs before reprocessing.
+  - Required per-table write/validation completion tracking so already-valid tables are not treated as failed after a restart.
+  - Added final reconciliation that confirms all 10 required Bronze outputs are readable regardless of whether they were written in the current session or a resumed session.
+
 ## Inputs
 - Workspace: `d547615a-511c-436c-b6e0-c95f688a7ead`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -98,6 +107,9 @@ Bronze standards:
 - Maintain a results collection containing table name, row count, and output path for every successful write.
 - Print a final JSON summary listing all successfully written Bronze tables.
 - Build a final validation manifest containing all 10 required Bronze table names and paths.
+- Before processing a source table, check whether the required target path already contains a readable Delta table; if it does, capture its row count and treat it as a valid completed table for resume/rebuild scenarios.
+- Processing must be table-by-table with validation immediately after each table so a server restart cannot invalidate previously completed tables.
+- On rebuild after interruption, revalidate existing Bronze outputs and only rewrite tables that are missing or unreadable.
 - Raise an error if fewer than 10 Bronze tables are successfully written and discoverable.
 - Raise an error if any required Bronze output path listed above is missing at notebook completion.
 - Raise an error if the final validation manifest does not contain exactly these 10 table names: address, customer, customeraddress, product, productcategory, productdescription, productmodel, productmodelproductdescription, salesorderdetail, salesorderheader.
