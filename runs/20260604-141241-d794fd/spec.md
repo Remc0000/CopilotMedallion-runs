@@ -40,6 +40,25 @@
   - Restricted relationship and measure creation to verified existing columns only.
   - Added report-build rules requiring visuals to use validated semantic-model fields and to skip unsupported visuals gracefully.
 
+### Iteration 3 — 2026-06-04 14:24:21Z — failed layer: reporting (run: 20260604-141241-d794fd)
+- **Root cause (1-line summary)**: Reporting build likely failed because required semantic-model artifacts were treated as mandatory even when one or more Gold tables, relationship columns, hierarchy columns, or visual fields were unavailable.
+- **Cross-table audit**:
+  - SalesLT/Address: no — reporting consumes only derived Gold dimensions and should tolerate missing geography attributes.
+  - SalesLT/Customer: no — reporting consumes only derived Gold dimensions and should tolerate missing customer attributes.
+  - SalesLT/CustomerAddress: no — reporting consumes only derived Gold dimensions and should tolerate absent address rollups.
+  - SalesLT/Product: no — reporting consumes only derived Gold dimensions and should tolerate missing product attributes.
+  - SalesLT/ProductCategory: no — reporting consumes only derived Gold dimensions and should tolerate missing category hierarchy fields.
+  - SalesLT/ProductDescription: no — reporting consumes only derived Gold dimensions and should tolerate missing descriptive attributes.
+  - SalesLT/ProductModel: no — reporting consumes only derived Gold dimensions and should tolerate missing model attributes.
+  - SalesLT/ProductModelProductDescription: no — reporting consumes only derived Gold dimensions and should tolerate missing enrichment outputs.
+  - SalesLT/SalesOrderDetail: no — reporting consumes Gold facts and should tolerate absent derived measures.
+  - SalesLT/SalesOrderHeader: no — reporting consumes Gold facts and should tolerate absent order-level attributes.
+- **Fix approach**: GENERALIZE — the dependency-validation requirement applies uniformly across semantic-model creation, report generation, and data-agent publication.
+- **What was changed**:
+  - Tightened semantic-model creation to use a minimum viable model when optional tables or columns are unavailable.
+  - Added explicit hierarchy, measure, and relationship fallback behavior that skips unsupported artifacts rather than failing.
+  - Added report and data-agent publication rules requiring successful deployment from whatever validated semantic-model content exists.
+
 ## Inputs
 - Workspace: `ad938c56-0933-47f8-9f87-c862248e89e7`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -363,6 +382,9 @@ Pre-build validation:
   - dim_date
 - Confirm every relationship column referenced below exists in both source and target tables before creating the relationship.
 - Create only validated relationships; do not reference inferred or renamed columns.
+- If one or more listed tables are unavailable, build the semantic model from the subset of validated tables rather than failing the reporting stage.
+- Treat dim_product_category, dim_address, fact_sales_order_header, hierarchies, and nonessential attributes as optional artifacts.
+- Create a minimum viable semantic model whenever at least one fact table and one related dimension are available.
 
 Tables:
 - fact_sales_order_line
@@ -374,6 +396,7 @@ Tables:
 - dim_date
 
 Relationships:
+- Create each relationship only when both tables and both columns exist.
 - fact_sales_order_line.customer_id → dim_customer.customer_id
 - fact_sales_order_line.product_id → dim_product.product_id
 - dim_product.product_category_id → dim_product_category.product_category_id
@@ -395,6 +418,7 @@ Explicit measures:
 - Average Unit Price = AVERAGE(unit_price)
 
 Hierarchies:
+- Create hierarchies only when every referenced level exists.
 - Date: Year → Quarter → Month → Day
 - Product Category: Parent Category → Category (where hierarchy data is available)
 - Geography: City → Postal Code
@@ -406,6 +430,8 @@ Report generation rules:
 - Validate every visual field binding before creation.
 - If a required field for a visual is unavailable, skip that visual and continue building the remainder of the report.
 - Do not reference columns directly from lakehouse tables; use semantic-model fields only.
+- Successfully publish the report even if one or more pages contain fewer visuals than specified due to unavailable fields.
+- Do not fail report creation because a hierarchy, measure, relationship, map field, decomposition tree field, or slicer field is unavailable.
 
 Page 1: Sales Overview
 - KPI cards:
@@ -458,6 +484,11 @@ Page 5: Data Quality
 
 Role:
 - Sales Analytics Copilot for order, customer, product, pricing, and fulfillment analysis based on the Direct Lake semantic model.
+
+Publication rules:
+- Publish the data agent against the successfully created semantic model, even if the model contains only a validated subset of the planned tables, relationships, measures, or hierarchies.
+- Expose only verified semantic-model fields.
+- Do not fail agent creation because optional report artifacts, hierarchies, measures, or dimensions were skipped.
 
 Domain hints:
 - Analyze sales orders and order lines.
