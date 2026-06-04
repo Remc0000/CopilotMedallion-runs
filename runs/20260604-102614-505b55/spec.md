@@ -29,6 +29,15 @@
   - Required per-table write/validation completion tracking so already-valid tables are not treated as failed after a restart.
   - Added final reconciliation that confirms all 10 required Bronze outputs are readable regardless of whether they were written in the current session or a resumed session.
 
+### Iteration 4 — 2026-06-04 10:48:44Z — failed layer: bronze (run: 20260604-102614-505b55)
+- **Root cause (1-line summary)**: Silver detected zero discoverable Bronze tables; Bronze outputs were either not written beneath the Lakehouse `Tables/bronze/` hierarchy or were not validated as discoverable before completion.
+- **Cross-table audit**: Address: yes — must be discoverable under `Tables/bronze/address`; Customer: yes — same pattern; CustomerAddress: yes — same pattern; Product: yes — same pattern; ProductCategory: yes — same pattern; ProductDescription: yes — same pattern; ProductModel: yes — same pattern; ProductModelProductDescription: yes — same pattern; SalesOrderDetail: yes — same pattern; SalesOrderHeader: yes — same pattern.
+- **Fix approach**: GENERALIZE — discoverability and path resolution requirements are identical for all 10 Bronze tables.
+- **What was changed**:
+  - Tightened Bronze path requirements to require writes to Lakehouse-managed `Tables/bronze/<table_name>` locations only.
+  - Added mandatory end-of-notebook discovery validation that enumerates all 10 expected Bronze paths and successfully loads each as Delta.
+  - Explicitly prohibit reporting Bronze success if the validation step cannot discover every required table from the target Lakehouse.
+
 ## Inputs
 - Workspace: `d547615a-511c-436c-b6e0-c95f688a7ead`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -68,6 +77,7 @@ Cross-cutting code rules:
 - Process source tables independently and persist outputs per table.
 - Emit discoverable Delta outputs under Tables/bronze, Tables/silver, Tables/gold, and Tables/test.
 - Every notebook cell must start with a short comment block describing intent.
+- Treat a layer as successful only after outputs can be rediscovered via direct Delta reads from the target Lakehouse paths.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 - Retain all existing rules A–K from the current specification without modification.
@@ -102,6 +112,7 @@ Bronze standards:
 - Small master tables remain unpartitioned.
 - Persist all tables as Delta format.
 - Capture row counts in notebook summary output.
+- Write only to the target Lakehouse managed `Tables/bronze/<required_name>` paths listed above; do not write Bronze outputs to Files, temporary folders, alternate lakehouses, or dynamically generated locations.
 - After each write, validate the target path exists and contains a readable Delta table.
 - Immediately after writing each table, perform `spark.read.format("delta").load(<target_path>)` and verify the read succeeds and returns the expected row count.
 - Maintain a results collection containing table name, row count, and output path for every successful write.
@@ -110,6 +121,7 @@ Bronze standards:
 - Before processing a source table, check whether the required target path already contains a readable Delta table; if it does, capture its row count and treat it as a valid completed table for resume/rebuild scenarios.
 - Processing must be table-by-table with validation immediately after each table so a server restart cannot invalidate previously completed tables.
 - On rebuild after interruption, revalidate existing Bronze outputs and only rewrite tables that are missing or unreadable.
+- As the final notebook step, enumerate and validate all 10 required Bronze paths and successfully execute a Delta load against each one.
 - Raise an error if fewer than 10 Bronze tables are successfully written and discoverable.
 - Raise an error if any required Bronze output path listed above is missing at notebook completion.
 - Raise an error if the final validation manifest does not contain exactly these 10 table names: address, customer, customeraddress, product, productcategory, productdescription, productmodel, productmodelproductdescription, salesorderdetail, salesorderheader.
