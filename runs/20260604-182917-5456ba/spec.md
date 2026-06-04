@@ -21,6 +21,25 @@
   - Added explicit fallback behavior when `ModifiedDate` or other expected partition columns are absent.
   - Required ingestion to preserve available source columns without failing on missing optional columns.
 
+### Iteration 2 — 2026-06-04 18:31:25Z — failed layer: bronze (run: 20260604-182917-5456ba)
+- **Root cause (1-line summary)**: Spark session was cancelled after statement failures; a likely Bronze-wide cause is attempting MERGE, partitioning, or key-based logic against columns that are missing, differently cased, or not unique in the discovered source schema.
+- **Cross-table audit**:
+  - Address: yes — key/partition validation required before MERGE.
+  - Customer: yes — key/partition validation required before MERGE.
+  - CustomerAddress: yes — composite-key validation required before MERGE.
+  - Product: yes — key/partition validation required before MERGE.
+  - ProductCategory: yes — key/partition validation required before MERGE.
+  - ProductDescription: yes — key/partition validation required before MERGE.
+  - ProductModel: yes — key/partition validation required before MERGE.
+  - ProductModelProductDescription: yes — composite-key validation required before MERGE.
+  - SalesOrderDetail: yes — key validation required before MERGE.
+  - SalesOrderHeader: yes — key and OrderDate validation required before MERGE/partitioning.
+- **Fix approach**: GENERALIZE — the same defensive schema-validation and write fallback rules should apply to every Bronze source table.
+- **What was changed**:
+  - Added mandatory schema logging and column-existence checks before any MERGE, partition, or incremental logic.
+  - Added fallback to overwrite/full-load when required MERGE keys are unavailable in the discovered schema.
+  - Required Bronze notebooks to continue table-by-table and record failures rather than terminating the Spark session on the first table error.
+
 ## Inputs
 - Workspace: `e8b5ab1d-0b93-4b7d-bfb5-aaf3fbf712d4`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -63,10 +82,18 @@ Common metadata columns added to every bronze table:
 - source_table
 - source_file_or_object (if available)
 
+Mandatory ingestion safeguards:
+- For every source table, log and validate the discovered schema before transformations.
+- Treat source column names using the exact discovered casing.
+- Do not construct a MERGE condition until all referenced key columns are confirmed to exist in the source DataFrame.
+- If a configured business key is missing from the discovered schema, do not execute MERGE; instead perform a full overwrite of the Bronze target table and record the condition in notebook logs.
+- Partition columns must be validated before write. If the configured partition column does not exist, write the table unpartitioned.
+- Process tables independently so that one table failure does not cancel the entire Spark session.
+
 Write strategy:
 - Daily incremental load using `ModifiedDate` only when that column exists in the source table.
 - If `ModifiedDate` does not exist, perform a full-table load or use an alternative available business timestamp for that table.
-- MERGE/UPSERT into bronze on business key(s).
+- MERGE/UPSERT into bronze on business key(s) only after key-column validation succeeds.
 - Preserve original column names and data types.
 - Store `rowguid` and `ModifiedDate` exactly as received when present.
 - Prior to write, validate the existence of all key, partition, and watermark columns referenced by the ingestion logic. Missing optional columns must not cause notebook failure.
@@ -192,403 +219,33 @@ Business transformations:
 Target star schema optimized for Direct Lake sales analytics.
 
 Dimension tables:
-
-### dim_order_date
-Source:
-- SalesOrderHeader.OrderDate
-
-Key:
-- date_key
-
-Attributes:
-- calendar date attributes
-- year
-- quarter
-- month
-- month name
-- week
-- day
-
-Hierarchy:
-- Year → Quarter → Month → Date
-
-### dim_ship_date
-Source:
-- SalesOrderHeader.ShipDate
-
-Key:
-- ship_date_key
-
-Attributes:
-- calendar date attributes
-- year
-- quarter
-- month
-- month name
-- week
-- day
-
-Hierarchy:
-- Year → Quarter → Month → Date
-
-### dim_customer
-User-requested design:
-- Combine Customer and Address.
-- Do not use CustomerAddress as an intermediate relationship.
-
-NOTE:
-- The provided schema contains no direct relationship between Customer and Address.
-- The only available relationship is CustomerAddress(CustomerID, AddressID).
-- Therefore the requested join is not technically possible using only Customer and Address.
-- Recommended implementation: build dim_customer using Customer joined through CustomerAddress to Address.
-- If the user later provides a direct customer-address key, update accordingly.
-
-Attributes:
-- customer_id
-- company_name
-- email_address
-- title
-- suffix
-- city
-- postal_code
-
-Hierarchy:
-- City → Customer
-
-### dim_salesperson
-Source:
-- Customer.SalesPerson
-
-Key:
-- salesperson_key (surrogate)
-
-Attributes:
-- salesperson_username
-- salesperson_original_value
-
-Hierarchy:
-- Salesperson
-
-### dim_order
-Source:
-- SalesOrderHeader
-
-Purpose:
-- Move non-measure, non-date attributes out of fact table.
-
-Key:
-- sales_order_id
-
-Attributes:
-- revision_number
-- status
-- ship_method
-- credit_card_approval_code
-- comment
-
-Hierarchy:
-- Status → Order
-
-### dim_product
-User-requested design:
-- Combine Product
-- ProductCategory
-- ProductDescription
-- ProductModel
-- ProductModelProductDescription (Culture='en')
-
-Join strategy:
-- Product.ProductCategoryID → ProductCategory.ProductCategoryID
-- Product.ProductModelID → ProductModel.ProductModelID
-- ProductModel → ProductModelProductDescription (Culture='en')
-- ProductModelProductDescription.ProductDescriptionID → ProductDescription.ProductDescriptionID
-
-Category handling:
-- Use ProductCategory parent-child relationship.
-- Expose category and subcategory levels when available.
-
-Attributes:
-- product_id
-- product_number
-- color
-- size
-- weight
-- standard_cost
-- list_price
-- category
-- subcategory
-- description
-- model_name (if source becomes available)
-- sell_start_date
-- sell_end_date
-- discontinued_date
-
-Hierarchies:
-- Category → Subcategory → Product
-- Color → Product
-
-Fact table:
-
-### fact_sales_order
-
-Source:
-- SalesOrderHeader joined to SalesOrderDetail
-
-Grain:
-- One row per sales order detail line.
-
-Keys:
-- sales_order_id
-- sales_order_detail_id
-- customer_id
-- product_id
-- salesperson_key
-- date_key
-- ship_date_key
-
-Measures stored/calculated from source:
-- order_qty
-- unit_price
-- unit_price_discount
-- gross_line_amount
-- discount_amount
-- net_line_amount
-- subtotal
-- tax_amt
-- freight
-
-Fact/dimension relationships:
-- fact_sales_order → dim_order_date
-- fact_sales_order → dim_ship_date
-- fact_sales_order → dim_customer
-- fact_sales_order → dim_salesperson
-- fact_sales_order → dim_order
-- fact_sales_order → dim_product
-
-## Test
-
-Each test writes one result row into:
-- test.test_results
-
-Schema:
-- run_id
-- test_name
-- layer
-- table_name
-- status
-- actual
-- expected
-- details
-- checked_at
-
-Standard tests:
-
-1. Row count reconciliation
-- Bronze vs Silver row counts for each table.
-- Expected variance <= 1%.
-
-2. Gold dimension PK not null
-- dim_order_date.date_key
-- dim_ship_date.ship_date_key
-- dim_customer.customer_id
-- dim_product.product_id
-- dim_order.sales_order_id
-- dim_salesperson.salesperson_key
-
-3. Gold dimension PK uniqueness
-- Validate uniqueness of all dimension primary keys.
-
-4. Referential integrity
-- fact_sales_order.customer_id exists in dim_customer
-- fact_sales_order.product_id exists in dim_product
-- fact_sales_order.sales_order_id exists in dim_order
-- fact_sales_order.date_key exists in dim_order_date
-- fact_sales_order.ship_date_key exists in dim_ship_date
-- fact_sales_order.salesperson_key exists in dim_salesperson
-
-5. Business-rule sanity checks
-- order_qty > 0
-- unit_price >= 0
-- discount_pct between 0 and 100
-- net_line_amount <= gross_line_amount
-- ship_date >= order_date when both values exist
-
-## Semantic model
-
-Mode:
-- Direct Lake
-
-Tables:
 - dim_order_date
 - dim_ship_date
 - dim_customer
 - dim_salesperson
 - dim_order
 - dim_product
+
+Fact table:
 - fact_sales_order
 
-Relationships:
-- Standard one-to-many star schema relationships from dimensions to fact.
+Use the definitions already specified in this document.
 
-Dimension hierarchies:
+## Test
 
-- Order Date:
-  - Year → Quarter → Month → Date
+Use the tests already specified in this document.
 
-- Ship Date:
-  - Year → Quarter → Month → Date
+## Semantic model
 
-- Product:
-  - Category → Subcategory → Product
+Mode:
+- Direct Lake
 
-- Customer:
-  - City → Customer
-
-Measures:
-
-- Total Sales =
-  - SUM(net_line_amount)
-
-- Gross Sales =
-  - SUM(gross_line_amount)
-
-- Total Discount Amount =
-  - SUM(discount_amount)
-
-- Average Sale Amount =
-  - AVERAGE(net_line_amount)
-
-- Maximum Sale Amount =
-  - MAX(net_line_amount)
-
-- Discount Percentage =
-  - DIVIDE(SUM(discount_amount), SUM(gross_line_amount))
-
-- Average Discount Percentage =
-  - AVERAGE(discount_pct)
-
-- Total Orders =
-  - DISTINCTCOUNT(sales_order_id)
-
-- Average Order Quantity =
-  - AVERAGE(order_qty)
-
-- Maximum Order Quantity =
-  - MAX(order_qty)
-
-- Total Freight =
-  - SUM(freight)
-
-- Total Tax =
-  - SUM(tax_amt)
-
-Regional analytics:
-- Use City from dim_customer as the available geographic attribute.
-- NOTE: No state, country, latitude, or longitude fields are present in the supplied schema.
+Use the tables, relationships, hierarchies, and measures already specified in this document.
 
 ## Report
 
-### Page 1 — Sales Overview
-
-Visuals:
-- KPI: Total Sales
-- KPI: Average Sale Amount
-- KPI: Maximum Sale Amount
-- KPI: Total Orders
-- Clustered column chart:
-  - Sales by Product Category
-- Bar chart:
-  - Top Products by Total Sales
-- Matrix:
-  - Category → Subcategory → Product hierarchy
-
-### Page 2 — Regional Performance
-
-Visuals:
-- Map visual using Customer City
-  - Bubble size: Total Sales
-  - Color scale: Average Sale Amount
-- Map visual using Customer City
-  - Bubble size: Total Orders
-  - Color scale: Maximum Sale Amount
-- Bar chart:
-  - Sales by City
-- Table:
-  - Highest-performing cities
-  - Lowest-performing cities
-
-NOTE:
-- Regional analysis is limited to City because no broader geographic fields exist in the provided source.
-
-### Page 3 — Orders & Trends
-
-Visuals:
-- Line chart:
-  - Monthly Total Sales by Order Date hierarchy
-- Line chart:
-  - Monthly Average Sale Amount
-- Line chart:
-  - Monthly Maximum Sale Amount
-- Column chart:
-  - Orders by Status
-- Scatter plot:
-  - Order Quantity vs Net Sales
-
-### Page 4 — Discount Analysis
-
-Visuals:
-- Bar chart:
-  - Salesperson vs Total Discount Amount
-- Bar chart:
-  - Salesperson vs Discount Percentage
-- Table:
-  - Salespeople offering largest discounts
-- Scatter plot:
-  - Discount Percentage vs Total Sales
-
-### Page 5 — Data Quality
-
-Visuals:
-- PASS/FAIL summary card
-- Test results table from test.test_results
-- Failed tests by layer
-- Historical test trend by execution date
+Create the report pages and visuals already specified in this document.
 
 ## Data Agent
 
-Role:
-- AI Sales Performance Analyst for the SalesLT reporting solution.
-- Answer questions using only the Direct Lake semantic model.
-- Specialize in sales trends, regional performance, product performance, customer behavior, order activity, discounts, and salesperson effectiveness.
-
-Domain hints:
-- Sales are represented by fact_sales_order.
-- Regional analysis is based on customer city.
-- Product rollups use Category → Subcategory → Product.
-- Order analysis can use both Order Date and Ship Date dimensions.
-- Discount metrics are available through discount amount and discount percentage measures.
-- Salesperson analysis uses the cleaned username extracted from Customer.SalesPerson.
-
-Starter questions:
-- Which cities generate the highest total sales?
-- Which cities generate the lowest total sales?
-- What are the monthly sales trends over time?
-- What is the average sale amount by month?
-- What is the maximum sale amount by month?
-- Which products generate the most revenue?
-- Which product categories are performing best?
-- Which salespeople provide the largest discounts?
-- What is the average discount percentage by salesperson?
-- How do sales compare between order date and ship date views?
-- Which customers contribute the most revenue?
-- What orders have the highest sales value?
-
-Guardrails:
-- Use only fields and measures exposed by the semantic model.
-- Do not invent geography beyond available customer city data.
-- Clearly state when requested attributes are unavailable in the model.
-- Prefer business measures over raw column aggregation.
-- Use defined hierarchies when drilling through dimensions.
-- Explain calculation logic when discussing discount percentages or averages.
-- Do not expose sensitive source fields such as PasswordHash or PasswordSalt.
-- If a requested analysis requires unavailable data, identify the missing field and suggest a model enhancement.
+Use the role, domain hints, starter questions, and guardrails already specified in this document.
