@@ -40,6 +40,25 @@
   - Required existence validation of all Gold tables before creating reporting artifacts.
   - Required per-artifact status tracking and deferred failure reporting after all reporting artifacts are attempted.
 
+### Iteration 3 — 2026-06-04 13:31:45Z — failed layer: reporting (run: 20260604-131843-766038)
+- **Root cause (1-line summary)**: Reporting stage again ended with `System_Cancelled_Session_Statements_Failed`; underlying artifact failure was masked by session cancellation and likely occurred during semantic-model object creation against missing or mismatched model objects.
+- **Cross-table audit**:
+  - Address: yes — contributes attributes to dim_customer and can indirectly affect reporting fields.
+  - Customer: yes — semantic model references customer attributes and relationships.
+  - CustomerAddress: yes — customer geography depends on this bridge-derived logic.
+  - Product: yes — report visuals and measures reference product dimensions.
+  - ProductCategory: yes — product hierarchy depends on category fields.
+  - ProductDescription: yes — description attributes may be surfaced in reports.
+  - ProductModel: yes — model-related attributes participate in dim_product.
+  - ProductModelProductDescription: yes — product-description joins affect report fields.
+  - SalesOrderDetail: yes — fact measures originate from this table.
+  - SalesOrderHeader: yes — date dimensions and order attributes originate here.
+- **Fix approach**: GENERALIZE — the failure is plausibly caused by reporting artifacts referencing objects before they are successfully created, which can affect all reporting assets regardless of source table.
+- **What was changed**:
+  - Tightened Semantic model requirements to enforce object-existence validation before relationships, hierarchies, and measures are created.
+  - Tightened Report requirements to require dependency-aware creation order and skipping dependent artifacts when prerequisite objects are unavailable.
+  - Added explicit validation of tables, columns, measures, and relationships before report-page generation.
+
 ## Inputs
 - Workspace: `0258bc57-3512-47aa-a7fb-6e3930af0f5d`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -396,6 +415,19 @@ Tests:
 Storage mode:
 - Direct Lake
 
+Model build order (mandatory):
+1. Create semantic model shell.
+2. Add and validate all tables.
+3. Add and validate all relationships.
+4. Add and validate all hierarchies.
+5. Add and validate all measures.
+6. Publish/save model.
+- Do not create relationships, hierarchies, or measures until all referenced tables are confirmed present in the semantic model.
+- Before creating any relationship, verify both tables and relationship columns exist.
+- Before creating any hierarchy, verify all hierarchy columns exist on the target table.
+- Before creating any measure, verify all referenced columns and referenced measures exist.
+- Record success/failure for each semantic-model object independently.
+
 Tables:
 - fact_sales_order
 - dim_customer
@@ -453,6 +485,11 @@ Reporting execution requirements:
 - If one reporting artifact fails, log the failure, continue attempting remaining reporting artifacts, and raise a consolidated reporting failure only after all reporting artifacts have been attempted.
 - Do not build the entire semantic model and report in a single monolithic operation without intermediate validation checkpoints.
 - After creating each relationship, hierarchy, measure, or report page, validate successful creation before proceeding to the next artifact.
+- Dependency enforcement:
+  - Do not create report pages until the semantic model is successfully published.
+  - Do not place a visual on a page unless every referenced table, column, hierarchy, and measure has been validated in the semantic model.
+  - If a required dependency is missing, mark the artifact as skipped with a detailed reason and continue processing remaining independent artifacts.
+  - Validate each report page after creation and before adding the next page.
 
 Page 1 — Executive Sales Overview
 - KPI cards:
@@ -470,7 +507,7 @@ Page 2 — Regional Performance
 - Tooltip:
   - Total Sales
   - Average Sales
-  - Maximum Sale
+  - Maximum Sales
   - Total Orders
 - Top-performing regions chart.
 - Lowest-performing regions chart.
