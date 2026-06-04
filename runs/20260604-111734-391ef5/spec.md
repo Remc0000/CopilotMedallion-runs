@@ -2,7 +2,7 @@
 
 ## Updated specs
 
-### Iteration 1 — 2026-06-04 11:24:03Z — failed layer: bronze (run: 20260604-111734-391ef5)
+### Iteration 1 — 2026-06-04 11:24:03Z — failed layer: bronze (run: 20260404-111734-391ef5)
 - **Root cause (1-line summary)**: Bronze completed without producing discoverable Delta tables under `Tables/bronze/`, causing Silver generation to stop.
 - **Cross-table audit**:
   - Address: yes — discoverability failure can affect any Bronze write.
@@ -20,6 +20,25 @@
   - Tightened Bronze write-path requirements to require physical Delta writes under `Tables/bronze/<table_name_lower>`.
   - Added mandatory post-write validation that each target path exists and contains Delta data before marking the table successful.
   - Added explicit requirement to raise an error if fewer than the 10 expected Bronze tables are discoverable at notebook completion.
+
+### Iteration 2 — 2026-06-04 11:31:20Z — failed layer: bronze (run: 20260604-111734-391ef5)
+- **Root cause (1-line summary)**: Bronze validation still reported zero discoverable tables; the build needs explicit Lakehouse-relative write locations and discoverability verification using the exact required folder names.
+- **Cross-table audit**:
+  - Address: yes — same discoverability requirement applies.
+  - Customer: yes — same discoverability requirement applies.
+  - CustomerAddress: yes — same discoverability requirement applies.
+  - Product: yes — same discoverability requirement applies.
+  - ProductCategory: yes — same discoverability requirement applies.
+  - ProductDescription: yes — same discoverability requirement applies.
+  - ProductModel: yes — same discoverability requirement applies.
+  - ProductModelProductDescription: yes — same discoverability requirement applies.
+  - SalesOrderDetail: yes — same discoverability requirement applies.
+  - SalesOrderHeader: yes — same discoverability requirement applies.
+- **Fix approach**: GENERALIZE — every Bronze table must use the same path convention and validation logic.
+- **What was changed**:
+  - Added explicit requirement to write to Lakehouse-relative paths rooted at `Tables/bronze/`.
+  - Added required Delta-log validation (`_delta_log` presence and successful Delta read).
+  - Added requirement to enumerate and verify all 10 expected folder names before Bronze completion.
 
 ## Inputs
 - Workspace: `35fe2703-387e-4ca0-a948-16313a09cf18`
@@ -56,6 +75,7 @@ Cross-cutting code rules:
 - Process source tables independently per layer.
 - Every code cell must start with a short explanatory comment block.
 - Bronze, Silver, and Gold outputs must be physically discoverable Delta folders under `Tables/<layer>/...` before the layer is considered successful.
+- Discoverability checks must validate both successful Delta reads and the existence of a `_delta_log` directory in each expected output folder.
 
 ## Bronze
 
@@ -68,7 +88,8 @@ Cross-cutting code rules:
   - `_bronze_ts`
 - Write mode: overwrite with schema overwrite enabled.
 - REQUIRED write pattern:
-  - Write each table as Delta to a physical Lakehouse path under `Tables/bronze/<table_name_lower>`.
+  - Write each table as Delta to a physical Lakehouse-relative path rooted at `Tables/bronze/`.
+  - Do not write to `Files/`, temporary folders, notebook-local storage, or any path outside `Tables/bronze/`.
   - The final folder names must be exactly:
     - `address`
     - `customer`
@@ -83,14 +104,28 @@ Cross-cutting code rules:
   - Do not write only to Files, temp locations, temp views, or notebook-local paths.
 - REQUIRED post-write validation for every table:
   - Verify the target path exists.
+  - Verify a `_delta_log` directory exists in the target path.
   - Verify it is readable as Delta immediately after write.
+  - Verify the Delta read returns a row count greater than or equal to the source row count.
   - Record row count and target path in the results summary.
   - Mark the table failed if validation does not pass.
 - REQUIRED notebook completion check:
-  - Discover and count written Bronze tables under `Tables/bronze/`.
+  - Enumerate folders directly under `Tables/bronze/`.
   - Expected discoverable table count: 10.
+  - Required folders:
+    - `address`
+    - `customer`
+    - `customeraddress`
+    - `product`
+    - `productcategory`
+    - `productdescription`
+    - `productmodel`
+    - `productmodelproductdescription`
+    - `salesorderheader`
+    - `salesorderdetail`
   - Raise an error if zero tables are discoverable.
-  - Raise an error if any of the 10 required Bronze outputs are missing.
+  - Raise an error if any required folder is missing.
+  - Raise an error if any required folder lacks a readable Delta table.
 - Partitioning:
   - SalesOrderHeader: partition by year derived from OrderDate.
   - SalesOrderDetail: partition by SalesOrderID hash bucket or non-partitioned if volume is small.
