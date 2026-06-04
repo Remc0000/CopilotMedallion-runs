@@ -21,6 +21,25 @@
   - Added mandatory post-write verification that each Delta path exists and contains data.
   - Added notebook-level failure condition if any source table is skipped or if discoverable table count differs from source table count.
 
+### Iteration 2 — 2026-06-04 09:49:29Z — failed layer: bronze (run: 20260604-094133-042506)
+- **Root cause (1-line summary)**: Build interruption due to environment/server restart mid-execution, creating risk of partial Bronze completion and non-resumable processing.
+- **Cross-table audit**:
+  - Address: yes — restart could interrupt write.
+  - Customer: yes — restart could interrupt write.
+  - CustomerAddress: yes — restart could interrupt write.
+  - Product: yes — restart could interrupt write.
+  - ProductCategory: yes — restart could interrupt write.
+  - ProductDescription: yes — restart could interrupt write.
+  - ProductModel: yes — restart could interrupt write.
+  - ProductModelProductDescription: yes — restart could interrupt write.
+  - SalesOrderDetail: yes — restart could interrupt write.
+  - SalesOrderHeader: yes — restart could interrupt write.
+- **Fix approach**: GENERALIZE — restart resilience and resumability must apply uniformly to every Bronze source table.
+- **What was changed**:
+  - Added mandatory per-table checkpointing and restart-safe processing rules in Bronze.
+  - Required independent processing and verification of each source table before advancing to the next table.
+  - Added resume behavior that skips already verified Bronze outputs and only rebuilds missing or invalid tables.
+
 ## Inputs
 - Workspace: `6b270c7d-4c29-43c3-a8de-4debee058dd2`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -55,6 +74,7 @@ Cross-cutting code rules:
 - Process source tables independently per layer and record results.
 - Every notebook must start with parameter cells for workspace, lakehouse, run_id, source paths, and target paths.
 - Every code cell must begin with a short comment block explaining purpose and intent.
+- Implement restart-safe execution: work must be committed and validated table-by-table so a notebook restart can resume without reprocessing already verified outputs.
 - Retain all existing Rules A–K exactly as written in this spec.
 
 ## Bronze
@@ -79,6 +99,12 @@ Cross-cutting code rules:
   - `SalesLT/SalesOrderDetail` → `Tables/bronze/salesorderdetail`
   - `SalesLT/SalesOrderHeader` → `Tables/bronze/salesorderheader`
 - Write each table directly to the corresponding Delta path under `Tables/bronze/`; do not write to alternate folders, nested schema folders, temporary folders, or non-Delta locations.
+- Process tables one at a time. After each table is written and validated, immediately record completion status, row count, and path in the results summary before starting the next table.
+- Resume behavior:
+  - At notebook start, inspect each expected Bronze Delta path.
+  - If a target path already exists, is readable as Delta, and passes row-count validation, treat that table as completed and do not rewrite it.
+  - Only rebuild tables that are missing, unreadable, or fail validation.
+  - Do not require all 10 tables to be rewritten in a resumed run.
 - After every write:
   - Verify the target path exists.
   - Verify it is readable as Delta.
@@ -92,8 +118,8 @@ Cross-cutting code rules:
 - Record row counts written for each table and emit bronze summary JSON.
 - Mandatory completion check:
   - Expected Bronze outputs = 10 tables.
-  - Raise an error if fewer than 10 discoverable Delta tables exist under `Tables/bronze/` after processing.
-  - Raise an error if zero tables were written, even if no Spark exception occurred.
+  - Raise an error if fewer than 10 discoverable Delta tables exist under `Tables/bronze/` after processing and validation.
+  - Raise an error if zero tables were written or validated, even if no Spark exception occurred.
 
 ## Silver
 
