@@ -30,7 +30,7 @@
   - Product: yes — date-derived business logic can fail.
   - ProductCategory: yes — rename and deduplication path can fail.
   - ProductDescription: yes — standard Silver transformation path can fail.
-  - ProductModel: yes — standard Silver transformation path can fail.
+  - ProductModel: yes — standard Silver processing path can fail.
   - ProductModelProductDescription: yes — junction-table composite-key processing can fail.
   - SalesOrderDetail: yes — calculated columns can fail.
   - SalesOrderHeader: yes — date derivations can fail.
@@ -39,6 +39,25 @@
   - Tightened Silver execution to require one notebook-level processing unit per table iteration with forced materialization before write.
   - Added mandatory row-count validation before and after write operations.
   - Required failures to be logged and skipped so remaining Silver tables continue processing.
+
+### Iteration 3 — 2026-06-04 12:32:57Z — failed layer: silver (run: 20260604-121637-7d1d0a)
+- **Root cause (1-line summary)**: Product Silver business logic incorrectly treated `discontinued_date` as mandatory, and error logging failed because `_save_error(table=...)` was called with an unsupported argument.
+- **Cross-table audit**:
+  - Address: yes — optional source columns could be absent and trigger the same validation pattern.
+  - Customer: yes — derived fields based on `sales_person` must tolerate missing optional columns.
+  - CustomerAddress: yes — optional audit columns may not exist.
+  - Product: yes — confirmed failure; `discontinued_date` may be absent in source schema.
+  - ProductCategory: yes — optional attributes may be absent after snake_case conversion.
+  - ProductDescription: yes — optional attributes may be absent.
+  - ProductModel: yes — schema differences can cause the same issue.
+  - ProductModelProductDescription: yes — optional columns may vary by source schema.
+  - SalesOrderDetail: yes — derived calculations must validate only truly required columns.
+  - SalesOrderHeader: yes — optional date columns such as `ship_date` may be absent.
+- **Fix approach**: GENERALIZE — the root cause is improper handling of optional columns and inconsistent error-handler signatures, which can affect all Silver tables.
+- **What was changed**:
+  - Tightened Silver schema-validation rules to distinguish required versus optional columns.
+  - Made `product.discontinued_date` optional and defined fallback behavior when absent.
+  - Required Silver error handling to call `_save_error` using only supported positional arguments and never assume a `table=` keyword parameter exists.
 
 ## Inputs
 - Workspace: `120db309-94d0-4c4a-9183-504d81b9a3bf`
@@ -75,7 +94,7 @@ Cross-cutting code rules:
 - Never use `saveAsTable`; write Delta directly to lakehouse paths.
 - Every notebook must begin with parameter cells for workspace, source lakehouse, target lakehouse, run_id, layer, and paths.
 - Use idempotent overwrite patterns with `mode("overwrite")` and `overwriteSchema=true`.
-- All exception handling must be error-loud: call `_save_error(layer, e)` (or `_save_error(layer, e, table=tbl)` in loops) and re-raise.
+- All exception handling must be error-loud: call `_save_error` only with the arguments supported by its implementation; do not assume a `table=` keyword argument exists.
 - Each code cell must start with a short comment block explaining purpose and business intent.
 - Process source tables independently per layer wherever possible.
 - Validate outputs exist before allowing downstream layers to execute.
@@ -121,11 +140,13 @@ Common Silver standards:
 - Each table must have its own try/except block, schema validation, transformation, and Delta write.
 - Never build a single DataFrame lineage, SQL statement, or execution plan spanning multiple Silver tables.
 - Before any rename, deduplication, window, filter, or derived-column logic, validate that all required source columns for that table exist and fail with a table-specific error message naming the missing column.
+- Distinguish REQUIRED columns from OPTIONAL columns. Missing OPTIONAL columns must not fail the table; instead skip the related derivation and populate the derived output with NULL/default values as defined below.
 - A failure on one Silver table must not prevent attempted processing of the remaining Silver tables; emit a per-table status summary at completion.
 - For every table, force materialization of the transformed DataFrame and validate a non-error row count before attempting the Delta write.
 - After every Silver write, immediately validate that the target Delta path exists and that the written row count is retrievable.
 - Record table name, pre-write row count, post-write row count, status, and error message (if any) in a Silver execution summary.
 - Continue processing remaining tables after a table-specific failure; only fail the Silver layer after the summary is produced.
+- Error logging must use `_save_error` only with its supported signature; do not pass unsupported keyword arguments.
 - Rename all columns to snake_case.
 - Add `_silver_loaded_at`.
 - Trim string columns.
@@ -151,10 +172,12 @@ Silver business enhancements:
   - Validate sales_person exists before deriving salesperson fields.
   - Derive cleaned_salesperson_raw from sales_person.
   - Derive salesperson_username by extracting username after "\" when present.
+  - If sales_person is absent, set cleaned_salesperson_raw and salesperson_username to NULL and continue.
 - product:
-  - Validate sell_start_date, sell_end_date, and discontinued_date existence before derived calculations.
-  - Derive is_discontinued from discontinued_date.
-  - Derive is_currently_sellable from sell_start_date, sell_end_date, and discontinued_date.
+  - Validate sell_start_date and sell_end_date before derived calculations.
+  - Treat discontinued_date as OPTIONAL.
+  - Derive is_discontinued from discontinued_date when the column exists; otherwise set is_discontinued = false.
+  - Derive is_currently_sellable using sell_start_date and sell_end_date; when discontinued_date exists, also incorporate it into the calculation.
 - salesorderheader:
   - Validate order_date before deriving date attributes.
   - Derive order_year, order_month, order_date_key.
