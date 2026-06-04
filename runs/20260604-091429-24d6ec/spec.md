@@ -1,419 +1,201 @@
-# Run Spec 20260604-091237-ae5763
-
-## Updated specs
-
-### Iteration 1 — 2026-06-04 09:18:05Z — failed layer: bronze (run: 20260604-091429-24d6ec)
-- **Root cause (1-line summary)**: Bronze completed without producing discoverable Delta tables under `Tables/bronze/`, causing Silver to halt because no Bronze outputs were found.
-- **Cross-table audit**:
-  - SalesLT/Address: yes — Bronze discoverability requirements apply.
-  - SalesLT/Customer: yes — Bronze discoverability requirements apply.
-  - SalesLT/CustomerAddress: yes — Bronze discoverability requirements apply.
-  - SalesLT/Product: yes — Bronze discoverability requirements apply.
-  - SalesLT/ProductCategory: yes — Bronze discoverability requirements apply.
-  - SalesLT/ProductDescription: yes — Bronze discoverability requirements apply.
-  - SalesLT/ProductModel: yes — Bronze discoverability requirements apply.
-  - SalesLT/ProductModelProductDescription: yes — Bronze discoverability requirements apply.
-  - SalesLT/SalesOrderDetail: yes — Bronze discoverability requirements apply.
-  - SalesLT/SalesOrderHeader: yes — Bronze discoverability requirements apply.
-- **Fix approach**: GENERALIZE — the failure is not table-specific; every Bronze table must be written and validated using the same discoverability rules.
-- **What was changed**:
-  - Tightened Bronze write requirements to require physical Delta outputs at `Tables/bronze/<table>`.
-  - Added post-write validation that each Bronze table is immediately discoverable and readable.
-  - Added a mandatory layer-level failure if any expected Bronze table is missing after writes complete.
-
-### Iteration 2 — 2026-06-04 09:21:52Z — failed layer: bronze (run: 20260604-091429-24d6ec)
-- **Root cause (1-line summary)**: Silver again found no discoverable Bronze outputs, indicating Bronze writes were not materialized at the exact Lakehouse `Tables/bronze/<table>` locations expected by downstream discovery.
-- **Cross-table audit**:
-  - SalesLT/Address: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/Customer: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/CustomerAddress: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/Product: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/ProductCategory: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/ProductDescription: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/ProductModel: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/ProductModelProductDescription: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/SalesOrderDetail: yes — must exist as a physical Delta table under the exact Bronze path.
-  - SalesLT/SalesOrderHeader: yes — must exist as a physical Delta table under the exact Bronze path.
-- **Fix approach**: GENERALIZE — the same discoverability requirement applies uniformly to every Bronze table.
-- **What was changed**:
-  - Added explicit prohibition on writing Bronze outputs anywhere except the listed `Tables/bronze/<table>` locations.
-  - Added mandatory Delta-log validation and directory enumeration after each write.
-  - Added a final Bronze manifest check requiring all expected table directories to exist before the layer can succeed.
-
-### Iteration 3 — 2026-06-04 09:25:11Z — failed layer: bronze (run: 20260604-091429-24d6ec)
-- **Root cause (1-line summary)**: Build interruption due to server restart during Bronze execution; partial writes must be handled safely and resumably.
-- **Cross-table audit**:
-  - SalesLT/Address: yes — interruption can occur during write or validation.
-  - SalesLT/Customer: yes — interruption can occur during write or validation.
-  - SalesLT/CustomerAddress: yes — interruption can occur during write or validation.
-  - SalesLT/Product: yes — interruption can occur during write or validation.
-  - SalesLT/ProductCategory: yes — interruption can occur during write or validation.
-  - SalesLT/ProductDescription: yes — interruption can occur during write or validation.
-  - SalesLT/ProductModel: yes — interruption can occur during write or validation.
-  - SalesLT/ProductModelProductDescription: yes — interruption can occur during write or validation.
-  - SalesLT/SalesOrderDetail: yes — interruption can occur during write or validation.
-  - SalesLT/SalesOrderHeader: yes — interruption can occur during write or validation.
-- **Fix approach**: GENERALIZE — restart resilience is required uniformly for every Bronze table.
-- **What was changed**:
-  - Added per-table checkpoint and completion-manifest requirements.
-  - Added restart-safe validation to reuse already validated Bronze outputs.
-  - Required final manifest verification before Bronze success is declared.
-
-### Iteration 4 — 2026-06-04 09:28:26Z — failed layer: bronze (run: 20260604-091429-24d6ec)
-- **Root cause (1-line summary)**: Silver could not discover any Bronze tables because Bronze outputs were not exposed as Lakehouse Tables under the expected `Tables/bronze/<table_name>` hierarchy.
-- **Cross-table audit**:
-  - SalesLT/Address: yes — requires discoverable Lakehouse table path.
-  - SalesLT/Customer: yes — requires discoverable Lakehouse table path.
-  - SalesLT/CustomerAddress: yes — requires discoverable Lakehouse table path.
-  - SalesLT/Product: yes — requires discoverable Lakehouse table path.
-  - SalesLT/ProductCategory: yes — requires discoverable Lakehouse table path.
-  - SalesLT/ProductDescription: yes — requires discoverable Lakehouse table path.
-  - SalesLT/ProductModel: yes — requires discoverable Lakehouse table path.
-  - SalesLT/ProductModelProductDescription: yes — requires discoverable Lakehouse table path.
-  - SalesLT/SalesOrderDetail: yes — requires discoverable Lakehouse table path.
-  - SalesLT/SalesOrderHeader: yes — requires discoverable Lakehouse table path.
-- **Fix approach**: GENERALIZE — the discoverability failure affects every Bronze table identically.
-- **What was changed**:
-  - Required writes to resolve against the target Lakehouse physical Tables area, not relative or notebook-local paths.
-  - Added mandatory post-write enumeration of `Tables/bronze/` and validation that all ten expected table directories are present before Bronze succeeds.
-  - Added a hard failure if the final discovered table count under `Tables/bronze/` is not exactly ten.
-
-### Iteration 5 — 2026-06-04 09:31:49Z — failed layer: bronze (run: 20260604-091429-24d6ec)
-- **Root cause (1-line summary)**: Server restarted mid-build; Bronze execution must resume from durable state without reprocessing already validated tables.
-- **Cross-table audit**:
-  - SalesLT/Address: yes — restart can occur after write or validation.
-  - SalesLT/Customer: yes — restart can occur after write or validation.
-  - SalesLT/CustomerAddress: yes — restart can occur after write or validation.
-  - SalesLT/Product: yes — restart can occur after write or validation.
-  - SalesLT/ProductCategory: yes — restart can occur after write or validation.
-  - SalesLT/ProductDescription: yes — restart can occur after write or validation.
-  - SalesLT/ProductModel: yes — restart can occur after write or validation.
-  - SalesLT/ProductModelProductDescription: yes — restart can occur after write or validation.
-  - SalesLT/SalesOrderDetail: yes — restart can occur after write or validation.
-  - SalesLT/SalesOrderHeader: yes — restart can occur after write or validation.
-- **Fix approach**: GENERALIZE — restart recovery requirements are identical for all Bronze source tables.
-- **What was changed**:
-  - Required Bronze processing to be table-at-a-time with immediate durable checkpoint persistence after each successful table.
-  - Required notebook startup recovery to rebuild state from physical Delta validation and manifest records rather than in-memory variables.
-  - Added prohibition on failing the run solely because previously completed tables already exist.
-
-### Iteration 6 — 2026-06-04 09:32:24Z — failed layer: bronze (run: 20260604-091429-24d6ec)
-- **Root cause (1-line summary)**: Repeated server restarts interrupted Bronze before completion; recovery state must be stored in durable Lakehouse artifacts and flushed after every table.
-- **Cross-table audit**:
-  - SalesLT/Address: yes — recovery metadata must survive restart.
-  - SalesLT/Customer: yes — recovery metadata must survive restart.
-  - SalesLT/CustomerAddress: yes — recovery metadata must survive restart.
-  - SalesLT/Product: yes — recovery metadata must survive restart.
-  - SalesLT/ProductCategory: yes — recovery metadata must survive restart.
-  - SalesLT/ProductDescription: yes — recovery metadata must survive restart.
-  - SalesLT/ProductModel: yes — recovery metadata must survive restart.
-  - SalesLT/ProductModelProductDescription: yes — recovery metadata must survive restart.
-  - SalesLT/SalesOrderDetail: yes — recovery metadata must survive restart.
-  - SalesLT/SalesOrderHeader: yes — recovery metadata must survive restart.
-- **Fix approach**: GENERALIZE — the same restart-resilience pattern applies to every Bronze table.
-- **What was changed**:
-  - Required a durable checkpoint/manifest stored in the target Lakehouse after every successful table write and validation.
-  - Required startup logic to enumerate all expected Bronze paths and rebuild progress solely from persisted artifacts and Delta validation.
-  - Required committing and validating one table at a time before moving to the next table.
-
-### Iteration 6 — 2026-06-04 09:36:44Z — failed layer: bronze (run: 20260604-091429-24d6ec)
-- **Root cause (1-line summary)**: Silver detected zero discoverable Bronze tables because Bronze outputs were not visible under the exact `Tables/bronze/` hierarchy at runtime.
-- **Cross-table audit**:
-  - SalesLT/Address: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/Customer: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/CustomerAddress: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/Product: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/ProductCategory: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/ProductDescription: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/ProductModel: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/ProductModelProductDescription: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/SalesOrderDetail: yes — must be discoverable through directory enumeration and Delta read.
-  - SalesLT/SalesOrderHeader: yes — must be discoverable through directory enumeration and Delta read.
-- **Fix approach**: GENERALIZE — the failure affects all Bronze tables uniformly because downstream discovery scans the same `Tables/bronze/` hierarchy.
-- **What was changed**:
-  - Added a mandatory Bronze completion gate requiring successful enumeration and Delta reads of all ten expected paths before Bronze can finish.
-  - Required the notebook to fail immediately if `Tables/bronze/` contains fewer than ten expected directories.
-  - Required the completion summary JSON to include a discovered-table count and per-table discoverability status.
-
-### Iteration 7 — 2026-06-04 09:40:44Z — failed layer: bronze (run: 20260604-091429-24d6ec)
-- **Root cause (1-line summary)**: Silver found zero discoverable Bronze tables, indicating Bronze validation was not using the same table-discovery mechanism as downstream layer startup.
-- **Cross-table audit**:
-  - SalesLT/Address: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/Customer: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/CustomerAddress: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/Product: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/ProductCategory: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/ProductDescription: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/ProductModel: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/ProductModelProductDescription: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/SalesOrderDetail: yes — downstream discovery requires a readable Delta table at the expected path.
-  - SalesLT/SalesOrderHeader: yes — downstream discovery requires a readable Delta table at the expected path.
-- **Fix approach**: GENERALIZE — every Bronze table must pass the exact same discovery checks used by Silver.
-- **What was changed**:
-  - Added a mandatory Bronze self-discovery phase that re-enumerates `Tables/bronze/` from a fresh read after all writes complete.
-  - Required validation against the exact ten expected table names and paths before Bronze can report success.
-  - Required Bronze to fail if self-discovery returns fewer than ten tables, regardless of manifest contents.
+# Run Spec 20260604-091429-24d6ec
 
 ## Inputs
 - Workspace: `44cf7adf-0561-49b1-bf73-44f3c5b38c21`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
 - Tables to ingest into Bronze:
-  - `SalesLT/Address`
-  - `SalesLT/Customer`
-  - `SalesLT/CustomerAddress`
-  - `SalesLT/Product`
-  - `SalesLT/ProductCategory`
-  - `SalesLT/ProductDescription`
-  - `SalesLT/ProductModel`
-  - `SalesLT/ProductModelProductDescription`
-  - `SalesLT/SalesOrderDetail`
-  - `SalesLT/SalesOrderHeader`
+- `SalesLT/Address`
+- `SalesLT/Customer`
+- `SalesLT/CustomerAddress`
+- `SalesLT/Product`
+- `SalesLT/ProductCategory`
+- `SalesLT/ProductDescription`
+- `SalesLT/ProductModel`
+- `SalesLT/ProductModelProductDescription`
+- `SalesLT/SalesOrderDetail`
+- `SalesLT/SalesOrderHeader`
 - Target Lakehouse: **LakeSales**
 
 ## Generic guidance
 
-Apply these reference skills/agents at all times:
-- FabricDataEngineer agent: https://github.com/microsoft/skills-for-fabric/blob/main/agents/FabricDataEngineer.agent.md
-- e2e-medallion-architecture skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/e2e-medallion-architecture
-- spark-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/spark-authoring-cli
-- powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
-- powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
-- powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+You are a data agent following the FabricDataEngineer agent (https://github.com/microsoft/skills-for-fabric/blob/main/agents/FabricDataEngineer.agent.md). Apply ALL of its principles: decompose into endpoint-specific stages, parameterize environments, never hard-code IDs/secrets, use Delta Lake everywhere, separate raw/validated/serving layers, validation gates between layers, idempotent overwrite patterns.
 
-Cross-cutting code rules:
-- Use defensive column references and validate required columns before every join, filter, aggregation, window, and derived-column operation.
-- Alias-prefix joins only inside the join expression; materialize flat column names immediately after joins.
-- Assert all groupBy and aggregation columns exist before execution.
-- Use defensive REST handling with `if x is None: raise RuntimeError(...)` before any `.get()` access.
-- Never use `saveAsTable`; write Delta directly to lakehouse paths.
-- Every notebook must start with parameter cells for workspace, lakehouse, run_id, paths, and execution options.
-- Use idempotent overwrite patterns with `.mode("overwrite").option("overwriteSchema","true")`.
-- All exception handling must be error-loud, call `_save_error(layer, e)` (or `_save_error(layer, e, table=tbl)` in loops), and re-raise after logging.
-- Process source tables independently per layer using per-table isolation patterns.
-- Every generated notebook cell must begin with a short comment block describing intent.
-- After every write, validate that the target Delta location exists and is readable before marking the table successful.
+Also apply these reference skills (use their patterns from training):
+- https://github.com/microsoft/skills-for-fabric/tree/main/skills/e2e-medallion-architecture
+- https://github.com/microsoft/skills-for-fabric/tree/main/skills/spark-authoring-cli
+- https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
+- https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
+- https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
+- https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+
+### Cross-cutting code rules (apply in every notebook)
+
+- **Defensive column references** — never assume a column exists. AdventureWorksLT junction tables (CustomerAddress, ProductModelProductDescription) only have FK columns, no own ID columns. CamelCase IDs become snake_case after silver rename (SalesOrderID → sales_order_id).
+- **Ambiguous columns after joins** — always alias both sides of joins and reference columns with the alias prefix: `F.col('c.customer_id')`, never bare `F.col('customer_id')` when both joined tables have that name. Use Python attribute access on aliased DFs in join conditions: `c.customer_id == ca.customer_id`.
+- **GroupBy / aggregation safety** — before any `df.groupBy(col)` or `df.agg(...)`, assert the column exists in `df.columns`. If the spec asks for aggregations by a column, the FACT table MUST materialize that column.
+- **Error-loud** — every layer wraps major steps in try/except that calls `_save_error('<layer>', e)` and re-raises. Never swallow per-table errors into a results dict and continue.
+- **Defensive REST handling (reporting notebook)** — every REST helper returns `None` on failure (non-2xx, caught exception). Callers MUST check `if x is None: raise RuntimeError(...)` BEFORE calling `.get(...)` on the result. Never write `something.get('id')` without a None check first.
+- **No saveAsTable** — schema-enabled lakehouses don't have a default DB context for unqualified saves. Always write Delta via `df.write.format('delta').save(abfss_path)`.
+- **Parameter cell** — every notebook receives a platform-injected parameters cell with `workspace_id, source_workspace_id, source_lakehouse_id, target_lakehouse_id, target_lakehouse_name, source_tables_csv, run_id, spec_url`. Don't redefine these.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
+These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
 
-All Rules A–K from the current specification remain in force.
+Rule A — No dotted alias strings.
+- Never pass dotted strings like "c.customer_id", "ca.address_type", "h.sales_person", or "pc_child.name" to F.col(...), withColumn(...), Window.partitionBy(...), Window.orderBy(...), or select(...). Spark treats "c.customer_id" as a single column literally named c.customer_id, which does not resolve once any projection or rename has been applied.
+- Alias scope (.alias("c"), .alias("ca"), ...) is only valid inside the SAME select / join expression that introduces it. Once you produce a new DataFrame via select(...) or withColumn(...), the dotted alias form is gone and you must reference plain column names.
+
+Rule B — Materialize helper columns before they are needed downstream.
+- For any column that will later be referenced by a Window, a withColumn, or a downstream join after a projection, first materialize it as a flat, unambiguous helper column (e.g. rank_customer_id, rank_address_type, sales_person_source) in the same select that introduces the join aliases.
+
+Rule C — Do not drop a column before its last consumer has run.
+- Before adding a withColumn, verify every F.col(...) referenced by that expression still exists on the DataFrame at that step. If a previous select(...) projection removed it, either:
+  - (preferred) move the withColumn BEFORE the projection that drops the source column, OR
+  - keep the source column in the projection, OR
+  - re-derive the value from a column that IS still present (often a boolean/flag that was computed earlier from the same source).
+- Example of the failure to avoid: dropping discontinued_date in a select(...) and then later writing F.when(F.col('discontinued_date').isNotNull(), ...) inside withColumn('is_sellable_currently', ...). The column is gone and Spark raises UNRESOLVED_COLUMN.
+- When a boolean flag derived from a raw column already exists on the DataFrame (e.g. is_discontinued derived from discontinued_date), prefer reusing the flag (F.col('is_discontinued')) over re-reading the dropped raw column.
+
+Rule D — Order of derived-column computations matters.
+- When building several derived columns where one depends on another (e.g. is_discontinued, then is_sellable_currently which uses is_discontinued), add them in dependency order with sequential withColumn calls, and reference the already-derived flag in the next expression — do NOT reach back to a raw source column that may have been dropped.
+
+Rule E — Validate schema between non-trivial transformation steps.
+- After any select(...) / drop(...) / heavy withColumn chain, and BEFORE the next step that depends on specific columns, assert those columns exist. Fail fast with an error message that names the missing column and the DataFrame variable, so the auto-fixer gets an actionable diagnostic instead of a deep analyzer stack trace.
+
+Rule F — Self-check pattern for every withColumn / Window.
+- For every withColumn(name, expr) and every Window definition, confirm: "Every column referenced inside expr / inside the window's partitionBy / orderBy exists on the DataFrame at this exact point." If not, fix per Rule C before generating the code.
+
+Rule G — Optional-column helpers must return typed Column nulls, not Python None.
+- When defining a helper like `_maybe(df, name)` that returns the column if it exists on the DataFrame and a fallback otherwise, NEVER return Python `None`. Spark functions (`F.coalesce`, `F.greatest`, `F.least`, `F.concat`, `F.when(...).otherwise(...)`, etc.) reject `None` arguments with `PySparkTypeError: [NOT_COLUMN_OR_STR]` and the cell crashes BEFORE any later fallback (e.g. `F.current_timestamp()`) gets a chance to satisfy the call.
+- Correct pattern — return a typed null literal as a Spark Column:
+  ```
+  def _maybe(df, name, dtype='timestamp'):
+      return F.col(name) if name in df.columns else F.lit(None).cast(dtype)
+  ```
+  Pick the `dtype` to match the surrounding expression (`'timestamp'` for date/time coalesces, `'string'` for text, `'double'` for numeric, etc.) so Spark can resolve the result type without ambiguity.
+- Alternative pattern (when the helper genuinely cannot know the dtype) — filter `None`s at the call site BEFORE invoking the Spark function:
+  ```
+  candidates = [c for c in (_maybe(df, 'modified_date'), _maybe(df, 'order_date')) if c is not None]
+  df = df.withColumn('source_dt', F.to_date(F.coalesce(*candidates, F.current_timestamp())))
+  ```
+  Either approach is acceptable, but **never pass Python `None` directly into a Spark function**.
+- Applies to ALL optional-column lookups across Bronze, Silver, Gold — including audit-timestamp coalesces, optional-key joins, fallback string formatting, etc. This is a layer-agnostic rule.
+
+Rule H — Per-table isolation; one table's failure must not cancel the Spark session for the rest.
+- Spark cancels the entire session when one statement crashes. If your notebook builds a single chained plan that touches every source table (one big SELECT, one big DataFrame, one big SQL script), any one table's failure kills ALL tables.
+- ALWAYS process source tables in a `for tbl in source_tables:` loop where each iteration is a SELF-CONTAINED unit: read → transform → write → record-result → recover. Wrap the loop body in `try/except` that calls `_save_error(layer, e, table=tbl)` and APPENDS the failure to a results dict, then re-raises only AFTER the loop has attempted all tables (or, if your spec says "fail-fast-first-table", re-raise immediately — but per-table-isolated by default).
+- Do NOT build a single multi-CTE Spark SQL statement that joins/transforms many source tables in one shot. Each table's transform is its own DataFrame chain with its own `.write` call.
+- Do NOT share intermediate temp views across tables. Temp views from one iteration must not be assumed to exist in the next. If you need cross-table joins (typical for Gold), do them in a SECOND loop AFTER all per-table Silver/Gold writes are complete.
+
+Rule I — Optional audit columns on junction / bridge / view tables.
+- In typical operational sources (AdventureWorksLT, Northwind, AdventureWorks2019, etc.), entity tables (Customer, Product, SalesOrderHeader) have system audit columns: `ModifiedDate`, `rowguid`. **Junction / bridge tables** (CustomerAddress, ProductModelProductDescription, SalesTerritoryHistory) typically have only the FK columns and may have NO ModifiedDate and NO rowguid. **Views** (vGetAllCategories, vProductAndDescription) may have whatever columns the underlying query projects — frequently NO audit columns.
+- When you write Silver dedup / tie-break / audit logic, you MUST NOT assume `modified_date` (or any other audit column) exists on every table. Use `'modified_date' in df.columns` as a guard and fall back to:
+  - For dedup: a deterministic ranking expression that uses only the natural-key columns (`row_number().over(Window.partitionBy(*pk_cols).orderBy(*pk_cols))`), OR a literal F.lit(timestamp).
+  - For `source_dt` / `_silver_ts`: a typed null literal (`F.lit(None).cast('timestamp')`) or `F.current_timestamp()`.
+- Junction tables: dedupe on the COMPOSITE FK key (e.g. `(customer_id, address_id, address_type)`) — never on a non-existent surrogate key.
+- View tables: project ONLY the columns actually returned by the view. Do not assume any standard naming.
+
+Rule J — Validate column existence BEFORE the expensive transform.
+- For every join, withColumn, groupBy, agg, or filter that names a specific column, ASSERT the column exists in `df.columns` BEFORE the line that uses it. Pattern:
+  ```
+  for required in ('customer_id', 'order_date'):
+      if required not in df.columns:
+          raise RuntimeError(f"[{layer}] {tbl}: required column '{required}' missing; available={df.columns}")
+  # … now the join / withColumn that uses customer_id and order_date
+  ```
+- Catches missing-column bugs in a SPECIFIC cell with a SPECIFIC table name, instead of a session-wide Spark cancellation 30 minutes later that the auto-fixer can't pinpoint.
+- Especially important AFTER a select(), drop(), or rename() — re-validate before the next consumer of those columns.
+
+Rule K — Resilience to partial output: Bronze MUST write Delta tables that the next layer can discover.
+- The build pipeline runs each layer's notebook then inspects the lakehouse for the layer's output Delta tables before generating the next layer. If Bronze runs "successfully" (Spark Completed) but writes zero discoverable tables under `Tables/bronze/`, the build hard-fails with "prior layer produced no discoverable tables".
+- To guarantee discoverability, the Bronze notebook MUST:
+  - Write via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy(...).save(f"{tgt_base}/Tables/bronze/<flat>")` for every source table, where `<flat>` is the lowercased last segment of `table_relative_path`.
+  - Print a final summary line `print(json.dumps({"bronze_results": {<table>: {"rows": N, "path": ...}, ...}}))` listing every table actually written. Use this as a self-check.
+  - Raise (not just log) if zero tables were written by the end of the notebook.
+- Same rule applies recursively to Silver (`Tables/silver/<table>`) and Gold (`Tables/gold/<table>` + `Tables/test/test_results`).
 
 ## Bronze
 
-Land each source table unchanged into `bronze` with original schema preserved plus:
-- `_ingested_at` timestamp
-- `_run_id`
-- `_source_table`
-- `_bronze_ts`
-
-Write pattern:
-- Delta format
-- Overwrite mode with schema overwrite enabled
-- One table per source entity
-- Partition by ingestion date derived from `_ingested_at`
-
-Mandatory discoverability requirements:
-- Write each table to the target LakeSales Lakehouse physical Tables area using the exact path `Tables/bronze/<table_name>`.
-- Resolve paths against the attached target Lakehouse; do not use relative filesystem locations, local disk, temporary storage, or alternate lakehouses.
-- Do not write Bronze outputs to `Files/`, temporary folders, notebook-local storage, alternative casing, or any path other than the exact locations listed below.
-- Process exactly one source table at a time and persist its completion manifest immediately after validation succeeds.
-- Store the Bronze manifest/checkpoint in a durable Lakehouse location that survives Spark session loss and notebook restarts.
-- Flush and persist manifest updates immediately after each individual table is validated; do not defer manifest creation until notebook completion.
-- On notebook startup, enumerate all expected Bronze table paths and rebuild completion state exclusively from the durable Bronze manifest plus physical Delta validation of existing `Tables/bronze/<table_name>` locations.
-- If a target table already exists, has a `_delta_log`, is readable, and passes validation, mark it complete and continue instead of rewriting it.
-- Immediately after each write, verify:
-  - the target directory exists;
-  - a `_delta_log` directory exists beneath the target directory;
-  - a Delta read from the same path succeeds;
-  - the returned schema is non-empty;
-  - the row count is greater than or equal to zero.
-- Maintain a success list containing only tables that pass all validations above.
-- After a table passes validation, persist a completion record in a Bronze manifest/checkpoint artifact containing table name, path, row count, validation status, and run_id.
-- On restart or rerun, if a table already exists at the expected path and passes all validation checks, treat it as completed and do not require re-ingestion before continuing with remaining tables.
-- At notebook completion, enumerate the contents of `Tables/bronze/` and compare against the expected table list.
-- Perform a fresh self-discovery pass after all writes complete; do not rely on cached filesystem results, manifests, or in-memory success lists.
-- The discovered directories under `Tables/bronze/` must be exactly:
-  - address
-  - customer
-  - customeraddress
-  - product
-  - productcategory
-  - productdescription
-  - productmodel
-  - productmodelproductdescription
-  - salesorderdetail
-  - salesorderheader
-- Assert that all expected Bronze table directories exist and are readable from their exact paths.
-- Rebuild the final success list from physical Delta validation rather than in-memory state so a notebook restart cannot lose progress.
-- Before declaring Bronze successful, assert that the discovered table count under `Tables/bronze/` equals 10.
-- Before declaring Bronze successful, perform a Delta read of every expected path and persist the results in the completion summary.
-- Fail Bronze immediately if the discovered table count is less than 10, even if manifest records indicate success.
-- The completion summary JSON must include: expected_table_count, discovered_table_count, and per-table discoverable=true/false status.
-- If any expected Bronze table is missing, unreadable, lacks a `_delta_log`, or is written to a different path, fail Bronze with a clear error naming the table and expected path.
-- Do not rely solely on metadata registration; physical Delta files under `Tables/bronze/<table_name>` must exist.
-
-Bronze tables:
-- bronze.address → `Tables/bronze/address`
-- bronze.customer → `Tables/bronze/customer`
-- bronze.customeraddress → `Tables/bronze/customeraddress`
-- bronze.product → `Tables/bronze/product`
-- bronze.productcategory → `Tables/bronze/productcategory`
-- bronze.productdescription → `Tables/bronze/productdescription`
-- bronze.productmodel → `Tables/bronze/productmodel`
-- bronze.productmodelproductdescription → `Tables/bronze/productmodelproductdescription`
-- bronze.salesorderdetail → `Tables/bronze/salesorderdetail`
-- bronze.salesorderheader → `Tables/bronze/salesorderheader`
-
-Capture source row counts and write summary JSON at notebook completion. The summary must include the exact Bronze path, validation status, row count for every expected table, discovered-table count, and discoverability status.
+1:1 ingestion of the selected source tables into the `bronze` schema, adding `ingestion_timestamp`, `source_path`, `batch_id`, `ingestion_date` metadata columns. Mode: overwrite + overwriteSchema=true. Partitioned by `ingestion_date`.
 
 ## Silver
 
-Standardize all tables:
-- Convert column names to snake_case.
-- Preserve business keys.
-- Add `_silver_ts`, `_run_id`, `_record_source`.
-- Remove exact duplicates.
-- Apply deterministic deduplication using latest modified_date when available.
-
-Table-specific deduplication keys:
-- silver.address: `address_id`
-- silver.customer: `customer_id`
-- silver.customeraddress: (`customer_id`, `address_id`)
-- silver.product: `product_id`
-- silver.productcategory: `product_category_id`
-- silver.productdescription: `product_description_id`
-- silver.productmodel: `product_model_id`
-- silver.productmodelproductdescription: (`product_model_id`, `product_description_id`, `culture`)
-- silver.salesorderheader: `sales_order_id`
-- silver.salesorderdetail: (`sales_order_id`, `sales_order_detail_id`)
-
-Business transformations:
-- Customer:
-  - Normalize email address casing.
-  - Trim text fields.
-- Product:
-  - Derive `is_discontinued`.
-  - Derive `is_currently_sellable` from sell dates and discontinued status.
-- SalesOrderHeader:
-  - Derive order_year, order_month, order_date_key.
-  - Derive ship_date_key when ship_date exists.
-- ProductModelProductDescription:
-  - Filter English records (`culture = 'en'`) for downstream product dimension use while retaining full silver table.
-
-Optimize and vacuum silver outputs after successful write.
+Dedupe on natural key (per table), snake_case rename, drop fully-null columns, trim strings, add `ingestion_dt` and `source_dt` audit columns plus `_silver_ts` timestamp. Mode: overwrite. After write run OPTIMIZE.
 
 ## Gold
 
-Target star schema requested by user.
+AdventureWorksLT shape:
 
-Dimension: `dim_order_date`
-- Source: SalesOrderHeader.order_date
-- Grain: one row per calendar date.
-
-Dimension: `dim_ship_date`
-- Source: SalesOrderHeader.ship_date.
-- Grain: one row per calendar date.
-
-Dimension: `dim_customer`
-- Source: Customer + Address.
-- User requested bypassing CustomerAddress.
-- NOTE: Customer and Address have no direct key relationship in the supplied schema. A valid customer-address link only exists through CustomerAddress.
-- Implementation recommendation: build dim_customer from Customer only for guaranteed correctness.
-
-Dimension: `dim_salesperson`
-- Source: Customer.sales_person.
-
-Dimension: `dim_order`
-- Source: SalesOrderHeader.
-
-Dimension: `dim_product`
-- Source:
-  - Product
-  - ProductCategory
-  - ProductModel
-  - ProductModelProductDescription (culture='en')
-  - ProductDescription
-
-Fact: `fact_sales_order`
-- Source:
-  - SalesOrderHeader
-  - SalesOrderDetail
-
-Regional-performance requirement:
-- Region data is not explicitly present.
-- Closest available geography is Address.city and postal_code.
+- **Dim_Customer** — join customer + customeraddress + address; keep all relevant fields.
+- **Dim_Product** — join product + productcategory (self-join: subcategory → parent category) + productdescription + productmodel + productmodelproductdescription; expose `category` and `subcategory`.
+- **Dim_Sales** — degenerate dimension on the cleaned salesperson from salesorderheader (strip leading `adventureworks/`, strip trailing digits).
+- **Fact_Sales** — join salesorderdetail + salesorderheader, keep all relevant fields, AND include the cleaned `sales_person` column (same cleaning as Dim_Sales) so reports can aggregate by it.
 
 ## Test
 
-Write all results into:
-- `test/test_results`
+Data quality tests run by the gold notebook AFTER the gold tables are written. Write rows to a `test` schema, table `test_results` with columns (run_id, test_name, layer, table_name, status, actual, expected, details, checked_at). Use APPEND mode so history is preserved. Each test wraps in try/except — failures become `FAIL`/`ERROR` rows, not crashed cells. Run at minimum:
 
-Required tests:
-1. Row count reconciliation
-2. Gold dimension PK not null
-3. Gold dimension PK uniqueness
-4. Referential integrity
-5. Business-rule sanity checks
+1. Row counts per layer (bronze ≈ silver within 1%).
+2. No-null primary keys in gold dims.
+3. Unique primary keys in gold dims.
+4. Referential integrity (every fact_sales FK exists in its dim).
+5. Salesperson cleaning sanity (no `adventureworks/`, no trailing digit).
 
 ## Semantic model
 
-Mode:
-- Direct Lake
-
-Tables:
-- fact_sales_order
-- dim_product
-- dim_customer
-- dim_salesperson
-- dim_order
-- dim_order_date
-- dim_ship_date
-
-Relationships:
-- fact_sales_order ↔ dim_product
-- fact_sales_order ↔ dim_customer
-- fact_sales_order ↔ dim_salesperson
-- fact_sales_order ↔ dim_order
-- fact_sales_order ↔ dim_order_date
-- fact_sales_order ↔ dim_ship_date
+Create a **Direct Lake** semantic model on the gold tables, with:
+- Tables: `dim_customer`, `dim_product`, `dim_sales`, `fact_sales`.
+- Relationships:
+  - `fact_sales[customer_id]` → `dim_customer[customer_id]` (many-to-one)
+  - `fact_sales[product_id]` → `dim_product[product_id]` (many-to-one)
+  - `fact_sales[sales_person]` → `dim_sales[sales_person]` (many-to-one)
+- Explicit measures (PascalCase, with format strings):
+  - `[Total Sales] = SUM(fact_sales[line_total])` — currency
+  - `[Total Discount Amount] = SUMX(fact_sales, fact_sales[line_total] * fact_sales[unit_price_discount])` — currency
+  - `[Discount %] = DIVIDE([Total Discount Amount], [Total Sales])` — percent
+  - `[Distinct Salespersons] = DISTINCTCOUNT(dim_sales[sales_person])`
+  - `[Sales Count] = COUNTROWS(fact_sales)`
+- Mark `fact_sales[order_date]` as a date column so time intelligence works without a separate date dim.
+- Hide all FK columns from the report view.
 
 ## Report
 
-Page 1: Executive Sales Overview
-- KPI cards
-- Monthly sales trend
-- Sales by product category
-- Top products
+Create a Power BI report bound to the semantic model above. Pages:
 
-Page 2: Regional Performance
-- Map visuals
-- City ranking
-- Geographic analysis
-
-Page 3: Orders and Discounts
-- Order trends
-- Salesperson analysis
-- Discount analysis
-
-Page 4: Product Performance
-- Category hierarchy analysis
-- Product profitability
-
-Page 5: Data Quality
-- Test results summary
-- Failed-test details
+1. **Sales overview** — card visuals for `[Total Sales]`, `[Distinct Salespersons]`, `[Sales Count]`; bar chart "Top salespersons by sales" (axis = `dim_sales[sales_person]`, value = `[Total Sales]`, sort desc, top 10); bar chart "Top salespersons by discount given" (axis = `dim_sales[sales_person]`, value = `[Total Discount Amount]`, sort desc, top 10); line chart sales by month.
+2. **Product mix** — matrix of `[Total Sales]` by `dim_product[category]` rows × `dim_product[subcategory]` columns; bar chart top 10 products by `[Total Sales]`.
+3. **Data quality** — table visual showing the latest `test_results` (filter to MAX(run_id)), columns: layer, table_name, test_name, status, actual, expected; conditional formatting on `status` (green=PASS, red=FAIL, amber=ERROR).
 
 ## Data Agent
 
-Role:
-- Sales Performance Intelligence Agent for LakeSales.
+Create a **Data Agent (AISkill)** grounded on the semantic model created above (not on the raw tables), so it answers through curated measures and relationships.
 
-Domain instructions:
-- Answer questions using only the semantic model.
-- Focus on sales performance, order behavior, discount trends, product performance, customer activity, salesperson effectiveness, and geographic analysis.
+**System instructions for the agent:**
 
-Guardrails:
-- Do not invent regions, territories, countries, or states not present in the model.
-- Use only published semantic-model tables and measures.
-- Distinguish clearly between gross sales and net sales.
-- Flag data-quality issues if test results indicate failures.
+> You are a sales analytics assistant for the AdventureWorksLT business. Answer questions about sales performance, salespeople, products, customers, and data quality. Always use the curated semantic-model measures (`Total Sales`, `Total Discount Amount`, `Discount %`, `Distinct Salespersons`, `Sales Count`) and the cleaned `dim_sales[sales_person]` dimension. NEVER aggregate columns directly from `fact_sales` when an equivalent measure exists.
+>
+> When asked "who", return the cleaned salesperson name (no `adventureworks/` prefix, no trailing digit). When asked "how much", format numbers as currency with two decimals. When asked about data quality, query the latest `test_results` (filter to MAX(run_id)) and summarise PASS/FAIL counts per layer and table. If the question cannot be answered from this model, say so clearly and suggest a follow-up. Be concise (3-5 sentences) unless the user asks for a deep dive.
+
+**Domain context to inject:**
+
+- "Salesperson names are stored cleaned in `dim_sales[sales_person]`; the raw value in `salesorderheader[sales_person]` had an `adventureworks/` prefix and a trailing employee-number digit, both stripped."
+- "Discount math: line discount amount = `fact_sales[line_total] * fact_sales[unit_price_discount]`. Use `[Total Discount Amount]` rather than inline math."
+- "There is no separate date dimension — use `fact_sales[order_date]` for time aggregations."
+- "Data quality lives in the `test` schema, table `test_results`, one row per (run_id, test_name)."
+
+**Starter / example questions:**
+
+- "Who are the top 5 salespersons by total sales?"
+- "Which salespersons give the largest discounts (by total discount amount and as % of their sales)?"
+- "How many distinct salespersons are there?"
+- "What is the average order value by salesperson?"
+- "Which products generate the most revenue?"
+- "Which product category drives the most discount give-away?"
+- "Show me sales trend by month over the last year."
+- "What is the latest data quality status? Are any tests failing?"
+
+**Guardrails:**
+
+- Refuse questions outside this dataset (no external lookups, no other businesses).
+- Do not invent column names that aren't in the semantic model — if a metric isn't exposed, propose adding it and stop.
+
