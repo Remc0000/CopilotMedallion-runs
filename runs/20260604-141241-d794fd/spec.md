@@ -12,7 +12,7 @@
   - SalesLT/ProductCategory: yes — may be joined into product enrichment and introduce duplicate attribute names.
   - SalesLT/ProductDescription: yes — participates in product enrichment joins and may introduce overlapping description columns.
   - SalesLT/ProductModel: yes — participates in product enrichment joins and may introduce overlapping model attributes.
-  - SalesLT/ProductModelProductDescription: yes — junction table used in enrichment joins and commonly introduces overlapping keys.
+  - SalesLT/ProductModelProductDescription: yes — junction table used in product enrichments and commonly introduces overlapping keys.
   - SalesLT/SalesOrderDetail: no — not part of the specified enrichment views in Silver.
   - SalesLT/SalesOrderHeader: no — not part of the specified enrichment views in Silver.
 - **Fix approach**: GENERALIZE — the risk is systemic across multiple Silver enrichment joins, so a single defensive join-and-projection rule should be applied to all Silver enrichment datasets.
@@ -20,6 +20,25 @@
   - Added explicit Silver join rules requiring table aliases and fully qualified join keys.
   - Added a post-join projection requirement to eliminate duplicate column names before writing Silver outputs.
   - Added validation that all declared business keys exist after snake_case conversion before deduplication logic runs.
+
+### Iteration 2 — 2026-06-04 14:22:55Z — failed layer: reporting (run: 20260604-141241-d794fd)
+- **Root cause (1-line summary)**: Reporting-layer Spark session was cancelled after one or more reporting artifacts failed to build, likely due to assumptions that required Gold tables, relationship keys, or report fields existed without validation.
+- **Cross-table audit**:
+  - SalesLT/Address: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/Customer: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/CustomerAddress: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/Product: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/ProductCategory: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/ProductDescription: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/ProductModel: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/ProductModelProductDescription: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/SalesOrderDetail: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+  - SalesLT/SalesOrderHeader: no — source ingestion is upstream and already succeeded; reporting only consumes Gold outputs derived from it.
+- **Fix approach**: GENERALIZE — the risk applies uniformly to all semantic-model tables, relationships, measures, and report visuals, so reporting should validate dependencies before creating artifacts.
+- **What was changed**:
+  - Added semantic-model pre-validation requirements for all required Gold tables and relationship columns.
+  - Restricted relationship and measure creation to verified existing columns only.
+  - Added report-build rules requiring visuals to use validated semantic-model fields and to skip unsupported visuals gracefully.
 
 ## Inputs
 - Workspace: `ad938c56-0933-47f8-9f87-c862248e89e7`
@@ -56,6 +75,11 @@ For all Silver and downstream joins:
 - Never write a joined DataFrame containing duplicate column names.
 - Immediately after every join, project a curated column list with unique output column names.
 - After snake_case conversion and before deduplication, validate that each table's declared business key columns are present; fail fast with a descriptive error if a required key is missing.
+
+For reporting artifact generation:
+- Validate existence of every referenced table, column, hierarchy level, relationship key, and measure dependency before creating semantic-model or report objects.
+- Create relationships, measures, hierarchies, and visuals only from verified existing fields.
+- If an optional field is unavailable in the semantic model, omit the dependent artifact rather than failing the reporting build.
 
 ## Bronze
 
@@ -328,6 +352,18 @@ Standard tests:
 Mode:
 - Direct Lake
 
+Pre-build validation:
+- Confirm the following tables exist before semantic-model creation:
+  - fact_sales_order_line
+  - fact_sales_order_header
+  - dim_customer
+  - dim_product
+  - dim_product_category
+  - dim_address
+  - dim_date
+- Confirm every relationship column referenced below exists in both source and target tables before creating the relationship.
+- Create only validated relationships; do not reference inferred or renamed columns.
+
 Tables:
 - fact_sales_order_line
 - fact_sales_order_header
@@ -347,6 +383,7 @@ Relationships:
 - fact_sales_order_header.customer_id → dim_customer.customer_id
 
 Explicit measures:
+- Create each measure only if all referenced columns exist.
 - Total Sales = SUM(net_line_sales)
 - Gross Sales = SUM(line_sales_amount)
 - Total Discount Amount = SUM(line_discount_amount)
@@ -363,6 +400,12 @@ Hierarchies:
 - Geography: City → Postal Code
 
 ## Report
+
+Report generation rules:
+- Build visuals only from fields verified to exist in the semantic model.
+- Validate every visual field binding before creation.
+- If a required field for a visual is unavailable, skip that visual and continue building the remainder of the report.
+- Do not reference columns directly from lakehouse tables; use semantic-model fields only.
 
 Page 1: Sales Overview
 - KPI cards:
