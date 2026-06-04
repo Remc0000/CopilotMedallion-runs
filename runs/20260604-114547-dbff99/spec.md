@@ -11,6 +11,15 @@
   - Added mandatory post-write validation that each written table is discoverable and registered in the Bronze output inventory.
   - Added a hard failure if any expected Bronze table is missing or if fewer than 10 Bronze tables are discoverable.
 
+### Iteration 2 — 2026-06-04 11:57:45Z — failed layer: bronze (run: 20260604-114547-dbff99)
+- **Root cause (1-line summary)**: Build was interrupted by a server restart mid-execution, requiring Bronze processing to be safely resumable and idempotent.
+- **Cross-table audit**: Address: yes — interruption can occur during write; Customer: yes — interruption can occur during write; CustomerAddress: yes — interruption can occur during write; Product: yes — interruption can occur during write; ProductCategory: yes — interruption can occur during write; ProductDescription: yes — interruption can occur during write; ProductModel: yes — interruption can occur during write; ProductModelProductDescription: yes — interruption can occur during write; SalesOrderDetail: yes — interruption can occur during write; SalesOrderHeader: yes — interruption can occur during write.
+- **Fix approach**: GENERALIZE — restart resilience must apply uniformly to every Bronze table.
+- **What was changed**:
+  - Added per-table independent processing and checkpoint-style validation so a restart does not invalidate already completed tables.
+  - Required Bronze to re-check existing outputs before rewriting and only consider a table complete after successful read-back validation.
+  - Added final inventory reconciliation to ensure all 10 expected Bronze tables exist after a resumed run.
+
 ## Inputs
 - Workspace: `1f02de75-3d95-4694-b090-c7cecaae69bf`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -50,6 +59,7 @@ Cross-cutting code rules:
 - Process source tables independently; avoid session-wide dependency chains.
 - Every notebook code cell must begin with a short explanatory comment block.
 - A layer is not considered successful until its expected output tables are physically discoverable in the target lakehouse location and can be enumerated by the next layer.
+- All layers must tolerate notebook interruption or cluster restart by re-validating existing outputs when execution resumes.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 Keep all existing Rules A–K exactly as currently specified.
@@ -69,13 +79,17 @@ For every table:
 - Write as Delta using overwrite mode with overwriteSchema=true.
 - Partition by ingestion date derived from `_ingested_at`.
 - The physical Delta output location MUST be discoverable under `Tables/bronze/<table_name_lower>`.
+- Process each source table independently so a restart or failure in one table does not invalidate completed tables.
+- At the start of processing a table, check whether `Tables/bronze/<table_name_lower>` already exists and is readable as Delta.
+- If an existing output passes read-back validation, it may be overwritten idempotently; do not assume prior notebook state exists.
 - Immediately after each write, validate:
   - the Delta path exists;
   - the table can be read back successfully;
   - row count is greater than zero unless the source table itself is empty.
 - Record the successfully written table name in a Bronze output inventory.
 - If any expected Bronze table is not discoverable after write, fail Bronze with an explicit error naming the missing table.
-- Before Bronze completes, assert that all 10 expected Bronze tables listed below are discoverable. Do not report Bronze success if fewer than 10 tables are available.
+- Before Bronze completes, rebuild or re-read the Bronze output inventory from the physical lakehouse paths and assert that all 10 expected Bronze tables listed below are discoverable.
+- Do not report Bronze success if fewer than 10 tables are available.
 
 Bronze tables:
 - bronze.address
