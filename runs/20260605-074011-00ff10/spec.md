@@ -135,6 +135,25 @@
   - Added mandatory verification of current catalog/database before and after every write.
   - Added a final hard-fail condition if `SHOW TABLES IN bronze` returns anything other than the 10 expected table names.
 
+### Iteration 4 — 2026-06-05 08:14:23Z — failed layer: bronze (run: 20260605-074011-00ff10)
+- **Root cause (1-line summary)**: Downstream validation still reported no discoverable tables in `Tables/bronze/`, indicating Bronze catalog objects may exist but are not materialized as physical managed lakehouse tables under the Bronze schema path expected by discovery.
+- **Cross-table audit**:
+  - Address: yes — discoverability depends on managed table materialization.
+  - Customer: yes — discoverability depends on managed table materialization.
+  - CustomerAddress: yes — discoverability depends on managed table materialization.
+  - Product: yes — discoverability depends on managed table materialization.
+  - ProductCategory: yes — discoverability depends on managed table materialization.
+  - ProductDescription: yes — discoverability depends on managed table materialization.
+  - ProductModel: yes — discoverability depends on managed table materialization.
+  - ProductModelProductDescription: yes — discoverability depends on managed table materialization.
+  - SalesOrderDetail: yes — discoverability depends on managed table materialization.
+  - SalesOrderHeader: yes — discoverability depends on managed table materialization.
+- **Fix approach**: GENERALIZE — the same physical-materialization requirement applies uniformly to all Bronze tables.
+- **What was changed**:
+  - Tightened Bronze requirements to require creation and validation of physical managed Delta tables under the lakehouse Bronze schema for all 10 tables.
+  - Added mandatory validation using table detail metadata to confirm table type is MANAGED and location resolves under the target lakehouse Tables area.
+  - Added a hard-fail condition if any table location, type, or schema metadata does not match the expected Bronze managed-table pattern.
+
 ## Inputs
 - Workspace: `373889eb-1531-49df-9b0c-474976350c90`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -223,6 +242,8 @@ Mandatory write/discovery requirements:
   - `option('overwriteSchema','true')`
   - `saveAsTable('bronze.<exact_target_name>')`
 - Tables must be managed lakehouse tables materialized under the target lakehouse Tables area and discoverable as Bronze schema objects. Do not create temporary views, external-only registrations, shortcuts, or catalog entries without persisted Delta data.
+- The table location reported by table-detail metadata must resolve to the target lakehouse managed storage and must contain the segment `/Tables/bronze/`.
+- The table type reported by metadata must be `MANAGED` (or Fabric-equivalent managed-table designation). Any external table designation is a failure.
 - Do not create nested names such as:
   - `bronze.SalesLT_Address`
   - `bronze.saleslt.address`
@@ -237,6 +258,7 @@ Mandatory write/discovery requirements:
   - capture row count in results output.
   - verify the table provider is Delta and the table is not temporary.
   - verify table metadata identifies schema `bronze` and a managed table type.
+  - verify table-detail metadata returns a non-null physical location containing `/Tables/bronze/`.
   - verify the table name appears in `SHOW TABLES IN bronze` before continuing to the next table.
   - raise a RuntimeError immediately if any validation fails.
 - Maintain an execution manifest containing:
@@ -263,9 +285,10 @@ Mandatory write/discovery requirements:
   - verify all 10 expected names are returned by `SHOW TABLES IN bronze`; count must equal exactly 10.
   - verify the Bronze schema contains 10 persisted managed tables and not views.
   - verify no expected table is missing from catalog enumeration results for schema `bronze`.
+  - verify every table-detail record reports a managed table with a location under `/Tables/bronze/`.
   - raise a RuntimeError if any expected table is missing or unreadable.
 - Print a final JSON summary containing all 10 table names and row counts.
-- Do not mark Bronze successful unless all 10 tables are discoverable, queryable through the Spark catalog, and present in the execution manifest with successful validation status.
+- Do not mark Bronze successful unless all 10 tables are discoverable, queryable through the Spark catalog, physically materialized as managed lakehouse tables under `/Tables/bronze/`, and present in the execution manifest with successful validation status.
 
 ## Silver
 
