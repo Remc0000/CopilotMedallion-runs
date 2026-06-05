@@ -97,6 +97,25 @@
   - Required per-table read, count, write, and read-back validation with explicit RuntimeError generation on any failure.
   - Added a Bronze execution manifest requiring all 10 tables to be successfully processed and recorded before notebook success.
 
+### Iteration 2 — 2026-06-05 08:04:59Z — failed layer: bronze (run: 20260605-074011-00ff10)
+- **Root cause (1-line summary)**: Bronze Spark statements failed before completion, most likely due to invalid source table resolution; the spec did not require exact source object names and schema validation before ingestion.
+- **Cross-table audit**:
+  - Address: yes — source must resolve exactly as `SalesLT.Address`.
+  - Customer: yes — source must resolve exactly as `SalesLT.Customer`.
+  - CustomerAddress: yes — source must resolve exactly as `SalesLT.CustomerAddress`.
+  - Product: yes — source must resolve exactly as `SalesLT.Product`.
+  - ProductCategory: yes — source must resolve exactly as `SalesLT.ProductCategory`.
+  - ProductDescription: yes — source must resolve exactly as `SalesLT.ProductDescription`.
+  - ProductModel: yes — source must resolve exactly as `SalesLT.ProductModel`.
+  - ProductModelProductDescription: yes — source must resolve exactly as `SalesLT.ProductModelProductDescription`.
+  - SalesOrderDetail: yes — source must resolve exactly as `SalesLT.SalesOrderDetail`.
+  - SalesOrderHeader: yes — source must resolve exactly as `SalesLT.SalesOrderHeader`.
+- **Fix approach**: GENERALIZE — every Bronze ingestion depends on the same source-table resolution and schema validation process.
+- **What was changed**:
+  - Added mandatory exact source-table name mapping and source schema verification before any write.
+  - Required successful catalog existence checks and schema introspection for all 10 source tables.
+  - Added a hard-fail condition if any expected source table cannot be resolved exactly as specified.
+
 ## Inputs
 - Workspace: `373889eb-1531-49df-9b0c-474976350c90`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -141,16 +160,16 @@ Cross-cutting code rules:
 ## Bronze
 
 - Land each source table 1:1 into the `bronze` schema using the exact mapping below:
-  - `SalesLT/Address` → `bronze.address`
-  - `SalesLT/Customer` → `bronze.customer`
-  - `SalesLT/CustomerAddress` → `bronze.customeraddress`
-  - `SalesLT/Product` → `bronze.product`
-  - `SalesLT/ProductCategory` → `bronze.productcategory`
-  - `SalesLT/ProductDescription` → `bronze.productdescription`
-  - `SalesLT/ProductModel` → `bronze.productmodel`
-  - `SalesLT/ProductModelProductDescription` → `bronze.productmodelproductdescription`
-  - `SalesLT/SalesOrderDetail` → `bronze.salesorderdetail`
-  - `SalesLT/SalesOrderHeader` → `bronze.salesorderheader`
+  - `SalesLT.Address` → `bronze.address`
+  - `SalesLT.Customer` → `bronze.customer`
+  - `SalesLT.CustomerAddress` → `bronze.customeraddress`
+  - `SalesLT.Product` → `bronze.product`
+  - `SalesLT.ProductCategory` → `bronze.productcategory`
+  - `SalesLT.ProductDescription` → `bronze.productdescription`
+  - `SalesLT.ProductModel` → `bronze.productmodel`
+  - `SalesLT.ProductModelProductDescription` → `bronze.productmodelproductdescription`
+  - `SalesLT.SalesOrderDetail` → `bronze.salesorderdetail`
+  - `SalesLT.SalesOrderHeader` → `bronze.salesorderheader`
 - Preserve source schema and datatypes.
 - Add ingestion metadata:
   - `_run_id`
@@ -169,9 +188,13 @@ Mandatory pre-flight validation:
 - Attach and use the target lakehouse **o** before creating tables.
 - Verify the active/default lakehouse is **o** immediately before the first Bronze write; abort the notebook if verification fails.
 - Before processing each source table:
-  - verify the source table exists and is readable.
+  - verify the exact source object exists using the fully qualified name shown in the mapping above.
+  - verify the source table is readable with `spark.read.table(...)`.
   - execute a row count on the source dataframe.
-  - raise a RuntimeError immediately if the source read fails or returns an invalid dataframe object.
+  - execute schema introspection and record column names.
+  - raise a RuntimeError immediately if the source read fails, the table cannot be resolved, or the dataframe schema is empty.
+  - do not continue to the next table after a failed validation.
+- Process Bronze tables sequentially in the exact order listed in the mapping above.
 
 Mandatory write/discovery requirements:
 - For every source table, write exactly one managed Delta table using:
