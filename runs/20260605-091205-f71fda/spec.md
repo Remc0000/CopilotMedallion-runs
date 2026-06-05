@@ -21,6 +21,25 @@
   - Added mandatory schema validation before joins, projections, and key generation.
   - Explicitly prohibited references to unavailable columns such as product_model.name and category name fields.
 
+### Iteration 2 — 2026-06-05 09:25:28Z — failed layer: reporting (run: 20260605-091205-f71fda)
+- **Root cause (1-line summary)**: Reporting stage failed with a session-cancelled error; most likely caused by semantic-model or report generation referencing expected gold columns, keys, or relationships that were not validated before publishing.
+- **Cross-table audit**:
+  - Address: no — not directly referenced by reporting artifacts; consumed through gold dimensions.
+  - Customer: no — not directly referenced by reporting artifacts; consumed through gold dimensions.
+  - CustomerAddress: no — not used by reporting artifacts.
+  - Product: no — not directly referenced by reporting artifacts; consumed through gold dimensions.
+  - ProductCategory: no — not directly referenced by reporting artifacts; consumed through gold dimensions.
+  - ProductDescription: no — not directly referenced by reporting artifacts; consumed through gold dimensions.
+  - ProductModel: no — not directly referenced by reporting artifacts; consumed through gold dimensions.
+  - ProductModelProductDescription: no — not directly referenced by reporting artifacts; consumed through gold dimensions.
+  - SalesOrderDetail: no — not directly referenced by reporting artifacts; consumed through gold fact tables.
+  - SalesOrderHeader: no — not directly referenced by reporting artifacts; consumed through gold dimensions and facts.
+- **Fix approach**: GENERALIZE — reporting consumes all published gold tables through a common semantic-model contract, so a single validation rule should be applied to every required reporting object.
+- **What was changed**:
+  - Tightened Semantic model requirements with mandatory pre-publication table, column, and relationship validation.
+  - Added explicit relationship keys and required-column contracts.
+  - Added report-generation guards requiring graceful failure with named missing tables/columns instead of unresolved Spark statements.
+
 ## Inputs
 - Workspace: `423348df-cb05-4fa0-bb36-72cf92932692`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -46,7 +65,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules:
 - Use defensive column references and validate required columns before every transformation.
@@ -348,6 +367,21 @@ Required tests:
 Mode:
 - Direct Lake
 
+Pre-publication validation requirements:
+- Before creating or updating the semantic model, verify that all required gold tables exist:
+  - dim_order_date
+  - dim_ship_date
+  - dim_customer
+  - dim_salesperson
+  - dim_order
+  - dim_product
+  - fact_sales_order
+- Fail fast with a clear error naming any missing table.
+- Verify required relationship columns exist before relationship creation.
+- Do not attempt to create inferred relationships.
+- Create relationships only using the explicit key pairs listed below.
+- Validate that each referenced key column exists in both source and target tables before publishing the model.
+
 Model tables:
 - dim_order_date
 - dim_ship_date
@@ -358,16 +392,23 @@ Model tables:
 - fact_sales_order
 
 Relationships:
-- fact_sales_order → dim_order_date
-- fact_sales_order → dim_ship_date
-- fact_sales_order → dim_customer
-- fact_sales_order → dim_salesperson
-- fact_sales_order → dim_order
-- fact_sales_order → dim_product
+- fact_sales_order.order_date_key → dim_order_date.date_key
+- fact_sales_order.ship_date_key → dim_ship_date.ship_date_key
+- fact_sales_order.customer_key → dim_customer.customer_key
+- fact_sales_order.salesperson_key → dim_salesperson.salesperson_key
+- fact_sales_order.order_key → dim_order.order_key
+- fact_sales_order.product_key → dim_product.product_key
 
 Hierarchies, measures, and relationships remain as specified.
 
 ## Report
+
+Reporting guardrails:
+- Build reports only after semantic-model validation succeeds.
+- Validate that every visual field exists in the semantic model before adding it to a visual.
+- If a required table, measure, hierarchy, or column is missing, fail with an explicit object name rather than continuing.
+- Do not reference source, bronze, silver, or intermediate gold columns that are not exposed in the semantic model.
+- Use only validated semantic-model objects.
 
 All report requirements remain as specified.
 
