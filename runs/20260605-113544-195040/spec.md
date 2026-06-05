@@ -78,6 +78,25 @@
   - Tightened Gold requirements to require schema-defined result tracking tables and typed test records.
   - Tightened Test requirements by defining required columns and prohibiting schema inference when writing `test.test_results`.
 
+### Iteration 4 — 2026-06-05 12:03:36Z — failed layer: reporting (run: 20260605-113544-195040)
+- **Root cause (1-line summary)**: Reporting failed with `AttributeError: 'NoneType' object has no attribute 'get'` because semantic-model creation code called `resp.json().get('id')` without validating that `resp.json()` returned a dictionary.
+- **Cross-table audit**:
+  - Address: no — failure occurred in Fabric REST response handling, not table data.
+  - Customer: no — failure occurred in Fabric REST response handling, not table data.
+  - CustomerAddress: no — failure occurred in Fabric REST response handling, not table data.
+  - Product: no — failure occurred in Fabric REST response handling, not table data.
+  - ProductCategory: no — failure occurred in Fabric REST response handling, not table data.
+  - ProductDescription: no — failure occurred in Fabric REST response handling, not table data.
+  - ProductModel: no — failure occurred in Fabric REST response handling, not table data.
+  - ProductModelProductDescription: no — failure occurred in Fabric REST response handling, not table data.
+  - SalesOrderDetail: no — failure occurred in Fabric REST response handling, not table data.
+  - SalesOrderHeader: no — failure occurred in Fabric REST response handling, not table data.
+- **Fix approach**: GENERALIZE — the same REST-response issue can affect semantic model, report, and data agent creation; all reporting API responses must be validated before field access.
+- **What was changed**:
+  - Tightened Generic guidance to require validation of response status, response body, and JSON type before any key access.
+  - Strengthened Semantic model requirements to require explicit validation of creation responses and presence of a non-null semantic-model identifier before continuing.
+  - Strengthened Report and Data Agent requirements to prohibit direct `.json().get(...)` access and require descriptive failures when response payloads are missing or malformed.
+
 ## Inputs
 - Workspace: `58810d23-9208-474f-899f-119dbfc70bd3`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -110,6 +129,8 @@ Cross-cutting code rules:
 - Alias-qualify all join projections and explicitly rename overlapping columns immediately after joins.
 - Assert column existence before every groupBy/agg operation.
 - Use defensive REST handling: `if x is None: raise RuntimeError(...)` before any `.get()` access.
+- For every REST/API response used in reporting artifacts, validate HTTP status, validate that `resp.json()` is not `None`, validate that the JSON payload is a dictionary/object, and only then access keys such as `id`, `value`, `name`, or `displayName`.
+- Direct patterns such as `resp.json().get(...)` are prohibited unless the JSON payload has already been validated and assigned to a non-null dictionary variable.
 - Always create schemas (`bronze`, `silver`, `gold`, `test`) before writes.
 - Use schema-qualified writes via `saveAsTable('<schema>.<table>')`.
 - Never write target outputs via raw abfss `.save()` paths on the schema-enabled lakehouse.
@@ -173,6 +194,9 @@ Build requirements:
 - Required tables: gold.fact_sales_order, gold.dim_customer, gold.dim_product, gold.dim_salesperson, gold.dim_order, gold.dim_order_date, gold.dim_ship_date.
 - Validate every semantic-model table, column, hierarchy level, relationship endpoint, and measure expression against the actual Gold schema before publication.
 - Create the semantic model in its own isolated step with dedicated error handling and result logging.
+- After every semantic-model REST/API call, validate that the response body exists and that the parsed JSON payload is a non-null dictionary before reading any fields.
+- Require a non-null semantic model identifier from the validated response payload. If the identifier is absent, stop semantic-model publication and raise a descriptive error containing HTTP status, response text, and validation details.
+- Do not access semantic model identifiers using unguarded expressions such as `resp.json().get('id')`.
 - After publication, validate that all configured tables, relationships, hierarchies, and measures exist before marking the semantic model as successful.
 - Do not publish a partial semantic model. If validation fails, log the specific missing dependency and mark semantic-model creation as failed without attempting deployment.
 
@@ -183,6 +207,7 @@ Build requirements:
 - Generate each report page independently and record page-level success/failure.
 - Validate that every visual references an existing semantic-model table, column, hierarchy, or measure before publishing.
 - Validate all report dependencies page-by-page before visual creation; unsupported visuals must be skipped with explicit logging rather than causing report-build cancellation.
+- For all report-creation REST/API calls, validate response status and payload shape before reading identifiers or metadata. Missing or null JSON payloads must produce descriptive validation errors.
 - After report publication, verify the report is discoverable and bound to the intended semantic model.
 
 ### Page 1 — Executive Sales Overview
@@ -236,6 +261,7 @@ Build requirements:
 - Validate the agent is bound to the published semantic model before completion.
 - Record agent creation success/failure independently from semantic model and report outcomes.
 - Validate all referenced measures, hierarchies, and tables against the published semantic model before agent publication.
+- For all data-agent REST/API calls, validate response status, payload existence, payload type, and required identifiers before accessing response fields.
 - Do not publish the agent if semantic-model validation reports unresolved dependencies.
 
 Domain knowledge:
