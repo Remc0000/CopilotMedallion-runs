@@ -21,6 +21,25 @@
   - Added required column-presence validation before every gold dimension/fact build.
   - Defined canonical source tables and join keys for each gold object to prevent implicit column resolution.
 
+### Iteration 2 — 2026-06-05 08:43:34Z — failed layer: reporting (run: 20260605-083107-a698ce)
+- **Root cause (1-line summary)**: Reporting layer session was cancelled after one or more semantic-model/report statements referenced missing tables, columns, hierarchies, relationships, or measures that were not successfully materialized in Gold.
+- **Cross-table audit**:
+  - Address: no — not referenced directly by reporting artifacts.
+  - Customer: no — reporting consumes dim_customer rather than the source table.
+  - CustomerAddress: no — not exposed directly to reporting.
+  - Product: no — reporting consumes dim_product rather than the source table.
+  - ProductCategory: no — reporting consumes dim_product hierarchy rather than the source table.
+  - ProductDescription: no — reporting consumes dim_product attributes rather than the source table.
+  - ProductModel: no — reporting consumes dim_product attributes rather than the source table.
+  - ProductModelProductDescription: no — reporting consumes dim_product attributes rather than the source table.
+  - SalesOrderDetail: no — reporting consumes fact_sales_order rather than the source table.
+  - SalesOrderHeader: no — reporting consumes gold dimensions/facts rather than the source table.
+- **Fix approach**: GENERALIZE — the root cause is reporting metadata referencing unavailable Gold objects; the same validation pattern applies to every semantic-model table, relationship, hierarchy, measure, and report visual.
+- **What was changed**:
+  - Tightened Semantic model requirements to validate table and column existence before creating relationships, hierarchies, and measures.
+  - Added mandatory conditional creation rules so reporting artifacts only reference validated Gold objects.
+  - Required reporting notebooks to fail with explicit missing-object diagnostics instead of allowing session-wide cancellation.
+
 ## Inputs
 - Workspace: `1aec2347-3511-4e15-91d0-aeda945b41d8`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -46,7 +65,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules:
 - Use defensive column existence validation before every join, filter, aggregation, withColumn, Window specification, and write.
@@ -437,6 +456,20 @@ Required tests:
 Mode:
 - Direct Lake
 
+Pre-deployment validation (mandatory):
+- Before creating the semantic model, verify that all referenced Gold tables physically exist:
+  - gold.dim_order_date
+  - gold.dim_ship_date
+  - gold.dim_customer
+  - gold.dim_salesperson
+  - gold.dim_order
+  - gold.dim_product
+  - gold.fact_sales_order
+- For every relationship, hierarchy, measure, and report dependency, validate that the referenced table and column exist in the Gold schema before creation.
+- Create relationships only after validating both sides of the key.
+- Fail with an explicit error naming the missing table or column; do not continue with a partially resolved relationship definition.
+- Build semantic-model objects independently so one failed measure, hierarchy, or relationship does not cancel the entire reporting session.
+
 Tables:
 - dim_order_date
 - dim_ship_date
@@ -447,12 +480,12 @@ Tables:
 - fact_sales_order
 
 Relationships:
-- fact_sales_order → dim_customer
-- fact_sales_order → dim_product
-- fact_sales_order → dim_salesperson
-- fact_sales_order → dim_order
-- fact_sales_order → dim_order_date
-- fact_sales_order → dim_ship_date
+- fact_sales_order.customer_id → dim_customer.customer_id
+- fact_sales_order.product_id → dim_product.product_id
+- fact_sales_order.salesperson_key → dim_salesperson.salesperson_key
+- fact_sales_order.order_dim_key → dim_order.sales_order_id
+- fact_sales_order.order_date_key → dim_order_date.date_key
+- fact_sales_order.ship_date_key → dim_ship_date.date_key
 
 Hierarchies
 
@@ -501,6 +534,12 @@ Geography Measures
 - Maximum Sales by City
 
 ## Report
+
+Reporting build safety rules:
+- Validate every semantic-model table, relationship, hierarchy, and measure exists before binding visuals.
+- Do not create a visual that references a missing field.
+- Generate pages independently; capture page-level failures and continue validating remaining pages.
+- Fail with explicit diagnostics identifying the missing semantic-model object instead of allowing a session-wide cancellation.
 
 Page 1 — Executive Sales Overview
 - KPI cards:
