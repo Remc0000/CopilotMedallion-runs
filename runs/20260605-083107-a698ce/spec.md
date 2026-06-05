@@ -1,5 +1,26 @@
 # Run Spec 20260605-083031-0b36b8
 
+## Updated specs
+
+### Iteration 1 — 2026-06-05 08:39:13Z — failed layer: gold (run: 20260605-083107-a698ce)
+- **Root cause (1-line summary)**: Gold-layer build terminated with a session-cancelled error after one or more gold statements failed; the most likely preventable cause is unresolved/ambiguous columns during multi-table dimension and fact joins.
+- **Cross-table audit**:
+  - Address: yes — contributes city/postal_code attributes that can collide after joins.
+  - Customer: yes — contributes customer_id and salesperson fields used in multiple gold objects.
+  - CustomerAddress: yes — bridge-table keys can create duplicate customer/address column references if joined.
+  - Product: yes — product_id joins to several product-related tables.
+  - ProductCategory: yes — parent/child category identifiers are prone to ambiguous naming in self-referencing joins.
+  - ProductDescription: yes — description attributes are joined through ProductModelProductDescription.
+  - ProductModel: yes — product_model_id participates in chained joins.
+  - ProductModelProductDescription: yes — bridge-table columns and culture filter are commonly referenced after projections.
+  - SalesOrderDetail: yes — sales_order_id and product_id overlap with other gold sources.
+  - SalesOrderHeader: yes — sales_order_id, customer_id, address keys, and date keys overlap with joined tables.
+- **Fix approach**: GENERALIZE — the failure signature does not identify a single table; all gold dimensions and facts rely on multi-table joins and can encounter the same unresolved/ambiguous-column pattern.
+- **What was changed**:
+  - Tightened Gold join rules to require alias-qualified joins followed by immediate projection to canonical column names.
+  - Added required column-presence validation before every gold dimension/fact build.
+  - Defined canonical source tables and join keys for each gold object to prevent implicit column resolution.
+
 ## Inputs
 - Workspace: `1aec2347-3511-4e15-91d0-aeda945b41d8`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -200,11 +221,20 @@ productmodelproductdescription
 
 Target star schema optimized for Direct Lake reporting.
 
+Gold build safety rules (mandatory for every dimension and fact):
+- Read only from silver tables.
+- Before constructing each gold object, assert all required source columns exist and raise a descriptive error naming the missing column and source table.
+- Every join must use explicit DataFrame aliases and explicit join predicates; never rely on implicit column matching or NATURAL joins.
+- Immediately after each join, project required columns into canonical flat names. No downstream transformation may reference alias-qualified columns.
+- If multiple joined tables contain the same column name (for example: customer_id, product_id, sales_order_id, product_model_id, product_category_id), select the desired source explicitly and rename during the projection step.
+- Build and write each gold table independently so one failed gold object does not prevent diagnostics for the remaining objects.
+
 Dimensions
 
 1. gold.dim_order_date
-- Source: salesorderheader.order_date
+- Source: silver.salesorderheader.order_date
 - Grain: one row per calendar date.
+- Required source column: order_date.
 - Attributes:
   - date_key
   - full_date
@@ -218,15 +248,23 @@ Dimensions
   - Year → Quarter → Month → Date
 
 2. gold.dim_ship_date
-- Source: salesorderheader.ship_date
+- Source: silver.salesorderheader.ship_date
 - Grain: one row per ship date.
+- Required source column: ship_date.
 - Attributes similar to Order Date.
 - Hierarchy:
   - Year → Quarter → Month → Date
 
 3. gold.dim_customer
 - User requirement: combine Customer and Address without using CustomerAddress.
-- Because Customer has no AddressID and Address has no CustomerID, there is no direct relationship available between the two tables.
+- Source tables:
+  - silver.customer
+  - silver.salesorderheader
+  - silver.address
+- Join path:
+  - customer.customer_id = salesorderheader.customer_id
+  - salesorderheader.ship_to_address_id = address.address_id
+- Because Customer has no AddressID and Address has no CustomerID, do not attempt a direct customer ↔ address join.
 - Gold implementation:
   - Primary customer attributes from Customer:
     - customer_id
@@ -242,7 +280,9 @@ Dimensions
   - The actual schema indicates CustomerAddress is the true bridge. Excluding it may create incomplete customer-address attribution. Current build follows user instruction.
 
 4. gold.dim_salesperson
-- Source: customer.sales_person
+- Source: silver.customer.cleaned_salesperson_source.
+- Required source column:
+  - cleaned_salesperson_source
 - Distinct salesperson values.
 - Transform:
   - If value contains `\`, keep username portion.
@@ -255,7 +295,9 @@ Dimensions
   - Single-level dimension.
 
 5. gold.dim_order
-- Source: salesorderheader
+- Source: silver.salesorderheader
+- Required source column:
+  - sales_order_id
 - Grain: sales_order_id
 - Attributes:
   - sales_order_id
@@ -270,12 +312,17 @@ Dimensions
 
 6. gold.dim_product
 - Source:
-  - product
-  - productcategory
-  - productmodel
-  - productmodelproductdescription
-  - productdescription
-- Filter ProductModelProductDescription to culture='en'.
+  - silver.product
+  - silver.productcategory
+  - silver.productmodel
+  - silver.productmodelproductdescription
+  - silver.productdescription
+- Join keys:
+  - product.product_model_id = productmodel.product_model_id
+  - productmodel.product_model_id = productmodelproductdescription.product_model_id
+  - productmodelproductdescription.product_description_id = productdescription.product_description_id
+  - product.parent_product_category_id / product_category_id references must be projected into uniquely named category fields before downstream use.
+- Filter ProductModelProductDescription to culture='en' before joining.
 - Build category hierarchy:
   - category
   - subcategory
@@ -304,7 +351,16 @@ Facts
 gold.fact_sales_order
 - Grain: one order line.
 - Source:
-  - salesorderheader joined to salesorderdetail
+  - silver.salesorderheader joined to silver.salesorderdetail
+- Required join:
+  - salesorderheader.sales_order_id = salesorderdetail.sales_order_id
+- Required columns before build:
+  - sales_order_id
+  - sales_order_detail_id
+  - customer_id
+  - product_id
+  - order_date_key
+- After the header/detail join, immediately project canonical columns and do not reference aliased header/detail column names later in the pipeline.
 - Keys:
   - sales_order_id
   - sales_order_detail_id
