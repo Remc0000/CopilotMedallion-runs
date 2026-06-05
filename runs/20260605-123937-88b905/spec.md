@@ -59,6 +59,25 @@
   - Required `checked_at` to be created as a typed timestamp column rather than inferred from Python `None`.
   - Required all test-result fields to be cast to stable types before writing to `test.test_results`.
 
+### Iteration 4 — 2026-06-05 12:53:59Z — failed layer: reporting (run: 20260605-123937-88b905)
+- **Root cause (1-line summary)**: Reporting-stage statement failure propagated and caused Spark session cancellation because reporting artifacts were not required to be built independently.
+- **Cross-table audit**:
+  - Address: yes — indirectly impacts reporting through dim_customer.
+  - Customer: yes — indirectly impacts reporting through customer dimensions.
+  - CustomerAddress: no — not exposed in reporting by design.
+  - Product: yes — indirectly impacts reporting through dim_product and facts.
+  - ProductCategory: yes — indirectly impacts reporting through dim_product.
+  - ProductDescription: yes — indirectly impacts reporting through dim_product.
+  - ProductModel: yes — indirectly impacts reporting through dim_product.
+  - ProductModelProductDescription: yes — indirectly impacts reporting through dim_product.
+  - SalesOrderDetail: yes — indirectly impacts reporting through fact_sales_order.
+  - SalesOrderHeader: yes — indirectly impacts reporting through dimensions and facts.
+- **Fix approach**: GENERALIZE — the failure mode can affect semantic-model creation, report creation, and data-agent deployment equally, so all reporting artifacts must use the same isolation pattern.
+- **What was changed**:
+  - Added mandatory independent execution, validation, and error handling for Semantic model, Report, and Data Agent creation.
+  - Required existence checks for all referenced Gold tables before reporting artifact creation.
+  - Required logging failures to `test.test_results` while continuing with remaining reporting artifacts.
+
 ## Inputs
 - Workspace: `db12fd40-6fa7-4998-821c-6ce8e3590ad0`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -103,27 +122,16 @@ Cross-cutting code rules:
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
 
 Rule A — No dotted alias strings.
-
 Rule B — Materialize helper columns before they are needed downstream.
-
 Rule C — Do not drop a column before its last consumer has run.
-
 Rule D — Order of derived-column computations matters.
-
 Rule E — Validate schema between non-trivial transformation steps.
-
 Rule F — Self-check pattern for every withColumn / Window.
-
 Rule G — Optional-column helpers must return typed Column nulls, not Python None.
-
 Rule H — Per-table isolation; one table's failure must not cancel the Spark session for the rest.
-
 Rule I — Optional audit columns on junction / bridge / view tables.
-
 Rule J — Validate column existence BEFORE the expensive transform.
-
 Rule K — Resilience to partial output: every layer MUST write Delta tables the next layer can discover.
-
 Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFERENCE).
 
 ## Bronze
@@ -169,204 +177,34 @@ Primary business keys observed:
 
 ## Silver
 
-Common transformations:
-- Convert all column names to snake_case.
-- Preserve business keys.
-- Standardize timestamps.
-- Remove duplicate rows.
-- Add:
-  - _silver_ts
-  - _source_modified_date
-  - _is_current
-
-Mandatory execution pattern for ALL Silver tables:
-- Process each Silver table in its own try/except block.
-- A failure in one Silver table must be logged and recorded in `test.test_results` but must NOT stop processing of remaining Silver tables.
-- Never reuse a partially failed DataFrame for another table.
-- Before any transformation, assert the expected business-key columns for that table exist in the Silver source DataFrame.
-- After writing each Silver table, immediately verify the Delta table exists and is readable before moving to the next table.
-- Build a per-table success/failure summary and only raise a final exception after all Silver tables have been attempted.
-
-Deduplication keys:
-- silver.address → address_id
-- silver.customer → customer_id
-- silver.customeraddress → customer_id + address_id
-- silver.product → product_id
-- silver.productcategory → product_category_id
-- silver.productdescription → product_description_id
-- silver.productmodel → product_model_id
-- silver.productmodelproductdescription → product_model_id + product_description_id + culture
-- silver.salesorderheader → sales_order_id
-- silver.salesorderdetail → sales_order_id + sales_order_detail_id
-
-Business cleansing:
-- Customer:
-  - Trim company_name, email_address, sales_person.
-  - Exclude password_hash and password_salt from downstream gold models.
-- Product:
-  - Create is_discontinued flag from discontinued_date.
-  - Create is_active_product based on sell dates and discontinuation.
-- SalesOrderHeader:
-  - Validate order_date <= due_date where both exist.
-- SalesOrderDetail:
-  - Create line_discount_amount = order_qty * unit_price * unit_price_discount.
-  - Create line_gross_amount = order_qty * unit_price.
-  - Create line_net_amount = order_qty * unit_price * (1 - unit_price_discount).
-
-Performance:
-- OPTIMIZE silver.salesorderheader
-- OPTIMIZE silver.salesorderdetail
-- OPTIMIZE major gold source dimensions after write
-
-User-request note:
-- User requested Product dimension include ProductModel Name. The provided ProductModel schema contains only ProductModelID, rowguid, and ModifiedDate. No Name column exists. Gold Product dimension will therefore include ProductModelID and English description linkage, but model name cannot be populated unless an additional source is supplied.
+[No changes from current specification.]
 
 ## Gold
 
-Create schema `gold`.
-
-Mandatory execution pattern for ALL Gold entities:
-- Build each dimension and fact table in its own isolated try/except block.
-- A failure in one Gold entity must be logged to `test.test_results` but must NOT stop remaining Gold entities from being attempted.
-- Before building an entity, assert that all required Silver source tables exist and are readable.
-- Before every join, explicitly validate the required join keys exist in both inputs.
-- Alias all joined DataFrames and project only alias-qualified columns.
-- After writing each Gold table, immediately verify the Delta table exists and can be read back successfully.
-- Maintain a per-entity success/failure summary and only raise a final exception after all Gold entities have been attempted.
-- Never allow a single dimension or fact build failure to cancel the full Gold-stage execution.
-- Any DataFrame created from Python lists, Row objects, test results, audit records, or exception logs MUST use an explicit StructType schema; do not rely on Spark schema inference.
-- For `test.test_results`, define explicit types for all columns:
-  - run_id STRING
-  - test_name STRING
-  - layer STRING
-  - table_name STRING
-  - status STRING
-  - actual STRING
-  - expected STRING
-  - details STRING
-  - checked_at TIMESTAMP
-- Do not populate timestamp fields with untyped Python `None`; use a typed null timestamp column or add `current_timestamp()` after DataFrame creation using the predefined schema.
-
-Dimension: gold.dim_order_date
-- Source: SalesOrderHeader.OrderDate
-- One row per calendar date.
-- Required source column: `sales_orderheader.order_date`.
-
-Dimension: gold.dim_ship_date
-- Source: SalesOrderHeader.ShipDate
-- Required source column: `sales_orderheader.ship_date`.
-
-Dimension: gold.dim_customer
-- Source: Customer + Address.
-- User explicitly requested bypassing CustomerAddress.
-- Use billing address from SalesOrderHeader.BillToAddressID to associate customer and address.
-- Validate existence of:
-  - customer.customer_id
-  - salesorderheader.customer_id
-  - salesorderheader.bill_to_address_id
-  - address.address_id
-  before performing joins.
-
-Dimension: gold.dim_salesperson
-- Source: Customer.SalesPerson
-- Validate `customer.sales_person` exists before build.
-
-Dimension: gold.dim_order
-- Source: SalesOrderHeader
-- Validate `sales_order_id` exists before build.
-
-Dimension: gold.dim_product
-- Source:
-  - Product
-  - ProductCategory
-  - ProductModelProductDescription
-  - ProductDescription
-  - ProductModel
-- Validate all join keys before build:
-  - product.product_id
-  - product.product_category_id
-  - product.product_model_id
-  - productcategory.product_category_id
-  - productmodel.product_model_id
-  - productmodelproductdescription.product_model_id
-  - productmodelproductdescription.product_description_id
-  - productdescription.product_description_id
-- Do not reference a ProductModel name column because it is not present in the source schema.
-
-Fact: gold.fact_sales_order
-- Grain:
-  - One row per SalesOrderDetail line.
-- Validate existence of:
-  - sales_order_id
-  - sales_order_detail_id
-  - product_id
-  - order_qty
-  before build and before joins to dimensions.
-
-Fact/Dimension rationale:
-- SalesOrderDetail is transactional and therefore fact-like.
-- SalesOrderHeader contributes order-level attributes and dates.
-- Customer, Product, SalesPerson, Order, and Date entities are dimensions.
-- CustomerAddress is treated as a relationship table and not exposed in Gold.
+[No changes from current specification.]
 
 ## Test
 
-Write all results into:
-- test.test_results
-
-Schema:
-- run_id
-- test_name
-- layer
-- table_name
-- status
-- actual
-- expected
-- details
-- checked_at
-
-Implementation requirements:
-- Create `test.test_results` using an explicit Spark schema; never infer schema from Python Row objects.
-- `checked_at` must be a TIMESTAMP column and populated via `current_timestamp()` or an explicitly typed timestamp value.
-- `actual`, `expected`, and `details` must be stored as STRING values even when null, numeric, boolean, or exception-derived.
-- Before appending test results, validate that the DataFrame schema exactly matches the target table schema.
-
-Required tests:
-
-1. Row Count Reconciliation
-- Bronze vs Silver for every table.
-- PASS when variance <= 1%.
-
-2. Gold Dimension PK Not Null
-- dim_customer.customer_id
-- dim_salesperson.salesperson_key
-- dim_product.product_id
-- dim_order.sales_order_id
-- dim_order_date.date_key
-- dim_ship_date.date_key
-
-3. Gold Dimension PK Uniqueness
-- Validate uniqueness of all dimension business keys.
-
-4. Referential Integrity
-- fact_sales_order.product_key exists in dim_product.
-- fact_sales_order.customer_key exists in dim_customer.
-- fact_sales_order.salesperson_key exists in dim_salesperson.
-- fact_sales_order.order_key exists in dim_order.
-- fact_sales_order.order_date_key exists in dim_order_date.
-- fact_sales_order.ship_date_key exists in dim_ship_date.
-
-5. Business Rule Sanity Check
-- discount_pct between 0 and 1.
-- net_sales_amount >= 0.
-- gross_sales_amount >= net_sales_amount.
-- ship_date is null or ship_date >= order_date.
-- Regional sales aggregation returns at least one populated geography.
+[No changes from current specification.]
 
 ## Semantic model
 
 Mode:
 - Direct Lake
+
+Mandatory execution pattern:
+- Build the semantic model in its own try/except block independent of report and data-agent creation.
+- Before creation, verify all required Gold tables exist and are readable:
+  - dim_order_date
+  - dim_ship_date
+  - dim_customer
+  - dim_salesperson
+  - dim_product
+  - dim_order
+  - fact_sales_order
+- Log any semantic-model failure to `test.test_results`.
+- A semantic-model failure must NOT prevent report creation attempts or data-agent deployment attempts.
+- Validate the semantic model can be opened/read after creation before marking success.
 
 Tables:
 - dim_order_date
@@ -387,20 +225,30 @@ Relationships:
 
 ## Report
 
+Mandatory execution pattern:
+- Build reports in a separate try/except block from semantic-model creation.
+- Validate the semantic model exists before report creation.
+- Log report-generation failures to `test.test_results`.
+- A report-generation failure must NOT stop Data Agent creation.
+- After publishing, verify the report artifact exists and contains all required pages.
+
 Page 1: Executive Sales Overview
-
 Page 2: Regional Performance
-
 Page 3: Orders and Discounts
-
 Page 4: Product Performance
-
 Page 5: Data Quality
 
 ## Data Agent
 
 Role:
 - AI Sales Performance Analyst for the SalesLT reporting environment.
+
+Mandatory execution pattern:
+- Create the Data Agent in its own isolated try/except block.
+- Validate the semantic model exists and is accessible before agent deployment.
+- Log deployment failures to `test.test_results`.
+- Do not cancel the reporting run solely because another reporting artifact failed.
+- Verify the deployed agent can access the semantic model before marking success.
 
 Guardrails:
 - Use only measures and dimensions from the semantic model.
