@@ -40,6 +40,25 @@
   - Required schema and join-key validation before every Gold build.
   - Required immediate post-write validation and continuation of remaining Gold builds when one entity fails.
 
+### Iteration 3 — 2026-06-05 12:50:05Z — failed layer: gold (run: 20260605-123937-88b905)
+- **Root cause (1-line summary)**: PySpark `CANNOT_DETERMINE_TYPE` when creating the test-results DataFrame from in-memory rows containing null/empty values and no explicit schema.
+- **Cross-table audit**:
+  - Address: yes — any test row referencing this table can contain nullable fields and trigger schema inference issues.
+  - Customer: yes — same test-results logging pattern applies.
+  - CustomerAddress: yes — same test-results logging pattern applies.
+  - Product: yes — same test-results logging pattern applies.
+  - ProductCategory: yes — same test-results logging pattern applies.
+  - ProductDescription: yes — same test-results logging pattern applies.
+  - ProductModel: yes — same test-results logging pattern applies.
+  - ProductModelProductDescription: yes — same test-results logging pattern applies.
+  - SalesOrderDetail: yes — same test-results logging pattern applies.
+  - SalesOrderHeader: yes — same test-results logging pattern applies.
+- **Fix approach**: GENERALIZE — the root cause is not table-specific; any Gold validation or test record can fail if Spark must infer types from nullable values.
+- **What was changed**:
+  - Tightened Gold test logging requirements to require an explicit schema for all test-results DataFrames.
+  - Required `checked_at` to be created as a typed timestamp column rather than inferred from Python `None`.
+  - Required all test-result fields to be cast to stable types before writing to `test.test_results`.
+
 ## Inputs
 - Workspace: `db12fd40-6fa7-4998-821c-6ce8e3590ad0`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -215,6 +234,18 @@ Mandatory execution pattern for ALL Gold entities:
 - After writing each Gold table, immediately verify the Delta table exists and can be read back successfully.
 - Maintain a per-entity success/failure summary and only raise a final exception after all Gold entities have been attempted.
 - Never allow a single dimension or fact build failure to cancel the full Gold-stage execution.
+- Any DataFrame created from Python lists, Row objects, test results, audit records, or exception logs MUST use an explicit StructType schema; do not rely on Spark schema inference.
+- For `test.test_results`, define explicit types for all columns:
+  - run_id STRING
+  - test_name STRING
+  - layer STRING
+  - table_name STRING
+  - status STRING
+  - actual STRING
+  - expected STRING
+  - details STRING
+  - checked_at TIMESTAMP
+- Do not populate timestamp fields with untyped Python `None`; use a typed null timestamp column or add `current_timestamp()` after DataFrame creation using the predefined schema.
 
 Dimension: gold.dim_order_date
 - Source: SalesOrderHeader.OrderDate
@@ -293,6 +324,12 @@ Schema:
 - expected
 - details
 - checked_at
+
+Implementation requirements:
+- Create `test.test_results` using an explicit Spark schema; never infer schema from Python Row objects.
+- `checked_at` must be a TIMESTAMP column and populated via `current_timestamp()` or an explicitly typed timestamp value.
+- `actual`, `expected`, and `details` must be stored as STRING values even when null, numeric, boolean, or exception-derived.
+- Before appending test results, validate that the DataFrame schema exactly matches the target table schema.
 
 Required tests:
 
