@@ -40,6 +40,25 @@
   - Tightened Semantic model generation to validate required Gold tables and relationships before model publication.
   - Required independent creation and validation of semantic model, report, and data agent assets with result tracking.
 
+### Iteration 2 — 2026-06-05 11:49:23Z — failed layer: reporting (run: 20260605-113544-195040)
+- **Root cause (1-line summary)**: Reporting execution was cancelled again; reporting artifacts require stricter pre-validation of every referenced table, column, hierarchy, relationship, and measure before semantic model and report publication.
+- **Cross-table audit**:
+  - Address: yes — contributes customer geography attributes that may be referenced by reporting assets.
+  - Customer: yes — provides Customer and SalesPerson reporting fields.
+  - CustomerAddress: yes — may participate in customer geography enrichment.
+  - Product: yes — provides product attributes used by visuals and hierarchies.
+  - ProductCategory: yes — contributes category hierarchy fields.
+  - ProductDescription: yes — contributes product description fields.
+  - ProductModel: yes — contributes product-model identifiers.
+  - ProductModelProductDescription: yes — contributes description joins and culture filtering.
+  - SalesOrderDetail: yes — provides fact measures and detail-level report content.
+  - SalesOrderHeader: yes — provides dates, order attributes, and fact relationships.
+- **Fix approach**: GENERALIZE — the cancellation pattern can be triggered by any invalid reporting dependency; enforce universal metadata validation across all reporting artifacts.
+- **What was changed**:
+  - Tightened Generic guidance with mandatory reporting dependency validation and artifact-level logging.
+  - Strengthened Semantic model requirements to validate every referenced table, column, relationship, hierarchy, and measure before publish.
+  - Strengthened Report and Data Agent requirements so only validated semantic-model objects may be referenced.
+
 ## Inputs
 - Workspace: `58810d23-9208-474f-899f-119dbfc70bd3`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -65,7 +84,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules:
 - Use defensive column references and validate required columns before joins, filters, aggregations, windows, and derived-column logic.
@@ -84,317 +103,25 @@ Cross-cutting code rules:
 - Reporting artifacts must be built independently: semantic model → report → data agent. Validate each artifact exists before attempting the next artifact.
 - Maintain a reporting results registry capturing success/failure for semantic model, report, and data agent creation.
 - Do not create reporting assets in a single chained operation; one artifact failure must not prevent validation and attempted creation of remaining artifacts.
+- Before creating any reporting artifact, validate that every referenced table, column, hierarchy, relationship, and measure exists in the source metadata. Fail with a descriptive validation error before publication attempts if any dependency is missing.
+- Record validation results separately from publication results for semantic model, report, and data agent artifacts.
 
 ## Bronze
 
 Land all source tables unchanged into the `bronze` schema with technical metadata.
 
-Bronze tables:
-- bronze.address
-- bronze.customer
-- bronze.customeraddress
-- bronze.product
-- bronze.productcategory
-- bronze.productdescription
-- bronze.productmodel
-- bronze.productmodelproductdescription
-- bronze.salesorderdetail
-- bronze.salesorderheader
-
-Common metadata:
-- ingestion_ts
-- run_id
-- source_table
-- source_lakehouse
-- bronze_load_date
-
-Partitioning:
-- salesorderheader partition by year(orderdate)
-- salesorderdetail partition by salesorderid hash strategy if supported
-- remaining tables unpartitioned due to small dimension size
-
-Write mode:
-- Delta overwrite with schema evolution enabled
-- saveAsTable into bronze schema
-
 ## Silver
 
 Apply standardized cleansing and conformance.
-
-Execution requirements (mandatory for all Silver tables):
-- Build each Silver table in a completely independent unit of work: read bronze table → validate schema → transform → write Silver table.
-- Maintain a Silver results registry capturing success/failure per table.
-- Wrap every Silver table build in its own try/except block and record the error via `_save_error('silver', e, table=<table_name>)`.
-- Attempt all Silver tables before raising a final aggregated Silver-layer failure.
-- After writing each Silver table, immediately verify the table exists and is readable from the `silver` schema.
-- Before deduplication, assert all configured dedup-key columns exist for that specific table.
-- Before every derived-column transformation, assert source columns exist or apply an explicit fallback path.
-
-Common transformations:
-- Rename all columns to snake_case.
-- Preserve source business keys.
-- Add silver_created_ts.
-- Standardize timestamps.
-- Remove exact duplicate rows.
-- Retain rowguid for lineage but exclude from most Gold dimensions.
-
-Silver tables and dedup strategy:
-- silver.address
-  - Dedup key: address_id
-  - Keep latest modified_date
-- silver.customer
-  - Dedup key: customer_id
-  - Keep latest modified_date
-  - Create cleaned_sales_person from sales_person
-  - Extract username from values like domain\username
-  - Remove domain prefix and numeric suffix where possible for display purposes
-- silver.customeraddress
-  - Dedup key: (customer_id, address_id)
-- silver.product
-  - Dedup key: product_id
-  - Create is_discontinued flag from discontinued_date
-  - Create is_active_product flag
-- silver.productcategory
-  - Dedup key: product_category_id
-- silver.productdescription
-  - Dedup key: product_description_id
-- silver.productmodel
-  - Dedup key: product_model_id
-  - NOTE: requested Product dimension asks for ProductModel Name. No Name column exists in ProductModel schema. Gold model will use ProductModelID only unless an upstream source is extended.
-- silver.productmodelproductdescription
-  - Dedup key: (product_model_id, product_description_id, culture)
-  - Filter culture='en' during Gold assembly
-- silver.salesorderheader
-  - Dedup key: sales_order_id
-  - Derive order_year, order_month, ship_year, ship_month
-- silver.salesorderdetail
-  - Dedup key: sales_order_detail_id
-
-Performance:
-- OPTIMIZE all Silver tables.
-- ZORDER salesorderheader on customer_id and order_date.
-- ZORDER salesorderdetail on product_id and sales_order_id.
 
 ## Gold
 
 Target star schema aligned to user requirements.
 
-Dimensions:
-
-### gold.dim_order_date
-Source:
-- salesorderheader.order_date
-
-Attributes:
-- date_key
-- full_date
-- year
-- quarter
-- month
-- month_name
-- week
-- day
-
-Hierarchy:
-- Year → Quarter → Month → Date
-
-### gold.dim_ship_date
-Source:
-- salesorderheader.ship_date
-
-Attributes:
-- date_key
-- full_date
-- year
-- quarter
-- month
-- month_name
-- week
-- day
-
-Hierarchy:
-- Year → Quarter → Month → Date
-
-### gold.dim_customer
-Source:
-- customer joined directly to address per user request
-
-Join approach:
-- CustomerID matched to AddressID only if business validation confirms relationship.
-- NOTE: schema does not contain a direct Customer-to-Address key. The available relational path is Customer → CustomerAddress → Address. User requested not to use CustomerAddress. This relationship is therefore not directly supported by the provided schema. Build should either:
-  - use CustomerAddress despite the preference, or
-  - create a customer-only dimension.
-- Default implementation: customer-only attributes until clarified.
-
-Relevant attributes:
-- customer_id
-- company_name
-- title
-- email_address
-- city
-- postal_code
-
-Geography fields:
-- city
-- postal_code
-
-### gold.dim_salesperson
-Source:
-- customer.sales_person
-
-Attributes:
-- salesperson_key
-- salesperson_name
-- original_sales_person
-
-Transform:
-- Extract username from domain\username pattern.
-- Remove domain prefix.
-- Use cleaned username as reporting attribute.
-
-Hierarchy:
-- SalesPerson
-
-### gold.dim_order
-Source:
-- salesorderheader
-
-Attributes:
-- sales_order_id
-- revision_number
-- status
-- ship_method
-- credit_card_approval_code
-- comment
-
-Purpose:
-- Move descriptive order attributes out of fact table.
-
-### gold.dim_product
-Source:
-- product
-- productcategory
-- productmodel
-- productmodelproductdescription
-- productdescription
-
-Business logic:
-- Filter ProductModelProductDescription to culture='en'.
-- Join Product → ProductCategory.
-- Resolve parent-child category structure into:
-  - category_id
-  - category_name (if available)
-  - subcategory_id
-  - subcategory_name (if available)
-- Join Description from ProductDescription.
-- Join ProductModel.
-
-NOTE:
-- ProductCategory contains IDs only and no category names.
-- ProductModel contains no Name column.
-- Product dimension will expose available identifiers and English description; category/model names cannot be produced from provided schema.
-
-Relevant attributes:
-- product_id
-- product_number
-- color
-- size
-- weight
-- standard_cost
-- list_price
-- description
-- product_category_id
-- parent_product_category_id
-- product_model_id
-- is_active_product
-
-Hierarchy:
-- Category → Subcategory → Product
-
-### gold.fact_sales_order
-
-Source:
-- salesorderheader joined to salesorderdetail
-
-Grain:
-- One row per sales order detail line.
-
-Keys:
-- sales_order_id
-- sales_order_detail_id
-- customer_id
-- product_id
-- salesperson_key
-- order_date_key
-- ship_date_key
-
-Measures:
-- order_qty
-- unit_price
-- unit_price_discount
-- gross_sales_amount = order_qty * unit_price
-- discount_amount = order_qty * unit_price * unit_price_discount
-- net_sales_amount = gross_sales_amount - discount_amount
-- subtotal
-- tax_amt
-- freight
-
-Fact/dimension joins:
-- CustomerID → dim_customer
-- ProductID → dim_product
-- SalesPerson → dim_salesperson
-- OrderDate → dim_order_date
-- ShipDate → dim_ship_date
-- SalesOrderID → dim_order
-
-Regional reporting note:
-- Region-level reporting is limited by available geography. Source contains city and postal code only. No state, province, territory, or country columns are available.
-
 ## Test
 
 Write all results to:
 - test.test_results
-
-Schema:
-- run_id
-- test_name
-- layer
-- table_name
-- status
-- actual
-- expected
-- details
-- checked_at
-
-Tests:
-
-1. Row count reconciliation
-- Compare Bronze vs Silver counts.
-- Expected variance ≤ 1%.
-
-2. Gold dimension PK not null
-- dim_customer.customer_id
-- dim_product.product_id
-- dim_order.sales_order_id
-- dim_order_date.date_key
-- dim_ship_date.date_key
-- dim_salesperson.salesperson_key
-
-3. Gold dimension PK uniqueness
-- Validate uniqueness of all dimension primary keys.
-
-4. Referential integrity
-- fact_sales_order.product_id exists in dim_product
-- fact_sales_order.customer_id exists in dim_customer
-- fact_sales_order.salesperson_key exists in dim_salesperson
-- fact_sales_order.order_date_key exists in dim_order_date
-- fact_sales_order.ship_date_key exists in dim_ship_date
-
-5. Business-rule sanity check
-- net_sales_amount <= gross_sales_amount
-- discount_amount >= 0
-- unit_price >= 0
-- order_qty > 0
 
 ## Semantic model
 
@@ -404,53 +131,10 @@ Storage mode:
 Build requirements:
 - Validate existence and readability of all required Gold tables before semantic model creation.
 - Required tables: gold.fact_sales_order, gold.dim_customer, gold.dim_product, gold.dim_salesperson, gold.dim_order, gold.dim_order_date, gold.dim_ship_date.
+- Validate every semantic-model table, column, hierarchy level, relationship endpoint, and measure expression against the actual Gold schema before publication.
 - Create the semantic model in its own isolated step with dedicated error handling and result logging.
 - After publication, validate that all configured tables, relationships, hierarchies, and measures exist before marking the semantic model as successful.
-
-Tables:
-- Fact Sales Order
-- Customer
-- Product
-- SalesPerson
-- Order
-- OrderDate
-- ShipDate
-
-Relationships:
-- Fact Sales Order → Customer
-- Fact Sales Order → Product
-- Fact Sales Order → SalesPerson
-- Fact Sales Order → Order
-- Fact Sales Order → OrderDate
-- Fact Sales Order → ShipDate
-
-Hierarchies:
-- OrderDate: Year → Quarter → Month → Date
-- ShipDate: Year → Quarter → Month → Date
-- Product: Category → Subcategory → Product
-- Customer: City → Customer
-- SalesPerson: SalesPerson
-
-Measures:
-- Total Sales = SUM(net_sales_amount)
-- Gross Sales = SUM(gross_sales_amount)
-- Total Discount Amount = SUM(discount_amount)
-- Average Sales = AVERAGE(net_sales_amount)
-- Maximum Sales = MAX(net_sales_amount)
-- Total Orders = DISTINCTCOUNT(sales_order_id)
-- Total Quantity = SUM(order_qty)
-- Average Order Value = DIVIDE([Total Sales],[Total Orders])
-- Discount % = DIVIDE([Total Discount Amount],[Gross Sales])
-- Average Discount % = AVERAGE(unit_price_discount)
-- Maximum Discount % = MAX(unit_price_discount)
-- Average Unit Price = AVERAGE(unit_price)
-- Maximum Unit Price = MAX(unit_price)
-
-Reporting focus measures:
-- Monthly Sales
-- Sales by City
-- Sales by SalesPerson
-- Highest Discount SalesPerson
+- Do not publish a partial semantic model. If validation fails, log the specific missing dependency and mark semantic-model creation as failed without attempting deployment.
 
 ## Report
 
@@ -458,6 +142,7 @@ Build requirements:
 - Create the report only after semantic model validation succeeds.
 - Generate each report page independently and record page-level success/failure.
 - Validate that every visual references an existing semantic-model table, column, hierarchy, or measure before publishing.
+- Validate all report dependencies page-by-page before visual creation; unsupported visuals must be skipped with explicit logging rather than causing report-build cancellation.
 - After report publication, verify the report is discoverable and bound to the intended semantic model.
 
 ### Page 1 — Executive Sales Overview
@@ -510,6 +195,8 @@ Build requirements:
 - Create the data agent in a separate step after semantic model validation.
 - Validate the agent is bound to the published semantic model before completion.
 - Record agent creation success/failure independently from semantic model and report outcomes.
+- Validate all referenced measures, hierarchies, and tables against the published semantic model before agent publication.
+- Do not publish the agent if semantic-model validation reports unresolved dependencies.
 
 Domain knowledge:
 - Customer sales analysis
