@@ -1,5 +1,26 @@
 # Run Spec 20260605-073923-154f5e
 
+## Updated specs
+
+### Iteration 1 — 2026-06-05 07:42:33Z — failed layer: bronze (run: 20260605-074011-00ff10)
+- **Root cause (1-line summary)**: Bronze completed without producing discoverable schema-backed Delta tables, causing Silver to fail with "prior layer produced no discoverable tables".
+- **Cross-table audit**:
+  - Address: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - Customer: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - CustomerAddress: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - Product: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - ProductCategory: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - ProductDescription: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - ProductModel: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - ProductModelProductDescription: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - SalesOrderDetail: yes — subject to the same write/discovery mechanism as all Bronze tables.
+  - SalesOrderHeader: yes — subject to the same write/discovery mechanism as all Bronze tables.
+- **Fix approach**: GENERALIZE — the failure is systemic and affects discoverability for every Bronze table, not a single table-specific schema issue.
+- **What was changed**:
+  - Tightened Bronze write requirements to mandate one successful `saveAsTable('bronze.<table>')` per source table.
+  - Added post-write validation that each expected Bronze table is discoverable via Spark catalog metadata before notebook completion.
+  - Added a hard-fail condition if any expected Bronze table is missing or if fewer than 10 Bronze tables are discoverable.
+
 ## Inputs
 - Workspace: `373889eb-1531-49df-9b0c-474976350c90`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -152,6 +173,24 @@ Keep the comments human-readable, not the code repeated in prose. The goal: some
 - Write mode:
   - Delta overwrite with schema evolution enabled.
 - Capture row counts per table in notebook summary output.
+- Discovery requirements (mandatory):
+  - Create schema with `CREATE SCHEMA IF NOT EXISTS bronze` before any write.
+  - Read each source table independently and write exactly one corresponding managed table using `saveAsTable('bronze.<table_name>')`.
+  - Expected discoverable output tables are:
+    - bronze.address
+    - bronze.customer
+    - bronze.customeraddress
+    - bronze.product
+    - bronze.productcategory
+    - bronze.productdescription
+    - bronze.productmodel
+    - bronze.productmodelproductdescription
+    - bronze.salesorderdetail
+    - bronze.salesorderheader
+  - After each write, validate discoverability using catalog metadata (`spark.catalog.tableExists('bronze.<table_name>')` or equivalent).
+  - Before notebook completion, verify all 10 expected Bronze tables exist and are queryable.
+  - If any expected Bronze table is missing, raise a RuntimeError naming the missing table(s).
+  - Do not treat the Bronze layer as successful unless at least 10 discoverable Bronze tables were written.
 
 ## Silver
 
