@@ -78,6 +78,25 @@
   - Added mandatory post-write validation using catalog metadata and table detail metadata for all 10 Bronze tables.
   - Added a hard-fail requirement if any Bronze table is not a managed Delta table in schema `bronze` or if fewer than 10 tables are returned by `SHOW TABLES IN bronze`.
 
+### Iteration 1 — 2026-06-05 08:03:54Z — failed layer: bronze (run: 20260605-074011-00ff10)
+- **Root cause (1-line summary)**: Spark session was cancelled due to one or more failed Bronze statements; the spec lacked mandatory statement-level validation and fail-fast checks around schema creation, source reads, and table writes.
+- **Cross-table audit**:
+  - Address: yes — source read, row-count validation, and write operations can fail.
+  - Customer: yes — source read, row-count validation, and write operations can fail.
+  - CustomerAddress: yes — source read, row-count validation, and write operations can fail.
+  - Product: yes — source read, row-count validation, and write operations can fail.
+  - ProductCategory: yes — source read, row-count validation, and write operations can fail.
+  - ProductDescription: yes — source read, row-count validation, and write operations can fail.
+  - ProductModel: yes — source read, row-count validation, and write operations can fail.
+  - ProductModelProductDescription: yes — source read, row-count validation, and write operations can fail.
+  - SalesOrderDetail: yes — source read, row-count validation, and write operations can fail.
+  - SalesOrderHeader: yes — source read, row-count validation, and write operations can fail.
+- **Fix approach**: GENERALIZE — the failure pattern is operational and can affect every Bronze table uniformly.
+- **What was changed**:
+  - Added mandatory pre-flight validation for lakehouse attachment, schema existence, and source-table accessibility before processing any table.
+  - Required per-table read, count, write, and read-back validation with explicit RuntimeError generation on any failure.
+  - Added a Bronze execution manifest requiring all 10 tables to be successfully processed and recorded before notebook success.
+
 ## Inputs
 - Workspace: `373889eb-1531-49df-9b0c-474976350c90`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -145,10 +164,16 @@ Cross-cutting code rules:
 - Write mode:
   - Delta overwrite with schema evolution enabled.
 
-Mandatory write/discovery requirements:
-- Run `CREATE SCHEMA IF NOT EXISTS bronze` before any write.
+Mandatory pre-flight validation:
+- Run `CREATE SCHEMA IF NOT EXISTS bronze` and immediately verify `SHOW TABLES IN bronze` executes successfully before processing any source table.
 - Attach and use the target lakehouse **o** before creating tables.
 - Verify the active/default lakehouse is **o** immediately before the first Bronze write; abort the notebook if verification fails.
+- Before processing each source table:
+  - verify the source table exists and is readable.
+  - execute a row count on the source dataframe.
+  - raise a RuntimeError immediately if the source read fails or returns an invalid dataframe object.
+
+Mandatory write/discovery requirements:
 - For every source table, write exactly one managed Delta table using:
   - `format('delta')`
   - `mode('overwrite')`
@@ -164,10 +189,19 @@ Mandatory write/discovery requirements:
 - Immediately after each write:
   - assert `spark.catalog.tableExists('bronze.<table>')`
   - read back the table with `spark.read.table('bronze.<table>')`
+  - execute a row count against the read-back dataframe and verify it is greater than or equal to zero.
   - capture row count in results output.
   - verify the table provider is Delta and the table is not temporary.
   - verify table metadata identifies schema `bronze` and a managed table type.
+  - raise a RuntimeError immediately if any validation fails.
+- Maintain an execution manifest containing:
+  - source table name
+  - target table name
+  - source row count
+  - written row count
+  - validation status
 - Before notebook completion:
+  - verify the execution manifest contains exactly 10 successful entries.
   - execute `SHOW TABLES IN bronze`
   - verify the discoverable table set equals exactly:
     - address
@@ -185,7 +219,7 @@ Mandatory write/discovery requirements:
   - verify no expected table is missing from catalog enumeration results for schema `bronze`.
   - raise a RuntimeError if any expected table is missing or unreadable.
 - Print a final JSON summary containing all 10 table names and row counts.
-- Do not mark Bronze successful unless all 10 tables are discoverable and queryable through the Spark catalog.
+- Do not mark Bronze successful unless all 10 tables are discoverable, queryable through the Spark catalog, and present in the execution manifest with successful validation status.
 
 ## Silver
 
