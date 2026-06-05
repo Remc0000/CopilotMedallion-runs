@@ -59,6 +59,25 @@
   - Added mandatory verification of both catalog registration and physical discoverability for all 10 Bronze tables.
   - Added a hard-fail condition if the Bronze schema contains fewer than 10 readable managed Delta tables.
 
+### Iteration 2 — 2026-06-05 08:00:39Z — failed layer: bronze (run: 20260605-074011-00ff10)
+- **Root cause (1-line summary)**: Silver explicitly reported no discoverable tables in `Tables/bronze/`; catalog registration alone was insufficient and Bronze outputs were not validated against the lakehouse Tables area used by downstream discovery.
+- **Cross-table audit**:
+  - Address: yes — downstream discovery requires a readable managed table under the bronze schema.
+  - Customer: yes — same requirement.
+  - CustomerAddress: yes — same requirement.
+  - Product: yes — same requirement.
+  - ProductCategory: yes — same requirement.
+  - ProductDescription: yes — same requirement.
+  - ProductModel: yes — same requirement.
+  - ProductModelProductDescription: yes — same requirement.
+  - SalesOrderDetail: yes — same requirement.
+  - SalesOrderHeader: yes — same requirement.
+- **Fix approach**: GENERALIZE — every source table is affected by the same lakehouse attachment/materialization/discovery mechanism.
+- **What was changed**:
+  - Tightened Bronze requirements to require verification that the active lakehouse is the target lakehouse `o` before any read or write.
+  - Added mandatory post-write validation using catalog metadata and table detail metadata for all 10 Bronze tables.
+  - Added a hard-fail requirement if any Bronze table is not a managed Delta table in schema `bronze` or if fewer than 10 tables are returned by `SHOW TABLES IN bronze`.
+
 ## Inputs
 - Workspace: `373889eb-1531-49df-9b0c-474976350c90`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -98,6 +117,7 @@ Cross-cutting code rules:
 - Every notebook code cell must begin with a short explanatory comment block.
 - After layer completion, validate discoverability through catalog metadata, not path existence.
 - Do not use temporary views, global temp views, or in-memory objects as layer outputs; every layer output must be a persisted managed Delta table in the target lakehouse.
+- Before the first write in any layer, explicitly verify that the attached/default lakehouse is the target lakehouse `o`; fail immediately if another lakehouse is active.
 
 ## Bronze
 
@@ -128,6 +148,7 @@ Cross-cutting code rules:
 Mandatory write/discovery requirements:
 - Run `CREATE SCHEMA IF NOT EXISTS bronze` before any write.
 - Attach and use the target lakehouse **o** before creating tables.
+- Verify the active/default lakehouse is **o** immediately before the first Bronze write; abort the notebook if verification fails.
 - For every source table, write exactly one managed Delta table using:
   - `format('delta')`
   - `mode('overwrite')`
@@ -145,6 +166,7 @@ Mandatory write/discovery requirements:
   - read back the table with `spark.read.table('bronze.<table>')`
   - capture row count in results output.
   - verify the table provider is Delta and the table is not temporary.
+  - verify table metadata identifies schema `bronze` and a managed table type.
 - Before notebook completion:
   - execute `SHOW TABLES IN bronze`
   - verify the discoverable table set equals exactly:
@@ -160,6 +182,7 @@ Mandatory write/discovery requirements:
     - salesorderheader
   - verify all 10 tables are readable via `spark.read.table(...)`.
   - verify the Bronze schema contains 10 persisted managed tables and not views.
+  - verify no expected table is missing from catalog enumeration results for schema `bronze`.
   - raise a RuntimeError if any expected table is missing or unreadable.
 - Print a final JSON summary containing all 10 table names and row counts.
 - Do not mark Bronze successful unless all 10 tables are discoverable and queryable through the Spark catalog.
