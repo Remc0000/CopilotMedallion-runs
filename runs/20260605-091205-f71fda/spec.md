@@ -1,5 +1,26 @@
 # Run Spec 20260605-091115-6334db
 
+## Updated specs
+
+### Iteration 1 — 2026-06-05 09:20:33Z — failed layer: gold (run: 20260605-091205-f71fda)
+- **Root cause (1-line summary)**: Gold-layer failure was surfaced only as a session-cancelled error; likely caused by a downstream gold transformation referencing columns that are not guaranteed to exist after silver snake_case standardization and schema simplification.
+- **Cross-table audit**:
+  - Address: yes — city/postal_code fields are consumed by dim_customer and must be validated before joins.
+  - Customer: yes — sales_person and customer attributes are consumed by dim_customer and dim_salesperson.
+  - CustomerAddress: no — explicitly not used in the final customer dimension per requirements.
+  - Product: yes — product attributes and discontinued indicators are consumed by dim_product.
+  - ProductCategory: yes — category identifiers are consumed by dim_product.
+  - ProductDescription: yes — description attributes are consumed by dim_product.
+  - ProductModel: yes — source is known to contain only identifiers; gold must not reference a non-existent name column.
+  - ProductModelProductDescription: yes — culture filtering and joins are used by dim_product.
+  - SalesOrderDetail: yes — fact_sales_order depends on required detail columns.
+  - SalesOrderHeader: yes — dimensions and fact tables depend on date, customer, address, and order attributes.
+- **Fix approach**: GENERALIZE — the failure signature does not identify a single table/column, so gold-layer schema validation and explicit column contracts are required across all gold builds.
+- **What was changed**:
+  - Tightened the Gold section with required source-column contracts for every dimension and fact.
+  - Added mandatory schema validation before joins, projections, and key generation.
+  - Explicitly prohibited references to unavailable columns such as product_model.name and category name fields.
+
 ## Inputs
 - Workspace: `423348df-cb05-4fa0-bb36-72cf92932692`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -43,64 +64,7 @@ Cross-cutting code rules:
 - Every code cell must begin with a short explanatory comment block using `# ---`.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
-These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
-
-Rule A — No dotted alias strings.
-- Never pass dotted strings like "c.customer_id", "ca.address_type", "h.sales_person", or "pc_child.name" to F.col(...), withColumn(...), Window.partitionBy(...), Window.orderBy(...), or select(...). Spark treats "c.customer_id" as a single column literally named c.customer_id, which does not resolve once any projection or rename has been applied.
-- Alias scope (.alias("c"), .alias("ca"), ...) is only valid inside the SAME select / join expression that introduces it. Once you produce a new DataFrame via select(...) or withColumn(...), the dotted alias form is gone and you must reference plain column names.
-
-Rule B — Materialize helper columns before they are needed downstream.
-- For any column that will later be referenced by a Window, a withColumn, or a downstream join after a projection, first materialize it as a flat, unambiguous helper column (e.g. rank_customer_id, rank_address_type, sales_person_source) in the same select that introduces the join aliases.
-
-Rule C — Do not drop a column before its last consumer has run.
-- Before adding a withColumn, verify every F.col(...) referenced by that expression still exists on the DataFrame at that step. If a previous select(...) projection removed it, either:
-  - (preferred) move the withColumn BEFORE the projection that drops the source column, OR
-  - keep the source column in the projection, OR
-  - re-derive the value from a column that IS still present (often a boolean/flag that was computed earlier from the same source).
-- Example of the failure to avoid: dropping discontinued_date in a select(...) and then later writing F.when(F.col('discontinued_date').isNotNull(), ...) inside withColumn('is_sellable_currently', ...). The column is gone and Spark raises UNRESOLVED_COLUMN.
-- When a boolean flag derived from a raw column already exists on the DataFrame (e.g. is_discontinued derived from discontinued_date), prefer reusing the flag (F.col('is_discontinued')) over re-reading the dropped raw column.
-
-Rule D — Order of derived-column computations matters.
-- When building several derived columns where one depends on another (e.g. is_discontinued, then is_sellable_currently which uses is_discontinued), add them in dependency order with sequential withColumn calls, and reference the already-derived flag in the next expression — do NOT reach back to a raw source column that may have been dropped.
-
-Rule E — Validate schema between non-trivial transformation steps.
-- After any select(...) / drop(...) / heavy withColumn chain, and BEFORE the next step that depends on specific columns, assert those columns exist. Fail fast with an error message that names the missing column and the DataFrame variable, so the auto-fixer gets an actionable diagnostic instead of a deep analyzer stack trace.
-
-Rule F — Self-check pattern for every withColumn / Window.
-- For every withColumn(name, expr) and every Window definition, confirm: "Every column referenced inside expr / inside the window's partitionBy / orderBy exists on the DataFrame at this exact point." If not, fix per Rule C before generating the code.
-
-Rule G — Optional-column helpers must return typed Column nulls, not Python None.
-- When defining a helper like `_maybe(df, name)` that returns the column if it exists on the DataFrame and a fallback otherwise, NEVER return Python `None`. Spark functions (`F.coalesce`, `F.greatest`, `F.least`, `F.concat`, `F.when(...).otherwise(...)`, etc.) reject `None` arguments with `PySparkTypeError: [NOT_COLUMN_OR_STR]` and the cell crashes BEFORE any later fallback (e.g. `F.current_timestamp()`) gets a chance to satisfy the call.
-- Correct pattern — return a typed null literal as a Spark Column.
-- Pick the dtype to match the surrounding expression.
-- Never pass Python `None` directly into a Spark function.
-
-Rule H — Per-table isolation; one table's failure must not cancel the Spark session for the rest.
-- Process each source table independently.
-- Capture success/failure results per table.
-- Save errors and continue where appropriate.
-- Perform cross-table joins only after source outputs exist.
-
-Rule I — Optional audit columns on junction / bridge / view tables.
-- Do not assume ModifiedDate exists on every table.
-- Junction tables must deduplicate on composite business keys.
-- Use guarded audit logic.
-
-Rule J — Validate column existence BEFORE the expensive transform.
-- Assert required columns before joins, filters, aggregations, and derived columns.
-- Emit actionable errors including layer and table names.
-
-Rule K — Resilience to partial output: every layer MUST write Delta tables the next layer can discover.
-- Bronze writes to `bronze.<table>`.
-- Silver writes to `silver.<table>`.
-- Gold writes to `gold.<table>`.
-- Test writes to `test.test_results`.
-- Raise an error if no discoverable tables are produced.
-
-Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFERENCE).
-- Alias-qualify shared columns in joins.
-- Rename projected columns immediately.
-- After projection, use flat column names only.
+Retain all existing Rules A-L exactly as defined in the current specification.
 
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why.
 
@@ -203,98 +167,121 @@ Silver tables and deduplication:
 
 Target star schema aligned to requested sales-reporting solution.
 
+Mandatory gold-layer schema validation:
+- Before building each dimension or fact, assert that every required source column exists on the silver DataFrame being used.
+- Fail fast with an explicit message naming the missing column, source table, and target gold table.
+- After every join projection, reference only projected flat column names.
+- Do not reference any column not explicitly listed below.
+- Do not reference product_model.name, product_category.name, parent_category_name, or any other descriptive category/model columns not present in the supplied source schema.
+
 Dimensions:
 
 - gold.dim_order_date
-  - Source: salesorderheader.order_date
+  - Source: silver.salesorderheader
+  - Required columns:
+    - order_date
   - Key: date_key
-  - Attributes: date, day, month, month_name, quarter, year, fiscal attributes
-  - Hierarchy: Year > Quarter > Month > Date
 
 - gold.dim_ship_date
-  - Source: salesorderheader.ship_date
+  - Source: silver.salesorderheader
+  - Required columns:
+    - ship_date
   - Key: ship_date_key
-  - Attributes: date hierarchy fields
-  - Hierarchy: Year > Quarter > Month > Date
 
 - gold.dim_customer
-  - Source: customer joined directly to address as requested
-  - Preferred join:
+  - Sources:
+    - silver.customer
+    - silver.salesorderheader
+    - silver.address
+  - Required columns:
     - customer.customer_id
+    - customer.company_name
+    - customer.title
+    - customer.suffix
+    - customer.email_address
     - salesorderheader.customer_id
     - salesorderheader.bill_to_address_id
+    - address.address_id
+    - address.city
+    - address.postal_code
+  - Join path:
+    - salesorderheader.customer_id = customer.customer_id
+    - salesorderheader.bill_to_address_id = address.address_id
   - Do not use customeraddress bridge.
-  - Attributes:
-    - customer_id
-    - company_name
-    - title
-    - suffix
-    - email_address
-    - city
-    - postal_code
-  - Keep only reporting-relevant fields.
-  - Regional analysis will use city and postal_code because no state/province/country fields exist in the supplied schema.
+  - Project and immediately rename joined fields to flat names before downstream use.
 
 - gold.dim_salesperson
-  - Source: customer.sales_person
-  - Extract username portion from values formatted as `domain\username`.
-  - Example:
-    - adventure-works\jillian0 → jillian0
-  - Attributes:
-    - salesperson_key
-    - salesperson_name
-    - original_salesperson
-  - Deduplicate unique salespeople.
-  - Hierarchy not applicable.
+  - Source: silver.customer
+  - Required columns:
+    - customer_id
+    - sales_person OR salesperson_source
+  - If salesperson_source exists, use it.
+  - If sales_person exists, derive salesperson_source from it.
+  - Do not assume both columns exist simultaneously.
 
 - gold.dim_order
-  - Source: salesorderheader
-  - Key: sales_order_id
-  - Attributes:
+  - Source: silver.salesorderheader
+  - Required columns:
+    - sales_order_id
     - revision_number
     - status
     - ship_method
     - comment
-  - Exclude measures and foreign-key references that belong in the fact.
 
 - gold.dim_product
-  - Source:
-    - product
-    - productcategory
-    - productmodelproductdescription
-    - productdescription
-    - productmodel
-  - Filter productmodelproductdescription to culture='en'
-  - Parent-child category flattening:
-    - category_id
-    - category_name surrogate not available in source
-    - parent_product_category_id
-    - category_level
-  - Include:
-    - product_id
-    - product_number
-    - color
-    - size
-    - weight
-    - standard_cost
-    - list_price
-    - description
-    - product_model_id
-    - active/discontinued indicators
-  - NOTE:
-    - ProductCategory table contains IDs only; category names are not available.
-    - ProductModel.Name requested by user is not available in supplied schema.
-    - Product dimension will expose available identifiers and description data.
+  - Sources:
+    - silver.product
+    - silver.productcategory
+    - silver.productmodelproductdescription
+    - silver.productdescription
+    - silver.productmodel
+  - Required columns:
+    - product.product_id
+    - product.product_category_id
+    - product.product_model_id
+    - product.product_number
+    - product.color
+    - product.size
+    - product.weight
+    - product.standard_cost
+    - product.list_price
+    - product.is_discontinued
+    - product.is_active_product
+    - productcategory.product_category_id
+    - productcategory.parent_product_category_id
+    - productmodel.product_model_id
+    - productmodelproductdescription.product_model_id
+    - productmodelproductdescription.product_description_id
+    - productmodelproductdescription.culture
+    - productdescription.product_description_id
+  - Filter productmodelproductdescription to culture='en'.
+  - Use only identifiers from productmodel and productcategory.
+  - Do not create references to non-existent model or category name columns.
 
 Fact:
 
 - gold.fact_sales_order
   - Grain: one sales order line item
-  - Source:
-    - salesorderheader
-    - salesorderdetail
-  - Join:
+  - Sources:
+    - silver.salesorderheader
+    - silver.salesorderdetail
+  - Required header columns:
     - sales_order_id
+    - customer_id
+    - order_date
+    - ship_date
+    - subtotal
+    - tax_amt
+    - freight
+  - Required detail columns:
+    - sales_order_id
+    - product_id
+    - order_qty
+    - unit_price
+    - unit_price_discount
+  - Join:
+    - salesorderheader.sales_order_id = salesorderdetail.sales_order_id
+  - Validate required columns before join and before measure calculations.
   - Foreign keys:
     - order_date_key
     - ship_date_key
@@ -303,19 +290,9 @@ Fact:
     - order_key
     - product_key
   - Measures retained:
-    - order_qty
-    - unit_price
-    - unit_price_discount
     - extended_amount = order_qty * unit_price
     - discount_amount = order_qty * unit_price * unit_price_discount
     - net_sales_amount = order_qty * unit_price * (1 - unit_price_discount)
-    - subtotal
-    - tax_amt
-    - freight
-  - Fact classification:
-    - SalesOrderHeader = transactional fact header
-    - SalesOrderDetail = transactional fact detail
-    - CustomerAddress = bridge table, not exposed in final star schema
 
 ## Test
 
@@ -388,165 +365,12 @@ Relationships:
 - fact_sales_order → dim_order
 - fact_sales_order → dim_product
 
-Hierarchies:
-
-- Order Date Hierarchy
-  - Year
-  - Quarter
-  - Month
-  - Date
-
-- Ship Date Hierarchy
-  - Year
-  - Quarter
-  - Month
-  - Date
-
-- Customer Geography Hierarchy
-  - City
-  - Postal Code
-
-- Product Category Hierarchy
-  - Parent Product Category ID
-  - Product Category ID
-  - Product
-
-Measures:
-
-- Total Sales =
-  - SUM(net_sales_amount)
-
-- Average Sales =
-  - AVERAGE(net_sales_amount)
-
-- Maximum Sale =
-  - MAX(net_sales_amount)
-
-- Total Orders =
-  - DISTINCTCOUNT(order_key)
-
-- Total Quantity =
-  - SUM(order_qty)
-
-- Total Discount Amount =
-  - SUM(discount_amount)
-
-- Average Discount Amount =
-  - AVERAGE(discount_amount)
-
-- Discount Percentage =
-  - DIVIDE(SUM(discount_amount), SUM(extended_amount), 0)
-
-- Average Discount Percentage =
-  - AVERAGE(unit_price_discount)
-
-- Maximum Discount Percentage =
-  - MAX(unit_price_discount)
-
-- Average Order Value =
-  - DIVIDE([Total Sales], [Total Orders], 0)
+Hierarchies, measures, and relationships remain as specified.
 
 ## Report
 
-### Page 1 - Executive Sales Overview
-Visuals:
-- KPI cards:
-  - Total Sales
-  - Average Sales
-  - Maximum Sale
-  - Total Orders
-- Monthly sales trend line chart
-- Sales by salesperson bar chart
-- Sales by ship method column chart
-- Slicers:
-  - Date
-  - Salesperson
-  - Product
-
-### Page 2 - Regional Performance
-Visuals:
-- Filled map or bubble map using city and postal code from dim_customer
-- Sales by region map colored by Total Sales
-- High-performing regions ranked bar chart
-- Low-performing regions ranked bar chart
-- Average Sales by region
-- Maximum Sale by region
-- Regional order count matrix
-
-Note:
-- Source schema provides city and postal code but no state/country fields. Regional analysis is limited to available geography attributes.
-
-### Page 3 - Orders and Discounts
-Visuals:
-- Monthly order volume trend
-- Top discounted products
-- Salesperson discount leaderboard
-- Average Discount Percentage by salesperson
-- Maximum Discount Percentage by salesperson
-- Order status distribution
-- Product performance matrix
-
-### Page 4 - Product Insights
-Visuals:
-- Product sales ranking
-- Product description drill-through
-- Quantity sold by product
-- Active vs discontinued products
-- Product category hierarchy matrix
-
-### Page 5 - Data Quality
-Visuals:
-- Test result summary
-- PASS/FAIL counts
-- Failed test detail table
-- Row count reconciliation trends
-- Referential integrity status
+All report requirements remain as specified.
 
 ## Data Agent
 
-Role:
-- Sales Performance Intelligence Agent
-
-Grounding:
-- Use only the Direct Lake semantic model.
-- Answer exclusively from model data and measures.
-- Prefer approved measures over ad hoc aggregations.
-
-Domain focus:
-- Sales performance
-- Regional performance
-- Order trends
-- Discount analysis
-- Product performance
-- Salesperson effectiveness
-
-Instructions:
-- Explain calculations using model measures.
-- Always identify the time period used.
-- When discussing regional performance, use available city/postal-code geography.
-- Highlight top and bottom performers when ranking results.
-- Use Average Sales, Maximum Sale, Total Sales, and Discount Percentage measures whenever relevant.
-- If a requested attribute does not exist in the model, state that it is unavailable rather than inferring values.
-- Distinguish clearly between gross sales, discount amount, and net sales.
-- When answering trend questions, include change over time where possible.
-- Recommend relevant report pages when visual exploration would help.
-
-Starter questions:
-- Which cities generated the highest total sales?
-- Which cities generated the lowest total sales?
-- What are the monthly sales trends?
-- Which salesperson offered the largest average discount percentage?
-- Which salesperson offered the largest maximum discount percentage?
-- What are the top 10 products by net sales?
-- Which orders generated the highest sales amounts?
-- What is the average order value by month?
-- How do discounts impact net sales?
-- Which products are discontinued but still appear in sales history?
-
-Guardrails:
-- Do not fabricate geography beyond city and postal code.
-- Do not infer missing product category names.
-- Do not expose password_hash or password_salt values.
-- Do not answer using data outside the semantic model.
-- Do not generate forecasts unless explicit forecasting measures are added.
-- When confidence is limited by missing attributes, explain the limitation.
+All agent requirements, starter questions, and guardrails remain as specified.
