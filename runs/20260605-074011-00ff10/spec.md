@@ -116,6 +116,25 @@
   - Required successful catalog existence checks and schema introspection for all 10 source tables.
   - Added a hard-fail condition if any expected source table cannot be resolved exactly as specified.
 
+### Iteration 3 — 2026-06-05 08:09:23Z — failed layer: bronze (run: 20260605-074011-00ff10)
+- **Root cause (1-line summary)**: Silver still found no discoverable Bronze tables, indicating Bronze tables were not being created in the attached target lakehouse catalog/schema that downstream discovery scans.
+- **Cross-table audit**:
+  - Address: yes — must exist as `bronze.address` in the target lakehouse catalog.
+  - Customer: yes — same catalog/schema discoverability requirement.
+  - CustomerAddress: yes — same catalog/schema discoverability requirement.
+  - Product: yes — same catalog/schema discoverability requirement.
+  - ProductCategory: yes — same catalog/schema discoverability requirement.
+  - ProductDescription: yes — same catalog/schema discoverability requirement.
+  - ProductModel: yes — same catalog/schema discoverability requirement.
+  - ProductModelProductDescription: yes — same catalog/schema discoverability requirement.
+  - SalesOrderDetail: yes — same catalog/schema discoverability requirement.
+  - SalesOrderHeader: yes — same catalog/schema discoverability requirement.
+- **Fix approach**: GENERALIZE — the failure affects all Bronze tables equally because downstream discovery is performed at the schema/catalog level, not by individual table logic.
+- **What was changed**:
+  - Tightened Bronze requirements to forbid notebook success unless all 10 tables are visible from `SHOW TABLES IN bronze` in the active target lakehouse session.
+  - Added mandatory verification of current catalog/database before and after every write.
+  - Added a final hard-fail condition if `SHOW TABLES IN bronze` returns anything other than the 10 expected table names.
+
 ## Inputs
 - Workspace: `373889eb-1531-49df-9b0c-474976350c90`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -187,6 +206,7 @@ Mandatory pre-flight validation:
 - Run `CREATE SCHEMA IF NOT EXISTS bronze` and immediately verify `SHOW TABLES IN bronze` executes successfully before processing any source table.
 - Attach and use the target lakehouse **o** before creating tables.
 - Verify the active/default lakehouse is **o** immediately before the first Bronze write; abort the notebook if verification fails.
+- Capture and log the active catalog, current database, and lakehouse context before processing the first table.
 - Before processing each source table:
   - verify the exact source object exists using the fully qualified name shown in the mapping above.
   - verify the source table is readable with `spark.read.table(...)`.
@@ -209,6 +229,7 @@ Mandatory write/discovery requirements:
   - `bronze.bronze_address`
   - any name other than the 10 exact targets listed above.
 - Do not use path-based writes (`save(path)` or `save('Tables/...')`) for Bronze outputs.
+- Immediately before and immediately after each write, verify the active lakehouse context remains the target lakehouse **o**.
 - Immediately after each write:
   - assert `spark.catalog.tableExists('bronze.<table>')`
   - read back the table with `spark.read.table('bronze.<table>')`
@@ -216,6 +237,7 @@ Mandatory write/discovery requirements:
   - capture row count in results output.
   - verify the table provider is Delta and the table is not temporary.
   - verify table metadata identifies schema `bronze` and a managed table type.
+  - verify the table name appears in `SHOW TABLES IN bronze` before continuing to the next table.
   - raise a RuntimeError immediately if any validation fails.
 - Maintain an execution manifest containing:
   - source table name
@@ -238,6 +260,7 @@ Mandatory write/discovery requirements:
     - salesorderdetail
     - salesorderheader
   - verify all 10 tables are readable via `spark.read.table(...)`.
+  - verify all 10 expected names are returned by `SHOW TABLES IN bronze`; count must equal exactly 10.
   - verify the Bronze schema contains 10 persisted managed tables and not views.
   - verify no expected table is missing from catalog enumeration results for schema `bronze`.
   - raise a RuntimeError if any expected table is missing or unreadable.
