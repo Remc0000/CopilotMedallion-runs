@@ -21,6 +21,25 @@
   - Required writing successful Silver tables even when another Silver table fails.
   - Added mandatory schema validation and test-result logging per table before expensive transformations.
 
+### Iteration 2 — 2026-06-05 12:47:26Z — failed layer: gold (run: 20260605-123937-88b905)
+- **Root cause (1-line summary)**: A Gold-layer statement failure cancelled the Spark session because Gold entities were not required to be built and validated independently.
+- **Cross-table audit**:
+  - Address: yes — contributes to dim_customer and missing/invalid columns could fail a dimension build.
+  - Customer: yes — contributes to dim_customer and dim_salesperson.
+  - CustomerAddress: no — not used in Gold by design.
+  - Product: yes — contributes to dim_product and fact joins.
+  - ProductCategory: yes — contributes to dim_product.
+  - ProductDescription: yes — contributes to dim_product.
+  - ProductModel: yes — contributes to dim_product and has known schema limitations.
+  - ProductModelProductDescription: yes — contributes to dim_product bridge logic.
+  - SalesOrderDetail: yes — contributes to fact_sales_order.
+  - SalesOrderHeader: yes — contributes to all date, order, and customer-related dimensions plus fact joins.
+- **Fix approach**: GENERALIZE — the session-cancellation pattern can affect every Gold dimension and fact, so all Gold entities must follow the same isolation, validation, and write-verification pattern.
+- **What was changed**:
+  - Added mandatory per-entity isolation and error handling for all Gold dimensions and facts.
+  - Required schema and join-key validation before every Gold build.
+  - Required immediate post-write validation and continuation of remaining Gold builds when one entity fails.
+
 ## Inputs
 - Workspace: `db12fd40-6fa7-4998-821c-6ce8e3590ad0`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -46,7 +65,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules:
 - Use defensive column references and validate column existence before every join, filter, aggregation, window, and derived-column expression.
@@ -187,23 +206,43 @@ User-request note:
 
 Create schema `gold`.
 
+Mandatory execution pattern for ALL Gold entities:
+- Build each dimension and fact table in its own isolated try/except block.
+- A failure in one Gold entity must be logged to `test.test_results` but must NOT stop remaining Gold entities from being attempted.
+- Before building an entity, assert that all required Silver source tables exist and are readable.
+- Before every join, explicitly validate the required join keys exist in both inputs.
+- Alias all joined DataFrames and project only alias-qualified columns.
+- After writing each Gold table, immediately verify the Delta table exists and can be read back successfully.
+- Maintain a per-entity success/failure summary and only raise a final exception after all Gold entities have been attempted.
+- Never allow a single dimension or fact build failure to cancel the full Gold-stage execution.
+
 Dimension: gold.dim_order_date
 - Source: SalesOrderHeader.OrderDate
 - One row per calendar date.
+- Required source column: `sales_orderheader.order_date`.
 
 Dimension: gold.dim_ship_date
 - Source: SalesOrderHeader.ShipDate
+- Required source column: `sales_orderheader.ship_date`.
 
 Dimension: gold.dim_customer
 - Source: Customer + Address.
 - User explicitly requested bypassing CustomerAddress.
 - Use billing address from SalesOrderHeader.BillToAddressID to associate customer and address.
+- Validate existence of:
+  - customer.customer_id
+  - salesorderheader.customer_id
+  - salesorderheader.bill_to_address_id
+  - address.address_id
+  before performing joins.
 
 Dimension: gold.dim_salesperson
 - Source: Customer.SalesPerson
+- Validate `customer.sales_person` exists before build.
 
 Dimension: gold.dim_order
 - Source: SalesOrderHeader
+- Validate `sales_order_id` exists before build.
 
 Dimension: gold.dim_product
 - Source:
@@ -212,10 +251,26 @@ Dimension: gold.dim_product
   - ProductModelProductDescription
   - ProductDescription
   - ProductModel
+- Validate all join keys before build:
+  - product.product_id
+  - product.product_category_id
+  - product.product_model_id
+  - productcategory.product_category_id
+  - productmodel.product_model_id
+  - productmodelproductdescription.product_model_id
+  - productmodelproductdescription.product_description_id
+  - productdescription.product_description_id
+- Do not reference a ProductModel name column because it is not present in the source schema.
 
 Fact: gold.fact_sales_order
 - Grain:
   - One row per SalesOrderDetail line.
+- Validate existence of:
+  - sales_order_id
+  - sales_order_detail_id
+  - product_id
+  - order_qty
+  before build and before joins to dimensions.
 
 Fact/Dimension rationale:
 - SalesOrderDetail is transactional and therefore fact-like.
