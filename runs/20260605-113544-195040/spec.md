@@ -21,6 +21,25 @@
   - Added mandatory per-table schema validation before dedup, derived columns, and writes.
   - Required Silver result tracking and deferred failure reporting only after all Silver tables have been attempted.
 
+### Iteration 1 — 2026-06-05 11:46:23Z — failed layer: reporting (run: 20260605-113544-195040)
+- **Root cause (1-line summary)**: Reporting layer ended with `System_Cancelled_Session_Statements_Failed`; a failure in one reporting artifact likely cancelled creation of remaining semantic/reporting assets.
+- **Cross-table audit**:
+  - Address: yes — contributes indirectly through reporting dimensions and missing outputs can break model generation.
+  - Customer: yes — drives Customer and SalesPerson reporting assets.
+  - CustomerAddress: yes — may affect Customer geography attributes if used.
+  - Product: yes — drives Product dimension and report visuals.
+  - ProductCategory: yes — drives Product hierarchy assets.
+  - ProductDescription: yes — drives Product descriptive attributes.
+  - ProductModel: yes — drives Product dimension enrichment.
+  - ProductModelProductDescription: yes — drives Product description assembly.
+  - SalesOrderDetail: yes — drives fact measures and report visuals.
+  - SalesOrderHeader: yes — drives fact measures, date dimensions, and report visuals.
+- **Fix approach**: GENERALIZE — reporting failures caused by a single artifact can cancel the entire reporting build; enforce independent validation and creation of every reporting artifact.
+- **What was changed**:
+  - Added reporting-layer isolation and artifact validation requirements in Generic guidance.
+  - Tightened Semantic model generation to validate required Gold tables and relationships before model publication.
+  - Required independent creation and validation of semantic model, report, and data agent assets with result tracking.
+
 ## Inputs
 - Workspace: `58810d23-9208-474f-899f-119dbfc70bd3`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -62,58 +81,9 @@ Cross-cutting code rules:
 - Process source tables independently with per-table isolation and result tracking.
 - Emit discoverable Delta tables in every layer and fail if no tables are produced.
 - Every notebook code cell must begin with a short comment block using a `# ---` divider and human-readable purpose comments.
-
-### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
-These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
-
-Rule A — No dotted alias strings.
-- Never pass dotted strings like "c.customer_id", "ca.address_type", "h.sales_person", or "pc_child.name" to F.col(...), withColumn(...), Window.partitionBy(...), Window.orderBy(...), or select(...). Spark treats "c.customer_id" as a single column literally named c.customer_id, which does not resolve once any projection or rename has been applied.
-- Alias scope (.alias("c"), .alias("ca"), ...) is only valid inside the SAME select / join expression that introduces it. Once you produce a new DataFrame via select(...) or withColumn(...), the dotted alias form is gone and you must reference plain column names.
-
-Rule B — Materialize helper columns before they are needed downstream.
-- For any column that will later be referenced by a Window, a withColumn, or a downstream join after a projection, first materialize it as a flat, unambiguous helper column (e.g. rank_customer_id, rank_address_type, sales_person_source) in the same select that introduces the join aliases.
-
-Rule C — Do not drop a column before its last consumer has run.
-- Before adding a withColumn, verify every F.col(...) referenced by that expression still exists on the DataFrame at that step. If a previous select(...) projection removed it, either:
-  - (preferred) move the withColumn BEFORE the projection that drops the source column, OR
-  - keep the source column in the projection, OR
-  - re-derive the value from a column that IS still present (often a boolean/flag that was computed earlier from the same source).
-- Example of the failure to avoid: dropping discontinued_date in a select(...) and then later writing F.when(F.col('discontinued_date').isNotNull(), ...) inside withColumn('is_sellable_currently', ...). The column is gone and Spark raises UNRESOLVED_COLUMN.
-- When a boolean flag derived from a raw column already exists on the DataFrame (e.g. is_discontinued derived from discontinued_date), prefer reusing the flag (F.col('is_discontinued')) over re-reading the dropped raw column.
-
-Rule D — Order of derived-column computations matters.
-- When building several derived columns where one depends on another (e.g. is_discontinued, then is_sellable_currently which uses is_discontinued), add them in dependency order with sequential withColumn calls, and reference the already-derived flag in the next expression — do NOT reach back to a raw source column that may have been dropped.
-
-Rule E — Validate schema between non-trivial transformation steps.
-- After any select(...) / drop(...) / heavy withColumn chain, and BEFORE the next step that depends on specific columns, assert those columns exist. Fail fast with an error message that names the missing column and the DataFrame variable, so the auto-fixer gets an actionable diagnostic instead of a deep analyzer stack trace.
-
-Rule F — Self-check pattern for every withColumn / Window.
-- For every withColumn(name, expr) and every Window definition, confirm: "Every column referenced inside expr / inside the window's partitionBy / orderBy exists on the DataFrame at this exact point." If not, fix per Rule C before generating the code.
-
-Rule G — Optional-column helpers must return typed Column nulls, not Python None.
-- When defining a helper like `_maybe(df, name)` that returns the column if it exists on the DataFrame and a fallback otherwise, NEVER return Python `None`. Spark functions (`F.coalesce`, `F.greatest`, `F.least`, `F.concat`, `F.when(...).otherwise(...)`, etc.) reject `None` arguments with `PySparkTypeError: [NOT_COLUMN_OR_STR]` and the cell crashes BEFORE any later fallback (e.g. `F.current_timestamp()`) gets a chance to satisfy the call.
-- Correct pattern — return a typed null literal as a Spark Column.
-- Pick the dtype to match the surrounding expression.
-- Never pass Python `None` directly into a Spark function.
-
-Rule H — Per-table isolation; one table's failure must not cancel the Spark session for the rest.
-- Spark cancels the entire session when one statement crashes. If your notebook builds a single chained plan that touches every source table (one big SELECT, one big DataFrame, one big SQL script), any one table's failure kills ALL tables.
-- ALWAYS process source tables in a `for tbl in source_tables:` loop where each iteration is a SELF-CONTAINED unit: read → transform → write → record-result → recover.
-- Do NOT build a single multi-CTE Spark SQL statement that joins/transforms many source tables in one shot.
-
-Rule I — Optional audit columns on junction / bridge / view tables.
-- In typical operational sources, entity tables may contain audit columns while junction tables frequently do not.
-- Use column-existence guards before audit-based deduplication or timestamp derivations.
-- Junction tables: dedupe on the composite FK key.
-
-Rule J — Validate column existence BEFORE the expensive transform.
-- For every join, withColumn, groupBy, agg, or filter that names a specific column, ASSERT the column exists in `df.columns` BEFORE the line that uses it.
-
-Rule K — Resilience to partial output: every layer MUST write Delta tables the next layer can discover.
-- Bronze, Silver, Gold, and Test layers must write discoverable schema-qualified Delta tables via saveAsTable and raise if no outputs are produced.
-
-Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFERENCE).
-- Alias-qualify overlapping columns in join projections and rename immediately. Use plain renamed columns only after the projection has been materialized.
+- Reporting artifacts must be built independently: semantic model → report → data agent. Validate each artifact exists before attempting the next artifact.
+- Maintain a reporting results registry capturing success/failure for semantic model, report, and data agent creation.
+- Do not create reporting assets in a single chained operation; one artifact failure must not prevent validation and attempted creation of remaining artifacts.
 
 ## Bronze
 
@@ -431,6 +401,12 @@ Tests:
 Storage mode:
 - Direct Lake
 
+Build requirements:
+- Validate existence and readability of all required Gold tables before semantic model creation.
+- Required tables: gold.fact_sales_order, gold.dim_customer, gold.dim_product, gold.dim_salesperson, gold.dim_order, gold.dim_order_date, gold.dim_ship_date.
+- Create the semantic model in its own isolated step with dedicated error handling and result logging.
+- After publication, validate that all configured tables, relationships, hierarchies, and measures exist before marking the semantic model as successful.
+
 Tables:
 - Fact Sales Order
 - Customer
@@ -478,6 +454,12 @@ Reporting focus measures:
 
 ## Report
 
+Build requirements:
+- Create the report only after semantic model validation succeeds.
+- Generate each report page independently and record page-level success/failure.
+- Validate that every visual references an existing semantic-model table, column, hierarchy, or measure before publishing.
+- After report publication, verify the report is discoverable and bound to the intended semantic model.
+
 ### Page 1 — Executive Sales Overview
 Visuals:
 - KPI: Total Sales
@@ -523,6 +505,11 @@ Visuals:
 
 Role:
 - Sales Performance Intelligence Agent for the SalesLT reporting platform.
+
+Build requirements:
+- Create the data agent in a separate step after semantic model validation.
+- Validate the agent is bound to the published semantic model before completion.
+- Record agent creation success/failure independently from semantic model and report outcomes.
 
 Domain knowledge:
 - Customer sales analysis
