@@ -59,6 +59,25 @@
   - Strengthened Semantic model requirements to validate every referenced table, column, relationship, hierarchy, and measure before publish.
   - Strengthened Report and Data Agent requirements so only validated semantic-model objects may be referenced.
 
+### Iteration 3 — 2026-06-05 11:59:07Z — failed layer: gold (run: 20260605-113544-195040)
+- **Root cause (1-line summary)**: `spark.createDataFrame(test_rows)` failed with `PySparkValueError: [CANNOT_DETERMINE_TYPE]` because schema inference encountered null-only or mixed-type fields in Gold test result rows (notably timestamp/error-tracking fields).
+- **Cross-table audit**:
+  - Address: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - Customer: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - CustomerAddress: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - Product: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - ProductCategory: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - ProductDescription: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - ProductModel: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - ProductModelProductDescription: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - SalesOrderDetail: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+  - SalesOrderHeader: no — source-table schema is not the trigger; failure occurred while materializing test-result records.
+- **Fix approach**: GENERALIZE — any Gold validation or test framework can generate null-only or mixed-type result fields; all test-result DataFrames must use explicit schemas instead of Spark inference.
+- **What was changed**:
+  - Added a cross-cutting rule requiring explicit StructType schemas for all audit, logging, error, and test-result DataFrames.
+  - Tightened Gold requirements to require schema-defined result tracking tables and typed test records.
+  - Tightened Test requirements by defining required columns and prohibiting schema inference when writing `test.test_results`.
+
 ## Inputs
 - Workspace: `58810d23-9208-474f-899f-119dbfc70bd3`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -105,6 +124,8 @@ Cross-cutting code rules:
 - Do not create reporting assets in a single chained operation; one artifact failure must not prevent validation and attempted creation of remaining artifacts.
 - Before creating any reporting artifact, validate that every referenced table, column, hierarchy, relationship, and measure exists in the source metadata. Fail with a descriptive validation error before publication attempts if any dependency is missing.
 - Record validation results separately from publication results for semantic model, report, and data agent artifacts.
+- For every audit, logging, error-tracking, validation, or test-results DataFrame created from Python objects (`Row`, `dict`, `list`), define an explicit Spark `StructType` schema. Do not rely on Spark schema inference.
+- Columns that may contain only null values during a run (for example `checked_at`, error details, optional expected values, or diagnostic fields) must still be assigned explicit data types in the schema.
 
 ## Bronze
 
@@ -118,10 +139,29 @@ Apply standardized cleansing and conformance.
 
 Target star schema aligned to user requirements.
 
+Additional requirements:
+- Build Gold validation and result-tracking datasets using explicit schemas.
+- Any DataFrame created from in-memory test records, audit rows, error rows, or validation results must be created with a predefined `StructType`; schema inference is prohibited.
+- Gold test execution must allow nullable fields such as diagnostic messages, timestamps, and expected values without relying on type inference.
+
 ## Test
 
 Write all results to:
 - test.test_results
+
+Requirements:
+- Create `test.test_results` using an explicit schema with the following columns:
+  - run_id (string)
+  - test_name (string)
+  - layer (string)
+  - table_name (string)
+  - status (string)
+  - actual (string)
+  - expected (string)
+  - details (string)
+  - checked_at (timestamp)
+- When constructing test-result DataFrames from Python `Row` objects or dictionaries, provide the schema explicitly and permit nullable values for `details` and `checked_at`.
+- Do not use `spark.createDataFrame(test_rows)` without an explicit schema definition.
 
 ## Semantic model
 
