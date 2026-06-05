@@ -1,5 +1,26 @@
 # Run Spec 20260605-113141-2256d6
 
+## Updated specs
+
+### Iteration 1 — 2026-06-05 11:38:46Z — failed layer: silver (run: 20260605-113544-195040)
+- **Root cause (1-line summary)**: Silver layer terminated with `System_Cancelled_Session_Statements_Failed`, indicating one Silver table failure cancelled the Spark session and prevented completion of remaining Silver outputs.
+- **Cross-table audit**:
+  - Address: yes — any Silver transform failure can cancel the shared session.
+  - Customer: yes — contains derived-column logic and dedup logic that could fail independently.
+  - CustomerAddress: yes — junction-table handling and composite-key dedup could fail independently.
+  - Product: yes — derived flags from optional columns could fail independently.
+  - ProductCategory: yes — dedup logic could fail independently.
+  - ProductDescription: yes — dedup logic could fail independently.
+  - ProductModel: yes — dedup logic could fail independently.
+  - ProductModelProductDescription: yes — junction-table handling and culture filtering could fail independently.
+  - SalesOrderDetail: yes — dedup and type-standardization logic could fail independently.
+  - SalesOrderHeader: yes — date-derived columns and dedup logic could fail independently.
+- **Fix approach**: GENERALIZE — the failure pattern is systemic and can affect every Silver table; enforce per-table Silver execution, write isolation, schema validation, and result tracking for all tables.
+- **What was changed**:
+  - Tightened the Silver section to require one independent read-transform-write unit per Silver table.
+  - Added mandatory per-table schema validation before dedup, derived columns, and writes.
+  - Required Silver result tracking and deferred failure reporting only after all Silver tables have been attempted.
+
 ## Inputs
 - Workspace: `58810d23-9208-474f-899f-119dbfc70bd3`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -71,33 +92,19 @@ Rule F — Self-check pattern for every withColumn / Window.
 
 Rule G — Optional-column helpers must return typed Column nulls, not Python None.
 - When defining a helper like `_maybe(df, name)` that returns the column if it exists on the DataFrame and a fallback otherwise, NEVER return Python `None`. Spark functions (`F.coalesce`, `F.greatest`, `F.least`, `F.concat`, `F.when(...).otherwise(...)`, etc.) reject `None` arguments with `PySparkTypeError: [NOT_COLUMN_OR_STR]` and the cell crashes BEFORE any later fallback (e.g. `F.current_timestamp()`) gets a chance to satisfy the call.
-- Correct pattern — return a typed null literal as a Spark Column:
-  ```
-  def _maybe(df, name, dtype='timestamp'):
-      return F.col(name) if name in df.columns else F.lit(None).cast(dtype)
-  ```
-  Pick the `dtype` to match the surrounding expression (`'timestamp'` for date/time coalesces, `'string'` for text, `'double'` for numeric, etc.) so Spark can resolve the result type without ambiguity.
-- Alternative pattern (when the helper genuinely cannot know the dtype) — filter `None`s at the call site BEFORE invoking the Spark function:
-  ```
-  candidates = [c for c in (_maybe(df, 'modified_date'), _maybe(df, 'order_date')) if c is not None]
-  df = df.withColumn('source_dt', F.to_date(F.coalesce(*candidates, F.current_timestamp())))
-  ```
-  Either approach is acceptable, but **never pass Python `None` directly into a Spark function**.
-- Applies to ALL optional-column lookups across Bronze, Silver, Gold — including audit-timestamp coalesces, optional-key joins, fallback string formatting, etc. This is a layer-agnostic rule.
+- Correct pattern — return a typed null literal as a Spark Column.
+- Pick the dtype to match the surrounding expression.
+- Never pass Python `None` directly into a Spark function.
 
 Rule H — Per-table isolation; one table's failure must not cancel the Spark session for the rest.
 - Spark cancels the entire session when one statement crashes. If your notebook builds a single chained plan that touches every source table (one big SELECT, one big DataFrame, one big SQL script), any one table's failure kills ALL tables.
-- ALWAYS process source tables in a `for tbl in source_tables:` loop where each iteration is a SELF-CONTAINED unit: read → transform → write → record-result → recover. Wrap the loop body in `try/except` that calls `_save_error(layer, e, table=tbl)` and APPENDS the failure to a results dict, then **re-raises only AFTER the loop has attempted all tables** (or, if your spec says "fail-fast-first-table", re-raise immediately — but per-table-isolated by default).
-- Do NOT build a single multi-CTE Spark SQL statement that joins/transforms many source tables in one shot. Each table's transform is its own DataFrame chain with its own `.write` call.
-- Do NOT share intermediate temp views across tables. Temp views from one iteration must not be assumed to exist in the next. If you need cross-table joins (typical for Gold), do them in a SECOND loop AFTER all per-table Silver/Gold writes are complete.
+- ALWAYS process source tables in a `for tbl in source_tables:` loop where each iteration is a SELF-CONTAINED unit: read → transform → write → record-result → recover.
+- Do NOT build a single multi-CTE Spark SQL statement that joins/transforms many source tables in one shot.
 
 Rule I — Optional audit columns on junction / bridge / view tables.
-- In typical operational sources (AdventureWorksLT, Northwind, AdventureWorks2019, etc.), entity tables (Customer, Product, SalesOrderHeader) have system audit columns: `ModifiedDate`, `rowguid`. **Junction / bridge tables** (CustomerAddress, ProductModelProductDescription, SalesTerritoryHistory) typically have only the FK columns and may have NO ModifiedDate and NO rowguid. **Views** (vGetAllCategories, vProductAndDescription) may have whatever columns the underlying query projects — frequently NO audit columns.
-- When you write Silver dedup / tie-break / audit logic, you MUST NOT assume `modified_date` (or any other audit column) exists on every table. Use `'modified_date' in df.columns` as a guard and fall back to:
-  - For dedup: a deterministic ranking expression that uses only the natural-key columns (`row_number().over(Window.partitionBy(*pk_cols).orderBy(*pk_cols))`), OR a literal F.lit(timestamp).
-  - For `source_dt` / `_silver_ts`: a typed null literal (`F.lit(None).cast('timestamp')`) or `F.current_timestamp()`.
-- Junction tables: dedupe on the COMPOSITE FK key.
-- View tables: project ONLY the columns actually returned by the view. Do not assume any standard naming.
+- In typical operational sources, entity tables may contain audit columns while junction tables frequently do not.
+- Use column-existence guards before audit-based deduplication or timestamp derivations.
+- Junction tables: dedupe on the composite FK key.
 
 Rule J — Validate column existence BEFORE the expensive transform.
 - For every join, withColumn, groupBy, agg, or filter that names a specific column, ASSERT the column exists in `df.columns` BEFORE the line that uses it.
@@ -143,6 +150,15 @@ Write mode:
 ## Silver
 
 Apply standardized cleansing and conformance.
+
+Execution requirements (mandatory for all Silver tables):
+- Build each Silver table in a completely independent unit of work: read bronze table → validate schema → transform → write Silver table.
+- Maintain a Silver results registry capturing success/failure per table.
+- Wrap every Silver table build in its own try/except block and record the error via `_save_error('silver', e, table=<table_name>)`.
+- Attempt all Silver tables before raising a final aggregated Silver-layer failure.
+- After writing each Silver table, immediately verify the table exists and is readable from the `silver` schema.
+- Before deduplication, assert all configured dedup-key columns exist for that specific table.
+- Before every derived-column transformation, assert source columns exist or apply an explicit fallback path.
 
 Common transformations:
 - Rename all columns to snake_case.
