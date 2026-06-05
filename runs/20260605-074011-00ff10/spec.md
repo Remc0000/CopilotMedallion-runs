@@ -40,6 +40,25 @@
   - Required catalog verification using both `spark.catalog.tableExists()` and `SHOW TABLES IN bronze`.
   - Added a final hard-fail check requiring exactly the 10 expected Bronze table names before notebook success.
 
+### Iteration 1 — 2026-06-05 07:57:06Z — failed layer: bronze (run: 20260605-074011-00ff10)
+- **Root cause (1-line summary)**: Silver could not find any physical Bronze tables under `Tables/bronze/`, indicating Bronze outputs were not materialized in the target lakehouse schema location expected by downstream discovery.
+- **Cross-table audit**:
+  - Address: yes — must physically exist as a managed table in `Tables/bronze/address`.
+  - Customer: yes — same managed-table location requirement.
+  - CustomerAddress: yes — same managed-table location requirement.
+  - Product: yes — same managed-table location requirement.
+  - ProductCategory: yes — same managed-table location requirement.
+  - ProductDescription: yes — same managed-table location requirement.
+  - ProductModel: yes — same managed-table location requirement.
+  - ProductModelProductDescription: yes — same managed-table location requirement.
+  - SalesOrderDetail: yes — same managed-table location requirement.
+  - SalesOrderHeader: yes — same managed-table location requirement.
+- **Fix approach**: GENERALIZE — the failure is a lakehouse table materialization/discovery issue affecting every Bronze table uniformly.
+- **What was changed**:
+  - Tightened Bronze requirements to require managed lakehouse tables backed by the target lakehouse Tables area, not temporary views or external-only registrations.
+  - Added mandatory verification of both catalog registration and physical discoverability for all 10 Bronze tables.
+  - Added a hard-fail condition if the Bronze schema contains fewer than 10 readable managed Delta tables.
+
 ## Inputs
 - Workspace: `373889eb-1531-49df-9b0c-474976350c90`
 - Source Lakehouse: **SalesLT** (`47f5fdf7-1902-471b-958f-5a1e9430070e`)
@@ -78,6 +97,7 @@ Cross-cutting code rules:
 - Process tables in isolated loops with independent read-transform-write logic.
 - Every notebook code cell must begin with a short explanatory comment block.
 - After layer completion, validate discoverability through catalog metadata, not path existence.
+- Do not use temporary views, global temp views, or in-memory objects as layer outputs; every layer output must be a persisted managed Delta table in the target lakehouse.
 
 ## Bronze
 
@@ -107,11 +127,13 @@ Cross-cutting code rules:
 
 Mandatory write/discovery requirements:
 - Run `CREATE SCHEMA IF NOT EXISTS bronze` before any write.
+- Attach and use the target lakehouse **o** before creating tables.
 - For every source table, write exactly one managed Delta table using:
   - `format('delta')`
   - `mode('overwrite')`
   - `option('overwriteSchema','true')`
   - `saveAsTable('bronze.<exact_target_name>')`
+- Tables must be managed lakehouse tables materialized under the target lakehouse Tables area and discoverable as Bronze schema objects. Do not create temporary views, external-only registrations, shortcuts, or catalog entries without persisted Delta data.
 - Do not create nested names such as:
   - `bronze.SalesLT_Address`
   - `bronze.saleslt.address`
@@ -122,6 +144,7 @@ Mandatory write/discovery requirements:
   - assert `spark.catalog.tableExists('bronze.<table>')`
   - read back the table with `spark.read.table('bronze.<table>')`
   - capture row count in results output.
+  - verify the table provider is Delta and the table is not temporary.
 - Before notebook completion:
   - execute `SHOW TABLES IN bronze`
   - verify the discoverable table set equals exactly:
@@ -135,6 +158,8 @@ Mandatory write/discovery requirements:
     - productmodelproductdescription
     - salesorderdetail
     - salesorderheader
+  - verify all 10 tables are readable via `spark.read.table(...)`.
+  - verify the Bronze schema contains 10 persisted managed tables and not views.
   - raise a RuntimeError if any expected table is missing or unreadable.
 - Print a final JSON summary containing all 10 table names and row counts.
 - Do not mark Bronze successful unless all 10 tables are discoverable and queryable through the Spark catalog.
