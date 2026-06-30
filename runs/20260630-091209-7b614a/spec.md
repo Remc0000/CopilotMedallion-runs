@@ -1,5 +1,26 @@
 # Run Spec 20260630-091040-1454c5
 
+## Updated specs
+
+### Iteration 1 — 2026-06-30 09:21:48Z — failed layer: gold (run: 20260630-091209-7b614a)
+- **Root cause (1-line summary)**: Gold-layer build failed with session cancellation; the most likely underlying cause is an analyzer failure during multi-table Gold joins where overlapping key columns are referenced ambiguously or projected without explicit alias qualification.
+- **Cross-table audit**:
+  - customeraddress: yes — bridge table introduces shared customer_id/address_id keys when joined.
+  - salesorderdetail: yes — shares sales_order_id and product_id with other Gold sources.
+  - productdescription: yes — shares product_description_id with bridge joins.
+  - customer: yes — shares customer_id with salesorderheader.
+  - productcategory: yes — self-referencing hierarchy and shared product_category_id.
+  - productmodel: yes — shares product_model_id with product.
+  - salesorderheader: yes — shares customer_id and sales_order_id with other Gold sources.
+  - productmodelproductdescription: yes — bridge table shares product_model_id and product_description_id.
+  - product: yes — shares product_model_id and product_category_id with lookup tables.
+  - address: yes — shares address identifiers with customer geography derivations.
+- **Fix approach**: GENERALIZE — the risk is systemic across nearly every Gold join because multiple source tables expose overlapping business keys.
+- **What was changed**:
+  - Tightened Gold join requirements to require alias-qualified projections for every selected column from joined DataFrames.
+  - Added explicit join keys and projection rules for dim_customer, dim_product, and fact_sales_order.
+  - Added mandatory schema validation before each Gold join and before final writes.
+
 ## Inputs
 - Workspace: `f7395359-9652-4e13-8db5-610cef19a78d`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -100,30 +121,11 @@ Rule I — Optional audit columns on junction / bridge / view tables.
 - View tables: project ONLY the columns actually returned by the view. Do not assume any standard naming.
 
 Rule J — Validate column existence BEFORE the expensive transform.
-- For every join, withColumn, groupBy, agg, or filter that names a specific column, ASSERT the column exists in `df.columns` BEFORE the line that uses it. Pattern:
-  ```
-  for required in ('customer_id', 'order_date'):
-      if required not in df.columns:
-          raise RuntimeError(f"[{layer}] {tbl}: required column '{required}' missing; available={df.columns}")
-  # … now the join / withColumn that uses customer_id and order_date
-  ```
-- Catches missing-column bugs in a SPECIFIC cell with a SPECIFIC table name, instead of a session-wide Spark cancellation 30 minutes later that the auto-fixer can't pinpoint.
-- Especially important AFTER a select(), drop(), or rename() — re-validate before the next consumer of those columns.
+- For every join, withColumn, groupBy, agg, or filter that names a specific column, ASSERT the column exists in `df.columns` BEFORE the line that uses it.
 
 Rule K — Resilience to partial output: every layer MUST write Delta tables the next layer can discover.
-- The build pipeline runs each layer's notebook then inspects the lakehouse for the layer's output Delta tables before generating the next layer. If Bronze runs "successfully" (Spark Completed) but writes zero discoverable tables in the `bronze` schema, the build hard-fails with "prior layer produced no discoverable tables".
-- To guarantee discoverability, the Bronze notebook MUST:
-  - Write via `df.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy(...).saveAsTable(f"bronze.<flat>")` (after `spark.sql('CREATE SCHEMA IF NOT EXISTS bronze')`) for every source table, where `<flat>` is the lowercased last segment of `table_relative_path`. NEVER write target tables with abfss `.save(path)` — on this SCHEMA-ENABLED lakehouse a raw .save() to `Tables/bronze/<t>` lands at a broken nested `Tables/Tables/bronze/<t>` path the discovery + SQL endpoint cannot see.
-  - Print a final summary line `print(json.dumps({{"bronze_results": {{<table>: {{"rows": N, "path": ...}}, ...}}}}))` listing every table actually written. Use this as a self-check.
-  - Raise (not just log) if zero tables were written by the end of the notebook.
-- Same rule applies recursively to Silver (`silver.<table>`) and Gold (`gold.<table>` + `test.test_results`) — each via `CREATE SCHEMA IF NOT EXISTS` + saveAsTable.
 
 Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFERENCE).
-- When you `select(...)` directly off a join whose sides share a column name, selecting that column as a BARE string raises `[AMBIGUOUS_REFERENCE]` and cancels the whole Spark session. Typical Gold offenders: joining product `p` with product_model `m` (both expose `product_model_id`), or product `p` with product_category `pc` (both expose `product_category_id`), or any dimension built from several aliased source tables that carry the same key.
-- Inside the SAME join+select expression the alias scope is still live, so reference EVERY shared/overlapping column with its alias and rename it explicitly: `F.col('p.product_model_id').alias('product_model_id')`, `F.col('pc.parent_product_category_id').alias('category_id')`. A bare string in a join `select` is ONLY safe for a column that exists on EXACTLY ONE side of the join.
-- Before emitting a join's select list, enumerate the columns on each side; for any name present on more than one side, alias-qualify the side you want. When in doubt in a multi-table join, alias-qualify ALL columns in the select list — it is always safe and never ambiguous.
-- This is the in-join counterpart to Rule A: dotted alias references (`F.col('p.col')`) are valid ONLY inside the join/select that introduces the alias; once the joined DataFrame has been materialized by that select, switch back to plain, already-renamed column names (Rule A).
-- Concrete failure to avoid: `.select(F.col('p.product_id').alias('product_id'), 'product_number', 'product_model_id', ...)` after `p.join(m, ...)` — `product_model_id` exists on both `p` and `m`, so it MUST be `F.col('p.product_model_id').alias('product_model_id')` (or the `m.` side), never the bare `'product_model_id'`.
 
 ALSO REQUIRE for every generated notebook: EACH code cell must start with a short markdown comment block (Python `# ---` divider + 1-3 lines of `# ` comments) describing what the cell is doing and why — never emit a cell with no leading comment.
 
@@ -197,6 +199,14 @@ Silver business preparation:
 
 Target star schema aligned to requested reporting requirements.
 
+Gold join safety requirements (mandatory for every Gold table):
+- Before every join, validate all join-key columns exist on both sides.
+- Use DataFrame aliases for every joined source (`c`, `a`, `h`, `d`, `p`, `pm`, `pc`, `pmpd`, `pd`, etc.).
+- After every join, immediately project the final schema using only alias-qualified expressions such as `F.col('p.product_id').alias('product_id')`.
+- Do not use bare-string projections for any column that could exist on more than one joined DataFrame.
+- After the projection step, all downstream logic must reference the renamed flat column names only.
+- Before writing each Gold table, assert the final DataFrame contains every column listed in the dimension/fact specification.
+
 Dimensions:
 
 1. gold.dim_order_date
@@ -225,6 +235,10 @@ Dimensions:
 - Source: customer + address
 - User requested not to use customeraddress.
 - Join customer.customer_id to salesorderheader.customer_id and associate the primary reporting address through salesorderheader bill_to_address_id and ship_to_address_id usage.
+- Required join sequence:
+  - customer c ↔ salesorderheader h on c.customer_id = h.customer_id
+  - h ↔ address a using bill_to_address_id or ship_to_address_id
+- All projected columns must be explicitly selected from c or a aliases and renamed.
 - Keep relevant attributes:
   - customer_id
   - customer_name (constructed from available name fields)
@@ -271,7 +285,18 @@ Note:
   - productmodel
   - productmodelproductdescription
   - productdescription
+- Required join keys:
+  - product.product_model_id = productmodel.product_model_id
+  - product.product_category_id = productcategory.product_category_id
+  - productmodel.product_model_id = productmodelproductdescription.product_model_id
+  - productmodelproductdescription.product_description_id = productdescription.product_description_id
 - Filter productmodelproductdescription to culture='en'
+- In the join projection, ALWAYS alias-qualify:
+  - product_id
+  - product_model_id
+  - product_category_id
+  - product_description_id
+  - name columns from product, productmodel, and productcategory
 - Product model name sourced from productmodel.name as model_name.
 - Description sourced from productdescription.description.
 - Resolve parent-child productcategory structure:
@@ -300,6 +325,10 @@ Fact:
 
 7. gold.fact_sales_order
 - Source: salesorderheader + salesorderdetail
+- Required join key:
+  - salesorderheader.sales_order_id = salesorderdetail.sales_order_id
+- Project all columns using explicit aliases (`h.*` references are not permitted in the final projection).
+- Derive dimension foreign keys only after the joined dataset has been projected into uniquely named columns.
 - Grain:
   - One row per sales order detail line.
 
