@@ -1,5 +1,26 @@
 # Run Spec 20260701-083709-83716a
 
+## Updated specs
+
+### Iteration 1 — 2026-07-01 08:47:18Z — failed layer: gold (run: 20260701-083833-bb740e)
+- **Root cause (1-line summary)**: Gold-layer statement failure caused Spark session cancellation; the current Gold spec does not explicitly require independent dimension/fact builds and validation checkpoints before downstream Gold objects are created.
+- **Cross-table audit**:
+  - customeraddress: yes — participates in dim_customer and a failure can block all later Gold objects if builds are chained.
+  - salesorderdetail: yes — participates in fact_sales_order and can cancel downstream Gold processing.
+  - productdescription: yes — participates in dim_product multi-table join chain.
+  - customer: yes — participates in dim_customer and dim_salesperson.
+  - productcategory: yes — participates in dim_product hierarchy resolution.
+  - productmodel: yes — participates in dim_product joins.
+  - salesorderheader: yes — participates in dim_order_date, dim_ship_date, dim_order, and fact_sales_order.
+  - productmodelproductdescription: yes — participates in dim_product and contains optional bridge-table characteristics.
+  - product: yes — participates in dim_product and fact_sales_order relationships.
+  - address: yes — participates in dim_customer geography enrichment.
+- **Fix approach**: GENERALIZE — the session-cancellation pattern can affect every Gold object regardless of source table, so a single defensive Gold build rule is more appropriate than table-specific fixes.
+- **What was changed**:
+  - Tightened the Gold section to require independent materialization of every dimension and fact table.
+  - Added mandatory schema/key validation before each Gold join and write.
+  - Added a dependency order and prohibition on one large multi-object Gold query plan.
+
 ## Inputs
 - Workspace: `586d3e08-a02f-4277-84c4-49167b1a671b`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -181,6 +202,20 @@ Silver business preparation:
 
 ## Gold
 
+Gold build execution rules:
+- Build and write each Gold table independently in the following order:
+  1. gold.dim_order_date
+  2. gold.dim_ship_date
+  3. gold.dim_salesperson
+  4. gold.dim_order
+  5. gold.dim_customer
+  6. gold.dim_product
+  7. gold.fact_sales_order
+- After each Gold table write, immediately validate the table exists and is readable before starting the next Gold object.
+- Do NOT create all Gold dimensions and facts in one Spark SQL statement, one chained DataFrame lineage, or one shared temp-view dependency graph.
+- Before every Gold join, assert that all join-key columns exist in the contributing Silver tables and raise a descriptive error naming the missing table and column.
+- Materialize and write intermediate dimension outputs before the fact build consumes them.
+
 Target schema requested by user:
 
 ### gold.dim_order_date
@@ -225,6 +260,11 @@ Implementation note:
 - No direct Customer→Address relationship exists in the provided schema.
 - CustomerAddress is the only available bridge linking CustomerID to AddressID.
 - Gold implementation should therefore use CustomerAddress internally to perform the join, but the resulting dimension exposes only customer and address attributes and does not expose the bridge table.
+- Mandatory join validation before execution:
+  - silver.customer.customer_id
+  - silver.customeraddress.customer_id
+  - silver.customeraddress.address_id
+  - silver.address.address_id
 
 Included attributes:
 - customer_id
@@ -293,6 +333,17 @@ Join strategy:
 - productmodelproductdescription.product_description_id → productdescription.product_description_id
 - Filter productmodelproductdescription where culture = 'en'
 
+Mandatory join validation before execution:
+- silver.product.product_id
+- silver.product.product_category_id
+- silver.product.product_model_id
+- silver.productcategory.product_category_id
+- silver.productmodel.product_model_id
+- silver.productmodelproductdescription.product_model_id
+- silver.productmodelproductdescription.product_description_id
+- silver.productmodelproductdescription.culture
+- silver.productdescription.product_description_id
+
 Parent-child category handling:
 - Parent category from productcategory.parent_product_category_id
 - Subcategory from productcategory.name
@@ -327,6 +378,14 @@ Source:
 
 Grain:
 - One row per sales order line.
+
+Mandatory join validation before execution:
+- silver.salesorderheader.sales_order_id
+- silver.salesorderdetail.sales_order_id
+- gold.dim_customer.customer_id
+- gold.dim_product.product_id
+- gold.dim_order.sales_order_id
+- gold.dim_salesperson.salesperson_key
 
 Keys:
 - order_date_key
