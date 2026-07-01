@@ -21,6 +21,25 @@
   - Added mandatory schema/key validation before each Gold join and write.
   - Added a dependency order and prohibition on one large multi-object Gold query plan.
 
+### Iteration 2 — 2026-07-01 08:49:45Z — failed layer: gold (run: 20260701-083833-bb740e)
+- **Root cause (1-line summary)**: Gold-layer Spark session was cancelled after one or more Gold object statements failed; the spec still allows a failed dimension build to cascade into downstream Gold processing.
+- **Cross-table audit**:
+  - customeraddress: yes — dim_customer depends on it and a failed build can cascade.
+  - salesorderdetail: yes — fact_sales_order depends on successful upstream Gold dimensions.
+  - productdescription: yes — dim_product dependency chain can fail independently.
+  - customer: yes — used by dim_customer and dim_salesperson.
+  - productcategory: yes — used by dim_product hierarchy resolution.
+  - productmodel: yes — used by dim_product.
+  - salesorderheader: yes — used by multiple Gold dimensions and the fact.
+  - productmodelproductdescription: yes — used by dim_product bridge logic.
+  - product: yes — used by dim_product and fact_sales_order.
+  - address: yes — used by dim_customer enrichment.
+- **Fix approach**: GENERALIZE — the failure mode is execution-orchestration related and can affect any Gold object regardless of source table.
+- **What was changed**:
+  - Tightened Gold execution requirements to require per-object try/except isolation, immediate materialization, and schema validation.
+  - Added mandatory dependency gating so downstream Gold objects are skipped when prerequisite Gold tables are unavailable.
+  - Added explicit row-count/readability checks after every Gold write before continuing.
+
 ## Inputs
 - Workspace: `586d3e08-a02f-4277-84c4-49167b1a671b`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -46,7 +65,7 @@ Apply these reference skills/agents at all times:
 - powerbi-authoring-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-authoring-cli
 - powerbi-consumption-cli skill: https://github.com/microsoft/skills-for-fabric/tree/main/skills/powerbi-consumption-cli
 - powerbi-semantic-model-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-semantic-model-authoring
-- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
+- powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi-report-authoring
 
 Cross-cutting code rules:
 - Use defensive column references and validate required columns before joins, filters, aggregations, windows, and derived-column logic.
@@ -212,9 +231,15 @@ Gold build execution rules:
   6. gold.dim_product
   7. gold.fact_sales_order
 - After each Gold table write, immediately validate the table exists and is readable before starting the next Gold object.
+- After each Gold write, perform a mandatory validation sequence: table exists → schema can be read → row count query succeeds. Only then continue.
+- Each Gold object build must run inside its own try/except block. Record success/failure per object and do not reuse partially built DataFrames from a failed object.
 - Do NOT create all Gold dimensions and facts in one Spark SQL statement, one chained DataFrame lineage, or one shared temp-view dependency graph.
 - Before every Gold join, assert that all join-key columns exist in the contributing Silver tables and raise a descriptive error naming the missing table and column.
 - Materialize and write intermediate dimension outputs before the fact build consumes them.
+- Dependency gating is mandatory:
+  - fact_sales_order may execute only if dim_order_date, dim_ship_date, dim_salesperson, dim_order, dim_customer, and dim_product were successfully written and validated.
+  - Any dimension that depends on another Gold object must verify the dependency exists before reading it.
+- Never read a Gold table that was created earlier in the same notebook unless it has already passed the existence, schema, and row-count validation checks.
 
 Target schema requested by user:
 
