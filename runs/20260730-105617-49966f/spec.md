@@ -1,5 +1,26 @@
 # Run Spec 20260730-105433-edc8b4
 
+## Updated specs
+
+### Iteration 1 — 2026-07-30 11:00:24Z — failed layer: bronze (run: 20260730-105617-49966f)
+- **Root cause (1-line summary)**: Notebook generation returned zero executable cells, so no per-table Bronze ingestion code was available to run; the emitted diagnostic was labeled `silver`, but the run metadata identifies Bronze as the failed/resume layer.
+- **Cross-table audit**:
+  - `customeraddress`: yes — zero-cell generation prevents this table from being ingested.
+  - `salesorderdetail`: yes — zero-cell generation prevents this table from being ingested.
+  - `productdescription`: yes — zero-cell generation prevents this table from being ingested.
+  - `customer`: yes — zero-cell generation prevents this table from being ingested.
+  - `productcategory`: yes — zero-cell generation prevents this table from being ingested.
+  - `productmodel`: yes — zero-cell generation prevents this table from being ingested.
+  - `salesorderheader`: yes — zero-cell generation prevents this table from being ingested.
+  - `productmodelproductdescription`: yes — zero-cell generation prevents this table from being ingested.
+  - `product`: yes — zero-cell generation prevents this table from being ingested.
+  - `address`: yes — zero-cell generation prevents this table from being ingested.
+- **Fix approach**: GENERALIZE — the failure occurs before any table-specific transformation and therefore affects all ten source tables uniformly; the notebook must always contain a deterministic minimum set of executable cells and explicitly cover every configured table.
+- **What was changed**:
+  - Tightened **Generic guidance** with a no-empty-notebook contract requiring parameter, setup, ingestion, validation, and final status cells in every generated layer notebook.
+  - Tightened **Bronze** to require executable per-table ingestion coverage for exactly the ten configured source tables, with a pre-execution coverage assertion and a nonempty final result assertion.
+  - Required notebook-generation failure to be raised explicitly rather than returning an empty cell collection or a misleading downstream-layer diagnostic.
+
 ## Inputs
 - Workspace: `692949a8-3b8c-41ea-9617-5280c45b1a0f`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -121,6 +142,18 @@ Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFE
 - This is the in-join counterpart to Rule A: dotted alias references (`F.col('p.col')`) are valid ONLY inside the join/select that introduces the alias; once the joined DataFrame has been materialized by that select, switch back to plain, already-renamed column names (Rule A).
 - Concrete failure to avoid: `.select(F.col('p.product_id').alias('product_id'), 'product_number', 'product_model_id', ...)` after `p.join(m, ...)` — `product_model_id` exists on both `p` and `m`, so it MUST be `F.col('p.product_model_id').alias('product_model_id')` (or the `m.` side), never the bare `'product_model_id'`.
 
+Rule M — Generated notebooks must never be empty.
+- Every generated layer notebook must contain a nonempty ordered list of executable code cells. Returning `None`, an empty cell list, prose-only output, or markdown-only cells is a generation failure and must raise `RuntimeError("[<layer>] notebook generation returned zero executable code cells")` before notebook submission.
+- At minimum, every generated Spark notebook must contain executable cells for:
+  1. Parameters and imports.
+  2. Lakehouse/schema setup and helper functions.
+  3. The layer's table-processing logic.
+  4. Output validation and result collection.
+  5. A final machine-readable summary and explicit failure propagation.
+- Before notebook submission, validate that every configured input or required output table is represented by the processing logic, either through an explicit per-table cell or through an executable loop over the exact configured table list.
+- Do not silently substitute another layer name in generation or error messages. The notebook, `_save_error` calls, runtime diagnostics, and final summary must all use the active layer name supplied by orchestration.
+- If the model response cannot be parsed into executable cells, retry generation once using the same active-layer spec; if the retry is also empty or invalid, raise the explicit generation error rather than advancing to another layer.
+
 ### Notebook cell documentation
 Every generated notebook must apply this pattern to every code cell:
 ```
@@ -131,15 +164,24 @@ df = spark.read.table(...)
 ```
 
 ## Bronze
+- Generate and execute a nonempty Bronze notebook; it must not return an empty notebook-cell collection. The notebook must contain, at minimum, executable parameter/import, schema setup, per-table ingestion, validation, and final summary cells as required by Rule M.
+- Define the exact configured list in the parameter cell:
+  `source_tables = ['customeraddress', 'salesorderdetail', 'productdescription', 'customer', 'productcategory', 'productmodel', 'salesorderheader', 'productmodelproductdescription', 'product', 'address']`.
+  Assert before ingestion that this list is nonempty, contains exactly ten unique names, and equals the configured Inputs list; raise an error naming missing or unexpected tables if it does not.
 - Create `bronze` and land one Delta table per selected source table, preserving source names and source data types.
-- Add `_run_id`, `_ingested_at`, `_source_lakehouse`, `_source_table`, and `_source_modified_at`; populate the last field from `ModifiedDate`.
+- Add `_run_id`, `_ingested_at`, `_source_lakehouse`, `_source_table`, and `_source_modified_at`.
+- Populate `_source_modified_at` from the case-insensitive source column matching `ModifiedDate` when that column exists. For a table without `ModifiedDate`, populate `_source_modified_at` with `F.lit(None).cast('timestamp')`; never fail ingestion solely because an optional audit column is absent.
 - Preserve source column names in Bronze so it remains a faithful raw landing layer. Snake-case conversion occurs in Silver.
-- Process all ten tables independently and record source and written row counts in the notebook result summary.
+- Process all ten tables independently in an executable `for tbl in source_tables:` loop and record source and written row counts in the notebook result summary.
+- Each loop iteration must explicitly perform read → add Bronze metadata → optional partition decision → schema-qualified write → written-row validation → result recording. A generated comment, placeholder, `pass`, TODO, or prose description does not satisfy this requirement.
+- Before submitting the notebook, validate processing coverage with the exact configured list. At runtime, maintain `attempted_tables`, `bronze_results`, and `bronze_errors`; assert after the loop that every configured table appears in exactly one of `bronze_results` or `bronze_errors`.
 - Use full-table idempotent overwrite because no source change-tracking or ingestion watermark column was supplied. `ModifiedDate` can support a later incremental design, but is not sufficient by itself to detect deletions.
 - Do not partition the relatively small master/junction tables: `customeraddress`, `productdescription`, `customer`, `productcategory`, `productmodel`, `productmodelproductdescription`, `product`, and `address`.
 - Do not partition `salesorderdetail`; its available columns do not provide a natural date partition.
 - Partition `salesorderheader` by a derived `_order_year` based on `OrderDate` only if volume justifies partitioning; otherwise leave it unpartitioned to avoid small files. Retain the original `OrderDate`.
 - Write each result with schema-qualified `saveAsTable('bronze.<table>')`.
+- Print a final machine-readable JSON summary containing all attempted tables, successful table row counts, and per-table errors.
+- Raise after all table attempts if `bronze_results` is empty, if any configured table was not attempted, or if any table failed. The raised message must identify the active layer as `bronze`, list failed/missing tables, and must not label the failure as `silver`.
 - Table roles observed from the supplied columns:
   - Transaction header: `salesorderheader`, keyed by `SalesOrderID`.
   - Transaction lines: `salesorderdetail`, keyed by `SalesOrderDetailID` and linked by `SalesOrderID`.
