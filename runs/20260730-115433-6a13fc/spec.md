@@ -59,6 +59,25 @@
   - Tightened `## Silver` to require structured `START`/`SUCCESS`/`FAIL` diagnostics around each Spark action and a guarded pre-write materialization checkpoint for every table.
   - Replaced deferred continuation after Spark execution errors with fail-fast behavior; deferred aggregation remains permitted only for non-terminal validation findings while an explicit Spark health probe succeeds.
 
+### Iteration 4 — 2026-07-30 12:13:00Z — failed layer: gold (run: 20260730-115433-6a13fc)
+- **Root cause (1-line summary)**: A Gold Spark statement failed and Fabric returned only `System_Cancelled_Session_Statements_Failed`; the Gold specification also treated optional audit columns such as `modified_date` as mandatory ranking inputs, especially on the `productmodelproductdescription` junction table.
+- **Cross-table audit**:
+  - `customeraddress`: no — Gold is explicitly prohibited from consuming this bridge, but its audit columns are likewise optional and must not be assumed if it is ever inspected.
+  - `salesorderdetail`: yes — Gold fact processing must not assume optional audit columns beyond its declared business keys and measures.
+  - `productdescription`: yes — description ranking or projection could fail if an optional audit column is referenced without a schema guard.
+  - `customer`: yes — Gold must use its guaranteed business columns and treat `modified_date` and `rowguid` as optional.
+  - `productcategory`: yes — the category self-join must not depend on optional audit columns.
+  - `productmodel`: yes — the product-model join must not depend on optional audit columns.
+  - `salesorderheader`: yes — latest-order ranking currently mentions `modified_date`; it must omit that ordering expression when the column is absent and retain deterministic business-key tie-breakers.
+  - `productmodelproductdescription`: yes — this junction guarantees `product_model_id`, `product_description_id`, and `culture`, but does not guarantee `modified_date` or `rowguid`; directly ranking by either can trigger an unresolved-column failure.
+  - `product`: yes — Gold derived columns and joins must not reach back to optional audit columns after projection.
+  - `address`: yes — the current-region join must use `address_id` and selected address attributes without assuming audit columns.
+- **Fix approach**: GENERALIZE — optional audit-column availability is a systemic input-shape issue across the Silver tables, so Gold must construct every projection, ranking order, and tie-break list from columns verified on the DataFrame at that exact stage; this also covers the junction-table case without changing successful upstream layers.
+- **What was changed**:
+  - Tightened `## Gold` to make `modified_date`, `rowguid`, and other audit fields optional on every Silver input and to prohibit constructing `F.col(...)`, sort expressions, or projections for absent optional columns.
+  - Defined deterministic fallbacks for latest-customer-order ranking and English product-description selection using guaranteed business columns, including the real junction columns `product_model_id`, `product_description_id`, and `culture`.
+  - Added named Gold action diagnostics, pre-write materialization checkpoints, per-output isolation, and immediate re-raise after the first Spark failure so the originating output/action is preserved before Fabric cancels the session.
+
 ## Inputs
 - Workspace: `b4dc08af-f88c-47ab-aa71-7d33d2c473e9`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -268,12 +287,42 @@ Rule M — Named Spark-action diagnostics and pre-write checkpoints.
 - Do not attempt to “finish the loop” after a Spark execution exception. In Fabric, preserving the first table/action traceback and stopping immediately takes precedence over deferred attempts because the cancelled session cannot safely execute the remaining statements.
 
 ## Gold
+- Resume from the existing `silver` Delta tables; do not re-ingest or rewrite Bronze or Silver during this retry.
 - Build a Direct Lake star schema at sales-order-line grain and write all outputs with schema-qualified Delta tables.
+- Create `gold` with `spark.sql("CREATE SCHEMA IF NOT EXISTS gold")`.
+- Before building outputs, verify that these catalog tables are readable: `silver.customer`, `silver.salesorderdetail`, `silver.productdescription`, `silver.productcategory`, `silver.productmodel`, `silver.salesorderheader`, `silver.productmodelproductdescription`, `silver.product`, and `silver.address`. Do not read `silver.customeraddress` because the requested Gold design explicitly prohibits using it.
+- Treat `modified_date`, `rowguid`, `_source_modified_at`, `_silver_ts`, and other audit columns as optional on every Silver input. Before creating any projection, `Window.orderBy`, sort expression, `coalesce`, or tie-break list, inspect the columns on that exact DataFrame stage.
+- Never construct `F.col("modified_date")`, `F.col("rowguid")`, or another optional-column expression unless that name exists in the DataFrame at that stage. Remove absent optional columns from Python expression lists before passing those lists to Spark functions. Do not substitute Python `None` into a Spark expression.
+- Required Gold business columns must be validated separately from optional audit columns. A missing required business column must raise a Python `RuntimeError` naming the Silver table, Gold output, transformation stage, missing column, and available columns before a Spark action is attempted.
+- The guaranteed business grain of `silver.productmodelproductdescription` is `(product_model_id, product_description_id, culture)`. Do not require or unconditionally project `modified_date`, `rowguid`, or a surrogate bridge ID from this junction table.
+- For every joined DataFrame, alias each input and use alias-qualified `Column` expressions in the join condition and immediate projection. Explicitly rename selected columns to unique flat names; use only those flat names after the projection.
+- Build and verify Gold outputs sequentially in this order:
+  1. `gold.dim_order_date`
+  2. `gold.dim_ship_date`
+  3. `gold.dim_customer`
+  4. `gold.dim_sales_person`
+  5. `gold.dim_order`
+  6. `gold.dim_product`
+  7. `gold.fact_sales_order`
+- For each Gold output, print compact JSON `START` and `SUCCESS` records around these named Spark actions:
+  - `read_inputs_<output>`
+  - `materialize_<output>`
+  - `write_<output>`
+  - `catalog_exists_<output>`
+  - `read_back_<output>`
+  - `describe_detail_<output>`
+  - `count_read_back_<output>`
+- Immediately before writing each output, validate its required columns and execute `<output_df>.limit(1).collect()` within the corresponding `materialize_<output>` boundary. This checkpoint must analyze the complete join, window, projection, and derived-column plan; a zero-row result is valid.
+- Write each output independently with `.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("gold.<output>")`. Do not use a path-only write, temporary view, or one chained multi-output Spark plan.
+- After each write, verify catalog existence, readability, Delta format, required key columns, and row count before beginning the next output.
+- If any Gold Spark action fails, immediately print a `FAIL` record containing `run_id`, `layer="gold"`, `table`/output, named action, exception class, exception message, and `traceback.format_exc()`, then re-raise the original exception. Do not attempt another Gold output, health probe, catalog scan, Spark-backed error write, cleanup action, or summary action in the failed session.
 - `gold.dim_order_date`: role-specific date dimension spanning the minimum through maximum `salesorderheader.order_date`, with date, year, quarter, month number/name, year-month, week, and day attributes. Key is integer `yyyymmdd`.
 - `gold.dim_ship_date`: separate role-specific date dimension spanning non-null `ship_date`, with the same date attributes and a `Year > Quarter > Month > Date` hierarchy. Use a designated unknown/not-shipped member for null ship dates.
 - `gold.dim_customer`: one row per `customer_id`, retaining relevant identity, company, email, phone, and regional address attributes; exclude credentials and raw salesperson.
   - NOTE: `customer` has no `address_id`, so a direct Customer-to-Address join is impossible, and the user explicitly prohibited using `customeraddress`.
-  - Implement the requested combination by ranking each customer's orders by `order_date`, `modified_date`, and `sales_order_id`, then joining the latest order's `ship_to_address_id` to `address.address_id`. This yields a deterministic current shipping region without using `customeraddress`.
+  - Implement the requested combination by ranking each customer's orders and joining the latest order's `ship_to_address_id` to `address.address_id`. Require `customer_id`, `order_date`, `sales_order_id`, and `ship_to_address_id` from `silver.salesorderheader`.
+  - Construct the latest-order descending sort list in this exact precedence: `order_date`, optional `modified_date` only if present on the projected order DataFrame, then mandatory `sales_order_id`. Never create the `modified_date` sort expression when that column is absent.
+  - Materialize flat helper columns such as `rank_customer_id`, `rank_order_date`, optional `rank_modified_date`, `rank_sales_order_id`, and `rank_ship_to_address_id` before defining the window. Reference only those flat names in the window.
   - Customers without an order receive an unknown address/region. This is a current-profile dimension and does not preserve historical customer-region changes.
 - `gold.dim_sales_person`: distinct normalized `sales_person_username` values sourced from Customer, with a stable hash surrogate key and display name equal to the normalized username. Include an Unknown member.
 - `gold.dim_order`: one row per `sales_order_id`, holding suitable non-additive/header descriptors: revision number, status, online-order flag, purchase-order number, account number, ship method, and comment. Exclude credit-card approval code and header monetary measures.
@@ -282,15 +331,21 @@ Rule M — Named Spark-action diagnostics and pre-write checkpoints.
   - A self-join from leaf category to `parent_product_category_id`; when a parent exists, expose parent `name` as category and leaf `name` as subcategory. For root products, expose leaf name as category and null/“Uncategorized” as subcategory.
   - `productmodel.name` renamed to `model_name`.
   - `productmodelproductdescription` filtered case-insensitively to `culture='en'`, then joined to `productdescription`; expose only its `description`.
-  - If multiple English descriptions exist for one model, retain the greatest bridge `modified_date`, then greatest `product_description_id`.
+  - Before filtering or ranking the bridge, require exactly the relevant guaranteed columns `product_model_id`, `product_description_id`, and `culture`. Normalize the culture comparison with `F.lower(F.trim(F.col("culture"))) == F.lit("en")`.
+  - If multiple English descriptions exist for one model, rank by optional bridge `modified_date` descending only when it exists, then by mandatory `product_description_id` descending. If bridge `modified_date` is absent, rank solely by `product_description_id` descending. Do not reference `rowguid` unless it is present and intentionally included as an additional optional tie-breaker.
+  - Project the selected bridge row to flat `product_model_id` and `product_description_id` columns before joining to `productdescription`; do not reference bridge aliases after that projection.
   - Retain relevant merchandising attributes such as product number, color, size, weight, cost, list price, sell dates, discontinued status, and thumbnail filename; omit binary thumbnail data from the analytical dimension.
 - `gold.fact_sales_order`: combine `salesorderheader` and `salesorderdetail` on `sales_order_id`, at one row per `sales_order_detail_id`.
+  - Before joining, require `sales_order_id` on both inputs and `sales_order_detail_id`, `product_id`, `order_qty`, `unit_price`, and `unit_price_discount` on detail.
+  - Alias header as `h` and detail as `d`; use `F.col("h.sales_order_id") == F.col("d.sales_order_id")` only in the join condition and use alias-qualified expressions in the immediate projection. Materialize exactly one flat `sales_order_id` and one flat `sales_order_detail_id` afterward.
   - Foreign keys: order-date key, ship-date key, customer key, salesperson key derived through the order customer, order key, and product key.
   - Measures: order quantity, unit price, unit discount fraction, gross sales amount (`quantity × unit price`), discount amount (`gross × unit_price_discount`), net sales amount (`gross − discount`), allocated tax, allocated freight, and allocated total amount.
   - Allocate header tax and freight across lines in proportion to line net sales; if an order has zero net sales, allocate evenly across its lines. Reconciliation must equal header tax/freight within decimal rounding tolerance.
   - Keep dates and descriptive header fields in dimensions rather than duplicating them in the fact.
 - Do not create a separate address dimension because the requested Gold schema places address attributes in Customer. Regional analysis uses Customer country, state/province, city, and postal code.
 - Build dimensions first, then the fact in a second isolated phase. Include explicit Unknown dimension members so unresolved optional keys remain analyzable.
+- After all seven outputs have been written and verified, run a named `final_health_probe_gold`, then `SHOW TABLES IN gold` as `show_tables_gold`. Require the exact expected output set and print a machine-readable summary of written, discovered, missing, and unexpected Gold tables.
+- Never attempt to finish the Gold output sequence after a failed Spark statement. Preserving the first output/action traceback takes precedence over deferred error aggregation because the cancelled Fabric session cannot safely execute subsequent statements.
 
 ## Test
 - Create `test.test_results` with: `run_id`, `test_name`, `layer`, `table_name`, `status`, `actual`, `expected`, `details`, `checked_at`.
