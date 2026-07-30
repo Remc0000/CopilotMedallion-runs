@@ -40,6 +40,25 @@
   - Tightened **Bronze** so its parent notebook performs orchestration only and launches one single-table child execution per configured source table, capturing table, operation, child run/session ID, and full nested error details.
   - Added explicit source preflight, child-result contracts, and a prohibition on submitting further Spark statements to a canceled child session.
 
+### Iteration 3 — 2026-07-30 11:09:55Z — failed layer: silver (run: 20260730-105617-49966f)
+- **Root cause (1-line summary)**: Silver-resume notebook generation returned zero executable cells, while the diagnostic was incorrectly labeled `gold`, so no Silver transformations could execute and the build could not validly advance to Gold.
+- **Cross-table audit**:
+  - `customeraddress`: yes — an empty Silver notebook prevents its composite-key junction cleanup and write.
+  - `salesorderdetail`: yes — an empty Silver notebook prevents its typed monetary and quantity transformations.
+  - `productdescription`: yes — an empty Silver notebook prevents its cleanup and keyed deduplication.
+  - `customer`: yes — an empty Silver notebook prevents its cleanup and preservation of `sales_person`.
+  - `productcategory`: yes — an empty Silver notebook prevents its hierarchy columns from being normalized.
+  - `productmodel`: yes — an empty Silver notebook prevents its keyed deduplication and write.
+  - `salesorderheader`: yes — an empty Silver notebook prevents its order-date and monetary normalization.
+  - `productmodelproductdescription`: yes — an empty Silver notebook prevents its composite-key junction cleanup and `culture` normalization.
+  - `product`: yes — an empty Silver notebook prevents its pricing, cost, and product-key transformations.
+  - `address`: yes — an empty Silver notebook prevents its geography cleanup and keyed deduplication.
+- **Fix approach**: GENERALIZE — zero-cell generation is a layer-level failure that uniformly blocks all ten Silver outputs; a single generation manifest and exact table-coverage contract is safer than ten independent table-specific fixes.
+- **What was changed**:
+  - Tightened **Generic guidance** with an active/resume-layer identity contract: iteration 3 must generate and validate `silver`, must not report `gold`, and must not advance until all required Silver outputs are discoverable.
+  - Tightened **Silver** to require a nonempty executable notebook with deterministic setup, per-table processing, validation, and final-summary cells covering exactly all ten Bronze inputs.
+  - Added pre-submission cell-count and table-coverage assertions, one retry for invalid generation, and an explicit `"[silver] notebook generation returned zero executable code cells"` failure if the retry remains invalid.
+
 ## Inputs
 - Workspace: `692949a8-3b8c-41ea-9617-5280c45b1a0f`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -73,10 +92,12 @@ Apply these reference skills/agents at all times:
 - Handle REST responses defensively: use `if x is None: raise RuntimeError(...)` before any `.get()` call.
 - Create target schemas with `CREATE SCHEMA IF NOT EXISTS bronze`, `silver`, `gold`, and `test`.
 - Write schema-qualified Delta tables with `saveAsTable('<schema>.<table>')`; never use raw ABFSS `.save()` for the schema-enabled target Lakehouse.
-- Put workspace, source Lakehouse, target Lakehouse, run ID, table list, and configurable behavior in notebook parameter cells.
+- Put workspace, source Lakehouse, target Lakehouse, run ID, active/resume layer, table list, and configurable behavior in notebook parameter cells.
 - Use idempotent overwrite patterns, including `mode('overwrite')` and `option('overwriteSchema','true')`; replace only the current build's intended tables.
 - Use error-loud `try/except` handling that calls `_save_error(layer, e)` or `_save_error(layer, e, table=tbl)` and then re-raises according to the per-table isolation policy.
 - Every generated notebook code cell must start with a short human-readable comment block consisting of a Python `# ---` divider and one to three `# ` comment lines explaining what the cell does and why. Never emit an uncommented code cell.
+- Treat the orchestrator-provided failed/resume layer as authoritative. Generate, validate, execute, summarize, and report errors using that exact layer; do not infer or substitute the next layer from prior outputs.
+- Do not advance from a failed/resume layer until its required Delta outputs have been written and verified as discoverable. A diagnostic naming another layer is itself a generation/identity failure and must not trigger execution of that other layer.
 
 ### Global Spark column-reference rules (apply to ALL layers: Bronze, Silver, Gold)
 These rules exist to prevent recurring `UNRESOLVED_COLUMN` / `AnalysisException` analyzer errors. They are layer-agnostic — apply them anywhere a Spark DataFrame is transformed.
@@ -179,6 +200,12 @@ Rule M — Generated notebooks must never be empty.
 - Do not silently substitute another layer name in generation or error messages. The notebook, `_save_error` calls, runtime diagnostics, and final summary must all use the active layer name supplied by orchestration.
 - If the model response cannot be parsed into executable cells, retry generation once using the same active-layer spec; if the retry is also empty or invalid, raise the explicit generation error rather than advancing to another layer.
 
+Rule N — Bind notebook generation to the authoritative active/resume layer.
+- The generation request, returned notebook manifest, notebook parameters, error prefix, final summary key, and target schema must all identify the same orchestrator-provided active/resume layer.
+- Before submission, assert that `generated_layer == active_layer`. If the active layer is `silver`, any result labeled `gold`, targeting `gold.*`, or lacking an explicit layer identity is invalid and must be discarded without execution.
+- For an invalid layer identity or zero executable cells, retry generation once with the unchanged active-layer spec and exact required table manifest. If the retry fails, raise `RuntimeError("[silver] notebook generation returned zero executable code cells")` when Silver is active; never rewrite this as a Gold error.
+- Layer advancement is permitted only after the active layer's required output manifest is complete and every output is discoverable through schema-qualified table discovery.
+
 ### Notebook cell documentation
 Every generated notebook must apply this pattern to every code cell:
 ```
@@ -224,11 +251,26 @@ df = spark.read.table(...)
   - Junctions: `customeraddress` and `productmodelproductdescription`.
 
 ## Silver
+- Generate and execute a nonempty Silver notebook for the authoritative active/resume layer `silver`. The generated notebook manifest, parameter cell, `_save_error` calls, target schema, final summary, and all diagnostics must use `layer='silver'`; do not return, execute, or report a notebook labeled `gold`.
+- Before notebook submission, require at least five executable code cells covering:
+  1. Parameters and imports.
+  2. `silver` schema setup and helper functions.
+  3. Executable table-processing logic over the exact required table manifest.
+  4. Output readback and result validation.
+  5. Final machine-readable `silver_results` summary and explicit failure propagation.
+- Define the exact required Silver table manifest in executable code:
+  `silver_tables = ['customeraddress', 'salesorderdetail', 'productdescription', 'customer', 'productcategory', 'productmodel', 'salesorderheader', 'productmodelproductdescription', 'product', 'address']`.
+  Assert before submission and again before execution that it contains exactly ten unique names and exactly matches the configured Inputs list.
+- Validate generated notebook coverage before submission: every name in `silver_tables` must be represented by an explicit processing cell or by an executable loop over that exact list. Comments, markdown, placeholders, `pass`, TODOs, and prose do not count as table coverage.
+- If generation returns `None`, no parseable cells, zero executable cells, a manifest labeled `gold`, or processing logic that omits any required table, discard it and retry generation once using `active_layer='silver'` and the unchanged exact table manifest. If the retry remains invalid, raise `RuntimeError("[silver] notebook generation returned zero executable code cells")` before notebook submission; do not emit `gold: LLM did not return any notebook cells`.
+- Read only the already-succeeded schema-qualified inputs `bronze.<table>` and write schema-qualified outputs `silver.<table>`. Do not require rerunning or modifying Bronze.
 - Create cleaned, typed, snake-case Delta tables with the same table names under `silver`.
+- Before snake-case renaming each table, build the complete source-to-target column-name map and assert that target names are unique case-insensitively. If two Bronze columns normalize to the same Silver name, fail with `RuntimeError("[silver] <table>: snake_case rename collision: <source columns> -> <target>")`; do not silently overwrite or drop either column.
+- For each table, assert `spark.catalog.tableExists('bronze.<table>')` before reading it. After snake-case projection, assert that the table-specific deduplication keys listed below exist before constructing any window.
 - Trim strings, convert blank strings to null, retain decimal precision, normalize booleans, and preserve source timestamps.
-- Retain `rowguid` as a lineage attribute but do not use it as the business key.
-- Add `_silver_ts`, `_run_id`, and `source_dt`, using `modified_date` when present.
-- Deduplicate by the following keys, keeping the greatest non-null `modified_date`, then deterministic `rowguid`:
+- Retain `rowguid` as a lineage attribute when present but do not use it as the business key. Do not require `rowguid` on junction tables.
+- Add `_silver_ts`, `_run_id`, and `source_dt`. Use `modified_date` when present; otherwise use `_source_modified_at` when present and non-null, then fall back to `F.current_timestamp()`. Every fallback passed to `F.coalesce` must be a Spark `Column`, never Python `None`.
+- Deduplicate by the following keys, keeping the greatest non-null `modified_date` when present, then deterministic `rowguid` when present, and finally the listed key columns as a stable fallback:
   - `customeraddress`: composite `(customer_id, address_id, address_type)`.
   - `salesorderdetail`: `sales_order_detail_id`; verify `(sales_order_id, sales_order_detail_id)` is also unique.
   - `productdescription`: `product_description_id`.
@@ -239,10 +281,15 @@ df = spark.read.table(...)
   - `productmodelproductdescription`: composite `(product_model_id, product_description_id, culture)`.
   - `product`: `product_id`.
   - `address`: `address_id`.
+- For `customeraddress`, do not reference non-existent surrogate or audit columns; require only `customer_id`, `address_id`, and `address_type` for deduplication.
+- For `productmodelproductdescription`, do not reference a non-existent surrogate key; require only `product_model_id`, `product_description_id`, and `culture` for deduplication.
 - Validate that quantities and monetary fields can be interpreted without coercion: `order_qty`, `unit_price`, `unit_price_discount`, `standard_cost`, `list_price`, `sub_total`, `tax_amt`, and `freight`.
 - Treat `unit_price_discount` as a fractional rate for downstream calculations; retain the original value and flag values outside `[0,1]`.
 - Normalize `culture` to lowercase for the English-description filter.
 - Preserve customer `sales_person` for Gold parsing. Do not expose `password_hash` or `password_salt` beyond Silver.
+- Write every output using `format('delta').mode('overwrite').option('overwriteSchema','true').saveAsTable('silver.<table>')`.
+- After each write, read back `silver.<table>`, capture its row count, and record the result in `silver_results`. At the end, assert that all ten required tables exist in `silver_results`, are discoverable through schema-qualified table discovery, and have non-negative row counts.
+- Print a final machine-readable JSON object with top-level key `silver_results` listing every required table, source row count, written row count, target table, and status. Raise an error labeled `silver` if any required table is missing, failed, or undiscoverable; do not advance to Gold.
 - Run `OPTIMIZE` after writes where supported, prioritizing `salesorderheader`, `salesorderdetail`, and `product`; avoid unnecessary compaction of tiny tables.
 
 ## Gold
