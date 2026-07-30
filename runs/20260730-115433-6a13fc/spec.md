@@ -21,6 +21,25 @@
   - Added immediate per-table catalog/provider verification plus a final exact expected-versus-discovered table assertion.
   - Required Silver to raise after recording results if any expected table is missing, preventing a false successful completion with zero or partial discoverable outputs.
 
+### Iteration 2 — 2026-07-30 12:02:08Z — failed layer: silver (run: 20260730-115433-6a13fc)
+- **Root cause (1-line summary)**: The Silver authoring response contained zero notebook cells, so no executable Silver notebook was available to transform or write any table.
+- **Cross-table audit**:
+  - `customeraddress`: yes — the notebook-level empty response prevents its read, transformation, write, and verification.
+  - `salesorderdetail`: yes — the same missing-cell failure prevents all processing for this table.
+  - `productdescription`: yes — the same missing-cell failure prevents all processing for this table.
+  - `customer`: yes — the same missing-cell failure prevents all processing for this table.
+  - `productcategory`: yes — the same missing-cell failure prevents all processing for this table.
+  - `productmodel`: yes — the same missing-cell failure prevents all processing for this table.
+  - `salesorderheader`: yes — the same missing-cell failure prevents all processing for this table.
+  - `productmodelproductdescription`: yes — the same missing-cell failure prevents all processing for this table.
+  - `product`: yes — the same missing-cell failure prevents all processing for this table.
+  - `address`: yes — the same missing-cell failure prevents all processing for this table.
+- **Fix approach**: GENERALIZE — this is a notebook-emission failure that uniformly blocks all ten source tables, so the fix mandates a non-empty executable cell contract and a minimal Silver cell plan rather than introducing table-specific changes.
+- **What was changed**:
+  - Tightened `## Generic guidance` with a mandatory notebook-emission contract that prohibits empty or prose-only authoring responses.
+  - Tightened `## Silver` to require at least four executable Python cells covering parameters/helpers, schema setup, the all-table processing loop, and final catalog validation.
+  - Required optional work such as `OPTIMIZE` to be omitted or deferred rather than allowing complexity to result in zero emitted cells.
+
 ## Inputs
 - Workspace: `b4dc08af-f88c-47ab-aa71-7d33d2c473e9`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -48,6 +67,9 @@ Apply these reference skills/agents at all times:
 - powerbi-report-authoring: https://github.com/RuiRomano/powerbi-agentic-plugins/tree/main/plugins/powerbi/skills/powerbi-report-authoring
 
 Cross-cutting code rules:
+- Notebook authoring responses must always contain a non-empty collection of executable notebook cells. Never return an empty cell list, prose-only guidance, a plan without cells, or only markdown/code fences when the build requests notebook cells.
+- Every layer notebook must include, at minimum, an executable parameter/setup cell and an executable processing or validation cell. If the full implementation is large, split it into additional cells; never omit all cells because of implementation complexity.
+- Prefer a smaller complete executable notebook over a comprehensive but non-executable response. Optional maintenance or presentation work must be deferred rather than causing the required transformation/write cells to be omitted.
 - Use defensive column references and assert required columns before every join, filter, `withColumn`, `groupBy`, aggregation, window, and projection that depends on named columns.
 - After every join, use aliases and alias-prefixed references in the immediate join projection; materialize uniquely named flat columns before subsequent transformations.
 - Before `groupBy` or `agg`, assert that every grouping and aggregation column exists.
@@ -154,6 +176,14 @@ Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFE
 
 ## Silver
 - Resume from the existing `bronze` Delta tables; do not re-ingest or rewrite Bronze during this retry.
+- The Silver authoring response must emit a non-empty notebook containing at least four executable Python code cells through the notebook-cell authoring mechanism. Do not return an empty cell array, prose-only guidance, a markdown-only plan, or code fences in place of notebook cells.
+- Use this minimum executable cell sequence:
+  1. Parameters, imports, run metadata, expected table list, result collections, and helper functions.
+  2. `silver` schema creation plus validation that all expected `bronze.<table>` inputs are catalog-readable.
+  3. The per-table read → snake_case transform → validate → deduplicate → write → read-back verification loop for all ten tables.
+  4. Final `SHOW TABLES IN silver` comparison, machine-readable summary, and deferred raise for accumulated failures or missing tables.
+- Every one of these cells must begin with the required Python `# ---` divider and explanatory comments. Additional cells may be used, but the four responsibilities above must remain executable and must not be replaced by narrative.
+- If response-size or implementation complexity is constrained, prioritize the four required cells and all ten catalog writes. `OPTIMIZE` is optional maintenance for this retry and must be omitted or deferred before omitting any required notebook cell, transformation, write, or catalog verification.
 - Create the `silver` schema with `spark.sql("CREATE SCHEMA IF NOT EXISTS silver")` before processing any table.
 - Use this exact expected table set for both processing and final validation: `customeraddress`, `salesorderdetail`, `productdescription`, `customer`, `productcategory`, `productmodel`, `salesorderheader`, `productmodelproductdescription`, `product`, and `address`.
 - Process all ten expected tables independently. For each `tbl`, read the catalog table `bronze.<tbl>`, create the source-aligned snake_case DataFrame, and write it only as a managed/catalog Delta table using:
@@ -185,7 +215,7 @@ Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFE
 - Normalize `customer.sales_person` into `sales_person_username`: trim, replace `/` with `\` if encountered, take the text after the final backslash, and lowercase. For example, `adventure-works\jillian0` becomes `jillian0`; the requested example ending in `jillian` does not match the supplied sample text, so no trailing digit will be removed.
 - Exclude password hash/salt and credit-card approval code from Silver.
 - Filter invalid negative `order_qty`, `unit_price`, `unit_price_discount`, or header monetary amounts into an error/quarantine result rather than silently correcting them. Permit null optional dates and descriptive attributes.
-- Run `OPTIMIZE` after successful, verified writes, prioritizing `silver.salesorderheader` by `order_date`, `silver.salesorderdetail` by `sales_order_id`, and `silver.product` by `product_category_id`; avoid unnecessary optimization of very small tables. An `OPTIMIZE` failure must not erase or unregister an already verified Silver table, but it must be recorded explicitly.
+- Run `OPTIMIZE` after successful, verified writes when notebook generation and execution capacity permits, prioritizing `silver.salesorderheader` by `order_date`, `silver.salesorderdetail` by `sales_order_id`, and `silver.product` by `product_category_id`; avoid unnecessary optimization of very small tables. An `OPTIMIZE` failure must not erase or unregister an already verified Silver table, but it must be recorded explicitly. If necessary, defer all `OPTIMIZE` statements until after the required tables and validations have completed.
 - After all per-table attempts, enumerate the catalog with `SHOW TABLES IN silver` and compare the discovered names against the exact expected table set. Treat the comparison as case-insensitive, but require every expected table to be present; report both `missing_tables` and `unexpected_tables`.
 - Print a final machine-readable summary containing `silver_results`, the expected table list, the discovered table list, and `missing_tables`.
 - If any per-table transformation/write/read-back verification failed, or if any expected Silver table is missing, call `_save_error('silver', e, table=<affected table or '__layer__'>)` and raise a `RuntimeError` after all ten tables have been attempted. Never allow the Silver notebook to finish successfully when zero or only a partial set of discoverable `silver.*` Delta tables exists.
