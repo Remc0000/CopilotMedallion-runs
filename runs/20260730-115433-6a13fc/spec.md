@@ -78,6 +78,25 @@
   - Defined deterministic fallbacks for latest-customer-order ranking and English product-description selection using guaranteed business columns, including the real junction columns `product_model_id`, `product_description_id`, and `culture`.
   - Added named Gold action diagnostics, pre-write materialization checkpoints, per-output isolation, and immediate re-raise after the first Spark failure so the originating output/action is preserved before Fabric cancels the session.
 
+### Iteration 1 — 2026-07-30 13:30:30Z — failed layer: bronze (run: 20260730-115433-6a13fc)
+- **Root cause (1-line summary)**: Bronze notebook generation failed because an emitted code cell began with the non-Python markdown separator `---` and included prose instead of beginning with the required Python comment divider `# ---`.
+- **Cross-table audit**:
+  - `customeraddress`: yes — the malformed notebook cell prevents the shared Bronze ingestion notebook from executing before this table can be read or written.
+  - `salesorderdetail`: yes — the same notebook-level Python syntax failure blocks ingestion and verification.
+  - `productdescription`: yes — the same malformed shared cell blocks all processing.
+  - `customer`: yes — the same malformed shared cell blocks all processing, including restricted-field handling.
+  - `productcategory`: yes — the same malformed shared cell blocks all processing.
+  - `productmodel`: yes — the same malformed shared cell blocks all processing.
+  - `salesorderheader`: yes — the same malformed shared cell blocks ingestion and partition-column derivation.
+  - `productmodelproductdescription`: yes — the same malformed shared cell blocks all processing.
+  - `product`: yes — the same malformed shared cell blocks all processing.
+  - `address`: yes — the same malformed shared cell blocks all processing.
+- **Fix approach**: GENERALIZE — this is a shared notebook serialization and Python-syntax problem that can prevent every source table from running, so every emitted Python cell must satisfy one uniform raw-cell syntax contract before the Bronze notebook is submitted.
+- **What was changed**:
+  - Tightened `## Generic guidance` to require the literal first line `# ---`, prohibit markdown fences and bare `---` separators inside Python cell payloads, and require all explanatory text inside code cells to be Python comments.
+  - Added a mandatory Python syntax preflight for every generated cell; malformed cells must be corrected before notebook submission rather than retried unchanged.
+  - Tightened `## Bronze` with a minimum executable cell sequence and an explicit all-cell validation gate before any Bronze Spark operation.
+
 ## Inputs
 - Workspace: `b4dc08af-f88c-47ab-aa71-7d33d2c473e9`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -106,6 +125,10 @@ Apply these reference skills/agents at all times:
 
 Cross-cutting code rules:
 - Notebook authoring responses must always contain a non-empty collection of executable notebook cells. Never return an empty cell list, prose-only guidance, a plan without cells, or only markdown/code fences when the build requests notebook cells.
+- Every generated Python code-cell payload must be raw executable Python. Its first line must be exactly `# ---`, including the leading `#`; a bare `---`, markdown heading, bullet, explanatory sentence, or fenced-code marker is invalid.
+- Do not include opening or closing markdown fences such as `````python`` or ````` `` inside a Python cell payload. Do not use YAML/markdown separators such as bare `---`. Any explanation inside a code cell must be on a Python comment line beginning with `# `.
+- Before submitting or updating a notebook, validate every generated Python cell independently with an equivalent of `ast.parse(cell_source)` after stripping no content other than an optional UTF-8 BOM. Also assert `cell_source.splitlines()[0] == "# ---"`. If either check fails, correct or regenerate that cell before notebook submission; never submit the malformed cell and rely on retries.
+- The syntax preflight must cover every emitted cell, including setup, schema creation, helper, validation, processing, write, and summary cells. A valid cell may contain comments and Python statements, but never free-standing prose.
 - Every layer notebook must include, at minimum, an executable parameter/setup cell and an executable processing or validation cell. If the full implementation is large, split it into additional cells; never omit all cells because of implementation complexity.
 - Prefer a smaller complete executable notebook over a comprehensive but non-executable response. Optional maintenance or presentation work must be deferred rather than causing the required transformation/write cells to be omitted.
 - Use defensive column references and assert required columns before every join, filter, `withColumn`, `groupBy`, aggregation, window, and projection that depends on named columns.
@@ -206,6 +229,16 @@ Rule M — Named Spark-action diagnostics and pre-write checkpoints.
 - Never place a Spark action inside a `finally` block. Cleanup and summary code after a Spark failure must be Python-only.
 
 ## Bronze
+- The Bronze authoring response must emit a non-empty notebook containing at least four executable Python cells through the notebook-cell authoring mechanism. Do not return prose, markdown, fenced code blocks, or a markdown-only plan in place of Python cell payloads.
+- Use this minimum executable cell sequence:
+  1. Parameters, imports, run metadata, exact source-table list, source/target Lakehouse identifiers, result collections, and diagnostic helpers.
+  2. `bronze` schema creation, source connectivity/session health validation, and source-table availability checks.
+  3. Sequential all-table source read → metadata enrichment → optional partition-column derivation → materialization checkpoint → managed Delta write → read-back verification processing.
+  4. Final catalog comparison, machine-readable `bronze_results` summary, and failure for missing or failed tables.
+- Every Bronze cell's raw payload must begin on its first line with exactly `# ---`, followed by one to three Python comment lines. Never begin a cell with bare `---`; never place prose, markdown headings, bullets, or code fences in a Python cell.
+- Before submitting the Bronze notebook, validate every cell payload with both `cell_source.splitlines()[0] == "# ---"` and Python parsing equivalent to `ast.parse(cell_source)`. Submission is prohibited if any cell fails either check; correct the malformed cell first.
+- The syntax validation applies to the full cell payload actually sent to Fabric, not to an earlier template. Do not strip the leading `#`, convert the divider to YAML syntax, or prepend explanatory prose during notebook serialization.
+- If implementation size is constrained, omit optional partitioning, optimization, or presentation logic before omitting the required executable cells, syntax preflight, ingestion loop, managed writes, or verification.
 - Create the `bronze` schema and land all ten selected source tables as source-faithful Delta snapshots.
 - Preserve original business columns and data types; add `_ingest_run_id`, `_ingested_at`, `_source_lakehouse`, and `_source_table`.
 - Write each table independently with `mode('overwrite')`, `overwriteSchema=true`, and `saveAsTable('bronze.<table>')`.
