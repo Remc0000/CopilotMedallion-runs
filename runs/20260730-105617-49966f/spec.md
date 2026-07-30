@@ -21,6 +21,25 @@
   - Tightened **Bronze** to require executable per-table ingestion coverage for exactly the ten configured source tables, with a pre-execution coverage assertion and a nonempty final result assertion.
   - Required notebook-generation failure to be raised explicitly rather than returning an empty cell collection or a misleading downstream-layer diagnostic.
 
+### Iteration 2 — 2026-07-30 11:02:51Z — failed layer: bronze (run: 20260730-105617-49966f)
+- **Root cause (1-line summary)**: A Bronze Spark statement failed and Fabric canceled the shared Spark session, leaving only `System_Cancelled_Session_Statements_Failed` and no table, operation, or nested Spark exception with which to identify the originating statement.
+- **Cross-table audit**:
+  - `customeraddress`: yes — its read, metadata projection, count, or write could cancel a shared session and prevent later tables from running.
+  - `salesorderdetail`: yes — its read, count, or Delta write could produce the same shared-session cancellation.
+  - `productdescription`: yes — it is exposed to the same shared-session execution and opaque wrapper error.
+  - `customer`: yes — it is exposed to the same shared-session execution and opaque wrapper error.
+  - `productcategory`: yes — it is exposed to the same shared-session execution and opaque wrapper error.
+  - `productmodel`: yes — it is exposed to the same shared-session execution and opaque wrapper error.
+  - `salesorderheader`: yes — its optional `_order_year` derivation and partitioned write add Spark statements that could cancel the shared session.
+  - `productmodelproductdescription`: yes — it is exposed to the same shared-session execution and opaque wrapper error.
+  - `product`: yes — it is exposed to the same shared-session execution and opaque wrapper error.
+  - `address`: yes — it is exposed to the same shared-session execution and opaque wrapper error.
+- **Fix approach**: GENERALIZE — the observed failure is session-level rather than tied to a known table schema; all ten Bronze tables require the same separate-session execution boundary and structured operation-level diagnostics.
+- **What was changed**:
+  - Revised **Generic guidance**, Rule H, to state that Python `try/except` inside one Spark session is not failure isolation after Fabric cancels that session; isolated table processing must use separate child notebook/job Spark sessions and preserve the originating exception.
+  - Tightened **Bronze** so its parent notebook performs orchestration only and launches one single-table child execution per configured source table, capturing table, operation, child run/session ID, and full nested error details.
+  - Added explicit source preflight, child-result contracts, and a prohibition on submitting further Spark statements to a canceled child session.
+
 ## Inputs
 - Workspace: `692949a8-3b8c-41ea-9617-5280c45b1a0f`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -102,11 +121,17 @@ Rule G — Optional-column helpers must return typed Column nulls, not Python No
   Either approach is acceptable, but **never pass Python `None` directly into a Spark function**.
 - Applies to ALL optional-column lookups across Bronze, Silver, Gold — including audit-timestamp coalesces, optional-key joins, fallback string formatting, etc. This is a layer-agnostic rule.
 
-Rule H — Per-table isolation; one table's failure must not cancel the Spark session for the rest.
-- Spark cancels the entire session when one statement crashes. If your notebook builds a single chained plan that touches every source table (one big SELECT, one big DataFrame, one big SQL script), any one table's failure kills ALL tables.
-- ALWAYS process source tables in a `for tbl in source_tables:` loop where each iteration is a SELF-CONTAINED unit: read → transform → write → record-result → recover. Wrap the loop body in `try/except` that calls `_save_error(layer, e, table=tbl)` and APPENDS the failure to a results dict, then **re-raises only AFTER the loop has attempted all tables** (or, if your spec says "fail-fast-first-table", re-raise immediately — but per-table-isolated by default).
-- Do NOT build a single multi-CTE Spark SQL statement that joins/transforms many source tables in one shot. Each table's transform is its own DataFrame chain with its own `.write` call.
-- Do NOT share intermediate temp views across tables. Temp views from one iteration must not be assumed to exist in the next. If you need cross-table joins (typical for Gold), do them in a SECOND loop AFTER all per-table Silver/Gold writes are complete.
+Rule H — A canceled Spark session is not recoverable; isolate table executions by session.
+- Fabric can cancel the entire Spark session after one statement failure and return only `System_Cancelled_Session_Statements_Failed`. Python `try/except` can record the exception, but it cannot make that canceled Spark session safe for subsequent reads, counts, transforms, or writes.
+- A `for tbl in source_tables:` loop running all tables in one notebook Spark session is orchestration, not failure isolation. Where per-table isolation is required, the parent notebook must launch each table as a separate child notebook/job execution with its own Spark session. Do not use `%run` or any mechanism that executes the child in the parent's Spark session.
+- The parent orchestration notebook must not perform source DataFrame reads, Spark counts, transformations, or Delta writes. It may perform control-plane validation, invoke child executions, collect their outputs, and produce the final layer summary.
+- Each child execution must receive exactly one `table_name` plus the workspace, source Lakehouse, target Lakehouse, layer, and run ID parameters. It must perform only that table's read → transform → write → validation flow and return one machine-readable result.
+- Before beginning table processing, record the child run ID and Spark application/session ID when available. Track the current operation using one of these exact values: `source_preflight`, `source_read`, `schema_validation`, `metadata_projection`, `source_count`, `target_write`, `target_readback`, or `target_count`.
+- If a child fails, call `_save_error(layer, e, table=table_name)` before re-raising when the session still permits it. The persisted or returned diagnostic must include `layer`, `table`, `operation`, `child_run_id`, `spark_session_id`, source identifier, target table, exception class, exception text, and full traceback.
+- Preserve the first/originating nested Spark exception and request ID. Do not replace it with only the outer `System_Cancelled_Session_Statements_Failed` response. If only the cancellation wrapper is available, report the last started operation and last completed operation.
+- After a child receives a session-cancellation error, submit no more Spark statements in that child. The parent must record the failed child and launch the next table in a fresh child session.
+- If the available orchestration mechanism cannot guarantee a separate Spark session for each child, fail before any table Spark action with `RuntimeError("[<layer>] separate Spark session per table is required but unavailable")`; do not claim per-table isolation using a same-session loop.
+- For transformations that inherently join multiple source tables, isolate each independently writable output table in its own child execution and preflight all of that child's required inputs before constructing the joined plan.
 
 Rule I — Optional audit columns on junction / bridge / view tables.
 - In typical operational sources (AdventureWorksLT, Northwind, AdventureWorks2019, etc.), entity tables (Customer, Product, SalesOrderHeader) have system audit columns: `ModifiedDate`, `rowguid`. **Junction / bridge tables** (CustomerAddress, ProductModelProductDescription, SalesTerritoryHistory) typically have only the FK columns and may have NO ModifiedDate and NO rowguid. **Views** (vGetAllCategories, vProductAndDescription) may have whatever columns the underlying query projects — frequently NO audit columns.
@@ -164,24 +189,34 @@ df = spark.read.table(...)
 ```
 
 ## Bronze
-- Generate and execute a nonempty Bronze notebook; it must not return an empty notebook-cell collection. The notebook must contain, at minimum, executable parameter/import, schema setup, per-table ingestion, validation, and final summary cells as required by Rule M.
-- Define the exact configured list in the parameter cell:
+- Generate and execute a nonempty Bronze parent orchestration notebook and a nonempty single-table child ingestion notebook; neither may return an empty notebook-cell collection. The parent must contain executable parameter/import, child-invocation, result-validation, and final-summary cells. The child must contain executable parameter/import, schema setup, single-table ingestion, validation, and final-result cells as required by Rule M.
+- Define the exact configured list in the parent parameter cell:
   `source_tables = ['customeraddress', 'salesorderdetail', 'productdescription', 'customer', 'productcategory', 'productmodel', 'salesorderheader', 'productmodelproductdescription', 'product', 'address']`.
   Assert before ingestion that this list is nonempty, contains exactly ten unique names, and equals the configured Inputs list; raise an error naming missing or unexpected tables if it does not.
+- The parent notebook must perform control-plane orchestration only. It must launch exactly one child execution per configured table, sequentially or with bounded concurrency, and each child must use a Spark session isolated from the parent and from every other table.
+- The parent may use a `for tbl in source_tables:` loop only to invoke separate-session child notebook/job executions and collect their returned JSON. It must not use that loop to read, transform, count, or write multiple tables through the parent's Spark session.
+- Do not use `%run`, same-session notebook inclusion, or a single shared Spark loop as the child-execution mechanism. Before the first source Spark action, verify that the selected invocation mechanism provides an isolated child Spark session; otherwise raise `RuntimeError("[bronze] separate Spark session per table is required but unavailable")`.
+- Pass these parameters to every child: `workspace_id`, `source_lakehouse_id`, `target_lakehouse_name`, `run_id`, `layer='bronze'`, and exactly one `table_name`. The child must reject a missing table name or a table name not present in the exact configured list.
+- In each child, set `operation='source_preflight'` before resolving the source. Resolve the source table by its exact configured lower-case name within SalesLake and fail with an error containing the table name and available source tables if it is absent or resolves to more than one case-insensitive match.
+- After reading the source schema and before any count or write, assert that source column names are unique case-insensitively. If they are not, raise a table-specific error listing the colliding source names; do not silently rename or drop source columns in Bronze.
 - Create `bronze` and land one Delta table per selected source table, preserving source names and source data types.
 - Add `_run_id`, `_ingested_at`, `_source_lakehouse`, `_source_table`, and `_source_modified_at`.
-- Populate `_source_modified_at` from the case-insensitive source column matching `ModifiedDate` when that column exists. For a table without `ModifiedDate`, populate `_source_modified_at` with `F.lit(None).cast('timestamp')`; never fail ingestion solely because an optional audit column is absent.
+- Populate `_source_modified_at` from the single case-insensitive source column matching `ModifiedDate` when that column exists. If more than one source column matches `ModifiedDate` case-insensitively, fail during `schema_validation` and list the colliding columns. For a table without `ModifiedDate`, populate `_source_modified_at` with `F.lit(None).cast('timestamp')`; never fail ingestion solely because an optional audit column is absent.
 - Preserve source column names in Bronze so it remains a faithful raw landing layer. Snake-case conversion occurs in Silver.
-- Process all ten tables independently in an executable `for tbl in source_tables:` loop and record source and written row counts in the notebook result summary.
-- Each loop iteration must explicitly perform read → add Bronze metadata → optional partition decision → schema-qualified write → written-row validation → result recording. A generated comment, placeholder, `pass`, TODO, or prose description does not satisfy this requirement.
-- Before submitting the notebook, validate processing coverage with the exact configured list. At runtime, maintain `attempted_tables`, `bronze_results`, and `bronze_errors`; assert after the loop that every configured table appears in exactly one of `bronze_results` or `bronze_errors`.
+- Each child must explicitly perform one table's `source_preflight` → `source_read` → `schema_validation` → `metadata_projection` → `source_count` → `target_write` → `target_readback` → `target_count` flow. Set the `operation` variable immediately before each step so a failure identifies the exact statement that triggered cancellation.
+- A generated comment, placeholder, `pass`, TODO, or prose description does not satisfy the child-ingestion requirement.
+- The child must return one machine-readable JSON object containing `layer`, `table`, `status`, `source_rows`, `written_rows`, `target_table`, `child_run_id`, `spark_session_id`, and `last_completed_operation`. On failure, persist or return the same fields plus `failed_operation`, exception class, exception text, full traceback, and the originating request ID when available, then re-raise.
+- If a child receives `System_Cancelled_Session_Statements_Failed`, it must not attempt target readback, another `_save_error` Spark write, or any other Spark statement in that canceled session. Error persistence for that case must use the orchestration/control plane or the parent, and must include the failed table and last started operation.
+- At runtime, the parent must maintain `attempted_tables`, `bronze_results`, and `bronze_errors`. It must record the outcome of each child and continue to the next configured table by launching a fresh child session; it must never reuse a failed child's session.
+- Assert after child orchestration that every configured table appears in exactly one of `bronze_results` or `bronze_errors`, and that every successful child reports matching non-negative `source_rows` and `written_rows`.
 - Use full-table idempotent overwrite because no source change-tracking or ingestion watermark column was supplied. `ModifiedDate` can support a later incremental design, but is not sufficient by itself to detect deletions.
 - Do not partition the relatively small master/junction tables: `customeraddress`, `productdescription`, `customer`, `productcategory`, `productmodel`, `productmodelproductdescription`, `product`, and `address`.
 - Do not partition `salesorderdetail`; its available columns do not provide a natural date partition.
-- Partition `salesorderheader` by a derived `_order_year` based on `OrderDate` only if volume justifies partitioning; otherwise leave it unpartitioned to avoid small files. Retain the original `OrderDate`.
+- Partition `salesorderheader` by a derived `_order_year` based on `OrderDate` only if volume justifies partitioning; otherwise leave it unpartitioned to avoid small files. Resolve `OrderDate` by one case-insensitive match, fail if multiple matches exist, and retain the original `OrderDate`.
 - Write each result with schema-qualified `saveAsTable('bronze.<table>')`.
-- Print a final machine-readable JSON summary containing all attempted tables, successful table row counts, and per-table errors.
-- Raise after all table attempts if `bronze_results` is empty, if any configured table was not attempted, or if any table failed. The raised message must identify the active layer as `bronze`, list failed/missing tables, and must not label the failure as `silver`.
+- Validate each successful write by reading back `bronze.<table>` in the same child and comparing its count with the captured source count. A mismatch is a child failure and must report both counts.
+- Print a final machine-readable parent JSON summary containing all attempted tables, successful table row counts and child IDs, and per-table errors with failed operations and child IDs.
+- Raise after all child attempts if `bronze_results` is empty, if any configured table was not attempted, or if any table failed. The raised message must identify the active layer as `bronze`, list failed/missing tables and their failed operations, preserve originating request IDs, and must not label the failure as `silver`.
 - Table roles observed from the supplied columns:
   - Transaction header: `salesorderheader`, keyed by `SalesOrderID`.
   - Transaction lines: `salesorderdetail`, keyed by `SalesOrderDetailID` and linked by `SalesOrderID`.
