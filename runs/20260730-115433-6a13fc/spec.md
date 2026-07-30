@@ -1,5 +1,26 @@
 # Run Spec 20260730-115210-7c6906
 
+## Updated specs
+
+### Iteration 1 — 2026-07-30 12:00:06Z — failed layer: silver (run: 20260730-115433-6a13fc)
+- **Root cause (1-line summary)**: Silver completed without producing any catalog-discoverable Delta tables in the `silver` schema, so Gold refused to build from spec-only context.
+- **Cross-table audit**:
+  - `customeraddress`: yes — every Silver table can be affected if writes use an unqualified name/path, failures are swallowed, or the table is not verified in the catalog.
+  - `salesorderdetail`: yes — subject to the same Silver write and discoverability contract.
+  - `productdescription`: yes — subject to the same Silver write and discoverability contract.
+  - `customer`: yes — subject to the same Silver write and discoverability contract.
+  - `productcategory`: yes — subject to the same Silver write and discoverability contract.
+  - `productmodel`: yes — subject to the same Silver write and discoverability contract.
+  - `salesorderheader`: yes — subject to the same Silver write and discoverability contract.
+  - `productmodelproductdescription`: yes — subject to the same Silver write and discoverability contract.
+  - `product`: yes — subject to the same Silver write and discoverability contract.
+  - `address`: yes — subject to the same Silver write and discoverability contract.
+- **Fix approach**: GENERALIZE — the failure is a uniform layer-output problem rather than a table-specific schema issue, so one mandatory catalog-write and post-write verification contract now applies to all ten Silver tables.
+- **What was changed**:
+  - Tightened `## Silver` to require schema-qualified `saveAsTable('silver.<table>')` writes and prohibit path-only or temporary-view outputs.
+  - Added immediate per-table catalog/provider verification plus a final exact expected-versus-discovered table assertion.
+  - Required Silver to raise after recording results if any expected table is missing, preventing a false successful completion with zero or partial discoverable outputs.
+
 ## Inputs
 - Workspace: `b4dc08af-f88c-47ab-aa71-7d33d2c473e9`
 - Source Lakehouse: **SalesLake** (`040b6dbc-1c93-4448-9b22-cb2c26c79ee9`)
@@ -132,8 +153,23 @@ Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFE
 - Record row counts and target table names in `bronze_results`; attempt every table and raise after the loop if any table failed or if zero tables were written.
 
 ## Silver
+- Resume from the existing `bronze` Delta tables; do not re-ingest or rewrite Bronze during this retry.
+- Create the `silver` schema with `spark.sql("CREATE SCHEMA IF NOT EXISTS silver")` before processing any table.
+- Use this exact expected table set for both processing and final validation: `customeraddress`, `salesorderdetail`, `productdescription`, `customer`, `productcategory`, `productmodel`, `salesorderheader`, `productmodelproductdescription`, `product`, and `address`.
+- Process all ten expected tables independently. For each `tbl`, read the catalog table `bronze.<tbl>`, create the source-aligned snake_case DataFrame, and write it only as a managed/catalog Delta table using:
+  ```
+  silver_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"silver.{tbl}")
+  ```
+  Do not use `.save(path)`, ABFSS output paths, unqualified `saveAsTable(tbl)`, temporary views, global temporary views, or in-memory DataFrames as substitutes for the required `silver.<tbl>` table.
+- Immediately after each write, verify all of the following before recording success:
+  - `spark.catalog.tableExists(f"silver.{tbl}")` is true.
+  - `spark.table(f"silver.{tbl}")` can be read successfully.
+  - `DESCRIBE DETAIL silver.<tbl>` reports `format = 'delta'`.
+  - The read-back schema contains the table's required key columns listed below.
+  - Record the read-back row count and fully qualified target name in `silver_results`; do not mark a table successful based only on completion of the write call.
+- A valid empty source may produce a zero-row Silver table, but the catalog table must still be created and discoverable. Zero rows are not a reason to skip `saveAsTable`.
 - Create source-aligned, snake_case Delta tables in the `silver` schema. Trim strings, normalize blank strings to null where appropriate, preserve valid decimals/timestamps, and add `_silver_run_id`, `_silver_ts`, and `_source_modified_at`.
-- Deduplicate by the following actual keys, retaining the greatest `modified_date`, then `rowguid` as a deterministic tie-breaker:
+- Deduplicate by the following actual keys, retaining the greatest `modified_date`, then `rowguid` as a deterministic tie-breaker when those audit columns exist:
   - `customer`: `customer_id`.
   - `address`: `address_id`.
   - `product`: `product_id`.
@@ -144,11 +180,15 @@ Rule L — Disambiguate shared columns in join projections (avoid AMBIGUOUS_REFE
   - `salesorderdetail`: `sales_order_detail_id`; additionally assert `(sales_order_id, sales_order_detail_id)` uniqueness.
   - `customeraddress`: composite `(customer_id, address_id, address_type)`.
   - `productmodelproductdescription`: composite `(product_model_id, product_description_id, culture)`.
+- For `customeraddress` and `productmodelproductdescription`, do not require `modified_date` or `rowguid`; if absent, deduplicate deterministically using only the listed composite key. For every table, assert its listed key columns exist after snake_case projection and again in the catalog read-back table.
 - Validate actual foreign keys without dropping unresolved rows: order header to customer and bill/ship address; order detail to header and product; product to category/model; product-description bridge to model/description; customer-address bridge to customer/address.
 - Normalize `customer.sales_person` into `sales_person_username`: trim, replace `/` with `\` if encountered, take the text after the final backslash, and lowercase. For example, `adventure-works\jillian0` becomes `jillian0`; the requested example ending in `jillian` does not match the supplied sample text, so no trailing digit will be removed.
 - Exclude password hash/salt and credit-card approval code from Silver.
 - Filter invalid negative `order_qty`, `unit_price`, `unit_price_discount`, or header monetary amounts into an error/quarantine result rather than silently correcting them. Permit null optional dates and descriptive attributes.
-- Run `OPTIMIZE` after successful writes, prioritizing `silver.salesorderheader` by `order_date`, `silver.salesorderdetail` by `sales_order_id`, and `silver.product` by `product_category_id`; avoid unnecessary optimization of very small tables.
+- Run `OPTIMIZE` after successful, verified writes, prioritizing `silver.salesorderheader` by `order_date`, `silver.salesorderdetail` by `sales_order_id`, and `silver.product` by `product_category_id`; avoid unnecessary optimization of very small tables. An `OPTIMIZE` failure must not erase or unregister an already verified Silver table, but it must be recorded explicitly.
+- After all per-table attempts, enumerate the catalog with `SHOW TABLES IN silver` and compare the discovered names against the exact expected table set. Treat the comparison as case-insensitive, but require every expected table to be present; report both `missing_tables` and `unexpected_tables`.
+- Print a final machine-readable summary containing `silver_results`, the expected table list, the discovered table list, and `missing_tables`.
+- If any per-table transformation/write/read-back verification failed, or if any expected Silver table is missing, call `_save_error('silver', e, table=<affected table or '__layer__'>)` and raise a `RuntimeError` after all ten tables have been attempted. Never allow the Silver notebook to finish successfully when zero or only a partial set of discoverable `silver.*` Delta tables exists.
 
 ## Gold
 - Build a Direct Lake star schema at sales-order-line grain and write all outputs with schema-qualified Delta tables.
